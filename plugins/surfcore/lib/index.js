@@ -326,7 +326,7 @@ export function apply(ctx) {
         const voice = updCfg.voice ?? {};
         list.push({
           id: 'surfvoice-local', name: '语音包（本地）', dir: path.join(packsDir, 'voice-local'),
-          kind: 'auto', branch: 'main', versionUrl: voice.localVersionUrl || '', versionRepo: 'Mieksido/surfvoicelocal',
+          kind: 'auto', branch: 'main', versionUrl: voice.localVersionUrl || '', versionRepo: 'sprintkey666-gg/surfvoicelocal-sprintkey',
         });
         list.push({
           id: 'surfvoice-cloud', name: '语音包（云端）', dir: path.join(packsDir, 'voice-cloud'),

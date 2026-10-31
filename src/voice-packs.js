@@ -35,10 +35,13 @@ export const DEFAULT_MANIFESTS = [
   {
     id: 'voice-local',
     name: '本地语音包',
-    version: '1.0.0',
-    // 2026-10-28 更正：旧值 7.83GB 是开发机整目录（含 .venv 5.1GB + 日志），
-    // 公开分发实际下载 ≈ 1.77GB（vendor 1.71 + models 0.05）。
-    sizeBytes: 1_900_000_000,
+    version: '1.1.1',
+    // 2026-11-01：本机改版（大肥鱼音色 + RVC 语音/唱歌）自包含分发。
+    // vendor 约 2.5GB（GPT-SoVITS 1.9GB + Applio 0.6GB）、models 约 0.6GB。
+    sizeBytes: 3_200_000_000,
+    // 峰值空间 = 下载 2.9GB + 解压 3.1GB + .venv/.venv-gsv/.venv-rvc 3.6GB。
+    // 不留这个余量，装到一半磁盘满了只会报一句难懂的 Python 错误。
+    minFreeBytes: 14_000_000_000,
     port: 8765,
     startScript: 'run.bat',
     stopScript: 'stop.bat',
@@ -46,19 +49,22 @@ export const DEFAULT_MANIFESTS = [
     // 2026-10-27：只起 run.bat 时发语音全 503，用户以为"语音坏了"。
     engineScript: 'gsv.bat',
     enginePort: 9880,
-    repo: 'Mieksido/surfvoicelocal',
+    repo: 'sprintkey666-gg/surfvoicelocal-sprintkey',
     postInstall: ['scripts/fetch-models.mjs', 'scripts/bootstrap-env.mjs'],
     // 装完必须存在的目录（否则就是"只下了代码、模型没下完"）
-    verifyDirs: ['models', 'vendor/GPT-SoVITS'],
+    verifyDirs: ['models', 'vendor/GPT-SoVITS', 'vendor/Applio'],
     engineWarmupHint: '本地音色引擎加载约 40 秒，期间发语音会失败，稍等再试',
     // 开发期用本地目录；分发期换成 GitHub Releases 的 zip 链接
     url: process.env.SURFCORE_VOICE_LOCAL_URL || devPackUrl('voice-local'),
     requires: { gpu: true, network: false },
-    voices: [{ id: 'loli12-gsv', label: '小语（本地 · 女童声）' }],
+    voices: [
+      { id: 'da-fei-yu-gsv', label: '大肥鱼（本地 · 女声）' },
+      { id: 'huayan', label: '华研（本地兜底）' },
+    ],
     about: {
-      summary: '在你自己的电脑上跑，不联网也能说话。',
-      pros: ['完全免费', '断网可用', '延迟 1.0~1.5 秒'],
-      cons: ['需要 NVIDIA 显卡（6G 显存以上）', '下载约 1.8GB，首次装依赖 20~40 分钟'],
+      summary: '在你自己的电脑上跑，不联网也能说话、唱歌。',
+      pros: ['完全免费', '断网可用', '含大肥鱼音色与 RVC 唱歌'],
+      cons: ['需要 NVIDIA 显卡（6G 显存以上）', '下载约 3GB，首次装依赖 40~60 分钟'],
     },
   },
   {
@@ -315,6 +321,54 @@ async function fetchToLocal(cfg, id, src, destDir, onProgress = () => {}) {
   onProgress(100, '完成');
 }
 
+/**
+ * 默认音色兜底：config.toml 里的 `[voice] default` 如果指向包里没有的音色，改成清单里的第一个。
+ *
+ * 2026-11-01：1.0.x 用户的 config.toml 写着 `default = "loli12-gsv"`，重装 1.1.x 后包里
+ * 只有 da-fei-yu-gsv / huayan，voxd 直接报「没有音色「loli12-gsv」，可用：（空）」——
+ * 用户得自己翻配置文件才知道怎么改。这里在安装收尾时替他们改掉。
+ *
+ * 只碰 `[voice]` 段的 default 一行（保留原缩进）；段不存在就补一段；
+ * 包里一个 voice.json 都没有时不动（不自作主张）。返回 { changed, from, to } 方便测试。
+ */
+export async function ensureDefaultVoice(dir, voices = []) {
+  const wanted = String((Array.isArray(voices) && voices[0] && voices[0].id) || '').trim();
+  if (!wanted) return { changed: false, reason: '清单没声明音色' };
+  const voicesDir = path.join(dir, 'voices');
+  const installed = [];
+  for (const name of await fsp.readdir(voicesDir).catch(() => [])) {
+    if (await exists(path.join(voicesDir, name, 'voice.json'))) installed.push(name);
+  }
+  if (!installed.length) return { changed: false, reason: '包里没有 voice.json' };
+  const configPath = path.join(dir, 'config.toml');
+  let text;
+  try { text = await fsp.readFile(configPath, 'utf8'); } catch { return { changed: false, reason: '没有 config.toml' }; }
+
+  const headerRe = /^[ \t]*\[[^\]\r\n]+\][ \t]*$/gm;
+  const headers = [];
+  let hm;
+  while ((hm = headerRe.exec(text))) headers.push({ name: hm[0].trim(), start: hm.index, end: headerRe.lastIndex });
+  const defaultRe = /^[ \t]*default[ \t]*=[ \t]*["']([^"']*)["'][ \t]*$/m;
+  const at = headers.findIndex((h) => /^\[\s*voice\s*\]$/.test(h.name));
+  if (at < 0) {
+    text = `${text.replace(/\s*$/, '')}\n\n[voice]\ndefault = "${wanted}"\n`;
+    await fsp.writeFile(configPath, text, 'utf8');
+    return { changed: true, from: '', to: wanted };
+  }
+  const bodyStart = headers[at].end;
+  const bodyEnd = at + 1 < headers.length ? headers[at + 1].start : text.length;
+  const body = text.slice(bodyStart, bodyEnd);
+  const hit = defaultRe.exec(body);
+  const current = hit ? hit[1] : '';
+  // 用户自己选的音色只要还在包里就别动
+  if (current && installed.includes(current)) return { changed: false, from: current };
+  const nextBody = hit
+    ? body.replace(/^([ \t]*)default[ \t]*=[ \t]*["'][^"']*["']/m, `$1default = "${wanted}"`)
+    : `\ndefault = "${wanted}"${body}`;
+  await fsp.writeFile(configPath, text.slice(0, bodyStart) + nextBody + text.slice(bodyEnd), 'utf8');
+  return { changed: true, from: current, to: wanted };
+}
+
 export function createVoicePacks(cfg) {
   const activeInstalls = new Map(); // id → {progress, phase, startedAt, error}
   const activeEnvInstalls = new Map(); // id → 正在补装 Python 环境（.venv）的记录
@@ -424,8 +478,10 @@ export function createVoicePacks(cfg) {
     };
   }
 
-  /** 重装时保留这些（模型/环境/配置）：否则断点续传的 .part 也会被一起删掉。 */
-const PACK_KEEP = ['models', 'vendor', 'voices', 'voicepack', 'logs', 'cache', '.venv', '.venv-gsv', 'config.toml'];
+  /** 重装时保留这些（模型/环境/配置）：否则断点续传的 .part 也会被一起删掉。
+   *  2026-11-01：补上 .venv-rvc（本地语音包的 RVC 语音/唱歌环境）和 svsvenv（本地模型2 的唱歌环境）——
+   *  漏了它们，点一次"重装"就要白等 40~60 分钟重建环境，唱歌直接坏掉。*/
+const PACK_KEEP = ['models', 'vendor', 'voices', 'voicepack', 'logs', 'cache', '.venv', '.venv-gsv', '.venv-rvc', 'svsvenv', 'config.toml'];
 
 /** 清掉代码，但把模型/环境/配置暂时挪出去再挪回来。 */
 async function clearPackKeepingAssets(dir) {
@@ -619,6 +675,15 @@ async function install(id, { force = false, mirror = '', jobs = 0 } = {}) {    c
         if (!(await exists(path.join(dir, 'config.toml')))) {
           throw new Error('包里没有 config.toml，可能下载的是错的文件');
         }
+        // 1.0.x 老用户的 config.toml 默认音色可能还是 loli12-gsv（新包不带了）：
+        // 不改的话第一次发语音就是「没有音色 loli12-gsv，可用：（空）」。
+        try {
+          const migrated = await ensureDefaultVoice(dir, m.voices);
+          if (migrated.changed) {
+            rec.phase = `默认音色 ${migrated.from || '(空)'} → ${migrated.to}`;
+            rec.log = `${rec.log || ''}\n[config] [voice] default: ${migrated.from || '(空)'} → ${migrated.to}\n`.slice(-4000);
+          }
+        } catch {}
         // 后置步骤：先拉声音模型/唱歌权重（都做 sha256 校验），再建 Python 环境，最后自检。
         // 每一步按 postInstallWeights 分到一段进度条：不这样摊，用户看到的就是「卡在 99% 半小时」。
         const postScripts = (Array.isArray(m.postInstall) ? m.postInstall : (m.postInstall ? [m.postInstall] : []))
@@ -641,8 +706,9 @@ async function install(id, { force = false, mirror = '', jobs = 0 } = {}) {    c
           const weight = weightOf(i);
           rec.phase = phaseFor(script);
           rec.progress = Math.min(99, Math.round(90 + (weightDone / weightTotal) * 9));
-          // 唱歌权重要下 2.6GB，网络慢时 45 分钟不够；其余步骤沿用原来的上限。
-          const timeoutMs = (script.includes('fetch-svs') ? 150 : 45) * 60_000;
+          // 唱歌权重要下 2.6GB、本地语音包的 vendor+models 是 2.9GB：慢网 45 分钟不够，
+          // 超时的表现只是「安装失败」，用户完全看不出是网速（2026-11-01）。
+          const timeoutMs = (script.includes('fetch-svs') || script.includes('fetch-models') ? 150 : 45) * 60_000;
           const okPost = await new Promise((resolve) => {
             const env = { ...process.env };
             if (mirror) env.SURFCORE_GH_MIRROR = String(mirror);

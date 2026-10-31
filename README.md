@@ -58,10 +58,18 @@ node scripts/setup-dsh.mjs
 
 ### 关于“本地模型 1”
 
-语音包 `voice-local` 的模型不在本仓库，也不随本仓库分发。首次安装时，插件会从上游
-[`Mieksido/surfvoicelocal`](https://github.com/Mieksido/surfvoicelocal) 的 Release `v0.1.0`
-下载原始模型资产（vendor / models / voicepack）。也就是说：**新用户拿到的是上游原始语音包，
-不是本仓库作者机器上改过的音色或配置副本。**
+语音包 `voice-local` 的**代码**在本仓库的语音包仓库
+[`sprintkey666-gg/surfvoicelocal-sprintkey`](https://github.com/sprintkey666-gg/surfvoicelocal-sprintkey)；
+模型与 vendor（约 3GB）在该仓库的 Release `voice-local-v1.1.0`，首次安装时由插件下载。
+源码取该仓库的 `main`（1.1.1 起音色定义 `voices/` 已入仓，装完即有默认音色）。
+
+这个本地包是**改版**，不是上游原版：默认大肥鱼音色 `da-fei-yu-gsv`，带 RVC 语音/唱歌转换
+（Applio + `.venv-rvc`）。上游是
+[`Mieksido/surfvoicelocal`](https://github.com/Mieksido/surfvoicelocal)（loli12 音色），本仓库的
+修改部分与它同源。
+
+模型权重（大肥鱼 GPT-SoVITS / RVC）为 **CC BY-NC 4.0**（YinZilu / 尹紫鹭幻想社），
+非商业、需署名；代码 MIT。详见语音包仓库的 `THIRD_PARTY_NOTICES.md`。
 
 ---
 
