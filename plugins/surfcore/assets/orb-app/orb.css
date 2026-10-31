@@ -1,0 +1,190 @@
+/* 悬浮球 + 面板。窗口本身是 72×72（收起）→ 380×540（展开），
+   所以这里只需要在两种尺寸下把内容摆对，不负责窗口大小。 */
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; padding: 0; height: 100%; width: 100%;
+  background: transparent; overflow: hidden;
+  font: 13px/1.5 "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
+  color: #f2f4f8;
+  user-select: none;
+  -webkit-app-region: no-drag;
+}
+
+#root { width: 100%; height: 100%; position: relative; }
+
+/* ── 小球 ───────────────────────────────────────────── */
+/* 思路：一层柔光玻璃 + 一层边缘高光 + 一层落影，和 dsh-orb 那颗球是同一种气质
+   （半透明、有呼吸感、不抢视线），但不用图片资源，纯 CSS 画。 */
+#ball {
+  position: absolute; inset: 0;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 30% 24%, rgba(255,255,255,.95), rgba(255,255,255,.28) 26%, rgba(255,255,255,0) 52%),
+    radial-gradient(circle at 72% 82%, rgba(126,196,255,.55), rgba(126,196,255,0) 58%),
+    linear-gradient(155deg, #7cc4ff 0%, #4a8ff0 46%, #2358c8 100%);
+  box-shadow:
+    0 10px 24px rgba(10, 32, 82, .42),
+    0 2px 6px rgba(10, 32, 82, .28),
+    inset 0 1px 1px rgba(255,255,255,.75),
+    inset 0 -8px 16px rgba(12, 46, 120, .35);
+  display: flex; align-items: center; justify-content: center;
+  cursor: grab; overflow: hidden;
+  transition: transform .18s cubic-bezier(.2,.9,.3,1.2), box-shadow .22s ease, filter .22s ease;
+  will-change: transform;
+}
+/* 外圈一道细高光，球看起来是「玻璃」而不是「色块」。 */
+#ball::after {
+  content: ""; position: absolute; inset: 2px; border-radius: 50%;
+  border: 1px solid rgba(255,255,255,.5);
+  mask: linear-gradient(200deg, #000 12%, transparent 55%);
+  pointer-events: none;
+}
+#ball:hover, #ball.hot {
+  transform: scale(1.05);
+  filter: saturate(1.08) brightness(1.03);
+  box-shadow:
+    0 14px 30px rgba(10, 32, 82, .5),
+    0 2px 6px rgba(10, 32, 82, .3),
+    inset 0 1px 1px rgba(255,255,255,.85),
+    inset 0 -8px 16px rgba(12, 46, 120, .3);
+}
+#ball:active { transform: scale(.99); }
+#ball.dragging { cursor: grabbing; transform: scale(1.02); box-shadow: 0 16px 34px rgba(10,32,82,.5), inset 0 1px 1px rgba(255,255,255,.8); }
+#ball.thinking { animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse {
+  0%,100% { box-shadow: 0 10px 24px rgba(10,32,82,.42), inset 0 1px 1px rgba(255,255,255,.75), inset 0 -8px 16px rgba(12,46,120,.35); }
+  50% { box-shadow: 0 10px 30px rgba(96,170,255,.75), inset 0 1px 1px rgba(255,255,255,.9), inset 0 -8px 16px rgba(12,46,120,.3); }
+}
+
+.avatar {
+  width: 78%; height: 78%; border-radius: 50%;
+  background: #dfe9ff center/cover no-repeat;
+  /* 默认用打包进来的 Q 版头像；设置里填了绝对路径就覆盖成图库里的图。 */
+  background-image: var(--orb-avatar, url("avatar.png"));
+  box-shadow: inset 0 0 0 2px rgba(255,255,255,.65), 0 1px 4px rgba(10,32,82,.25);
+  pointer-events: none;
+}
+.badge {
+  position: absolute; right: 4px; top: 4px;
+  width: 12px; height: 12px; border-radius: 50%;
+  background: #ff5c7a; border: 2px solid #fff;
+}
+.badge.hidden { display: none; }
+
+/* ── 面板 ───────────────────────────────────────────── */
+#root.movable #panel { cursor: move; }
+#root.moving #panel { cursor: grabbing; }
+.panel {
+  position: absolute; inset: 0;
+  display: none;
+  flex-direction: column;
+  border-radius: 16px;
+  background: rgba(22, 25, 33, .96);
+  backdrop-filter: blur(10px);
+  box-shadow: 0 16px 46px rgba(0,0,0,.5), inset 0 0 0 1px rgba(255,255,255,.09);
+  overflow: hidden;
+}
+/* 展开时让面板淡入 + 轻微上浮，配合主进程的窗口插值，看着才顺。 */
+@keyframes panelIn {
+  from { opacity: 0; transform: translateY(6px) scale(.96); }
+  to   { opacity: 1; transform: none; }
+}
+#ball.hidden { display: none; }
+
+/* 桌宠模式：窗口比宠物大（头顶留气泡），展开面板时把宠物藏起来 */
+#root.petmode.expanded #pet { display: none; }
+#root.expanded #pet { opacity: 0; transform: scale(.94); pointer-events: none; }
+#root.expanded #ball { display: none; }
+#root.expanded .panel { display: flex; animation: panelIn .17s ease-out both; }
+
+.head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(255,255,255,.08);
+  background: linear-gradient(135deg, rgba(90,169,255,.16), rgba(255,122,162,.10));
+}
+.head .dot { width: 8px; height: 8px; border-radius: 50%; background: #8a8f98; flex: none; }
+.head .dot.ok { background: #2fbf71; }
+.head .dot.bad { background: #ff5c7a; }
+.head .name { font-weight: 600; font-size: 13px; }
+.head .spacer { flex: 1; }
+.mini {
+  border: 1px solid rgba(255,255,255,.16); background: rgba(255,255,255,.06);
+  color: #dfe6f5; border-radius: 7px; padding: 3px 8px; font-size: 11.5px; cursor: pointer;
+}
+.mini:hover { background: rgba(255,255,255,.14); }
+/* 图钉：固定后高亮，一眼看出「现在不会自己收起」。 */
+.mini.pin { padding: 3px 6px; font-size: 12px; line-height: 1.1; filter: grayscale(1) opacity(.65); }
+.mini.pin.on { filter: none; background: rgba(90,169,255,.28); border-color: rgba(90,169,255,.7); }
+
+.bubbles { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+.bubbles::-webkit-scrollbar { width: 6px; }
+.bubbles::-webkit-scrollbar-thumb { background: rgba(255,255,255,.16); border-radius: 3px; }
+.empty { color: rgba(255,255,255,.34); font-size: 12px; text-align: center; margin-top: 22px; }
+
+#pet { transform: translate(var(--pet-dx, 0px), var(--pet-dy, 0px)); }
+.petStage { transition: opacity .16s ease, transform .16s ease; }
+
+.row { display: flex; gap: 8px; align-items: flex-start; width: 100%; }
+.row.her { flex-direction: row; }
+.row.me { flex-direction: row-reverse; }
+.row .ava { width: 26px; height: 26px; flex: 0 0 26px; border-radius: 50%; object-fit: cover; background: rgba(255,255,255,.12); }
+.row .ava.noava { background: linear-gradient(145deg, #5ec1ff, #2b6fd3); }
+.row .ava-gap { width: 0; }
+.row .col { display: flex; flex-direction: column; gap: 3px; max-width: calc(100% - 34px); }
+.row.me .col { align-items: flex-end; }
+.row .who { font-size: 10.5px; color: rgba(255,255,255,.55); }
+.row .who .tag { margin-left: 5px; }
+
+.screenhint { display: flex; align-items: center; gap: 8px; margin: 6px 10px 0; padding: 6px 9px; border-radius: 9px; font-size: 11.5px; color: #ffd9a8; background: rgba(255,176,80,.14); border: 1px solid rgba(255,176,80,.3); }
+.screenhint.hidden { display: none; }
+.screenhint .shbtn { margin-left: auto; padding: 3px 9px; border-radius: 7px; border: 1px solid rgba(255,176,80,.5); background: rgba(255,176,80,.2); color: #ffe6c2; font-size: 11px; cursor: pointer; }
+.screenhint .shbtn:disabled { opacity: .6; cursor: default; }
+.mini.move.on { background: rgba(90,169,255,.35); border-color: rgba(90,169,255,.6); color: #fff; }
+
+.bubble { max-width: 84%; padding: 7px 10px; border-radius: 12px; font-size: 12.5px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+.bubble.her { align-self: flex-start; background: rgba(90,169,255,.20); border: 1px solid rgba(90,169,255,.28); }
+.bubble.me { align-self: flex-end; background: rgba(255,255,255,.10); border: 1px solid rgba(255,255,255,.14); }
+.bubble.proactive { border-color: rgba(255,122,162,.42); background: rgba(255,122,162,.16); }
+.bubble .meta { display: block; margin-top: 3px; font-size: 10px; color: rgba(255,255,255,.42); }
+.bubble .tag { display: inline-block; margin-right: 4px; padding: 0 5px; border-radius: 6px; font-size: 9.5px; background: rgba(255,122,162,.35); }
+
+.composer { display: flex; gap: 6px; padding: 10px 12px; border-top: 1px solid rgba(255,255,255,.08); }
+.composer input {
+  flex: 1; min-width: 0; height: 32px; border-radius: 9px; padding: 0 10px;
+  border: 1px solid rgba(255,255,255,.16); background: rgba(255,255,255,.06);
+  color: #f2f4f8; font-size: 12.5px; outline: none; user-select: text;
+}
+.composer input:focus { border-color: rgba(90,169,255,.7); }
+.send {
+  width: 44px; height: 32px; border: none; border-radius: 9px; cursor: pointer;
+  background: linear-gradient(135deg, #5aa9ff, #2f6fe4); color: #fff; font-size: 12.5px; font-weight: 600;
+}
+.send:disabled { opacity: .5; cursor: default; }
+.hint { padding: 0 12px 8px; font-size: 11px; color: rgba(255,255,255,.42); min-height: 14px; }
+.hint.bad { color: #ff8ba3; }
+.mini.eye { padding: 3px 6px; font-size: 12px; line-height: 1.1; filter: grayscale(1) opacity(.6); }
+.mini.eye.on { filter: none; background: rgba(90,208,255,.3); border-color: rgba(90,208,255,.65); box-shadow: 0 0 10px rgba(90,208,255,.35); }
+.mini.eye.busy { animation: eyePulse 1s ease-in-out infinite; }
+@keyframes eyePulse { 0%, 100% { opacity: .5; } 50% { opacity: 1; } }
+/* 会话气泡里的图（表情包 / 本地图 / 生图），宽度封顶 220px */
+.bubble.haspic { white-space: normal; padding: 6px; }
+.bubble .pic { display: block; width: auto; height: auto; max-width: 100%; max-height: 240px; border-radius: 9px; object-fit: contain; }
+.bubble .pic + span.meta { display: block; margin-top: 3px; }
+
+/* 面板头的「图」按钮 */
+.mini.pic { padding: 3px 6px; font-size: 12px; line-height: 1.1; }
+.mini.pic.busy { opacity: .65; }
+.mini.pic.hidden { display: none; }
+
+/* 提示条：3 秒后渐隐（JS 加 .fade），不留常驻条 */
+.screenhint.fade { opacity: 0; transition: opacity 600ms ease-out; }
+.screenhint { transition: opacity 300ms ease-out; }
+
+/* 「有新消息 ↓」圆形小按钮：只在主人往上翻历史时出现 */
+.jump { position: absolute; right: 16px; bottom: 76px; z-index: 6; min-width: 26px; height: 26px; padding: 0 4px;
+  border-radius: 50%; border: 1px solid rgba(90,169,255,.5); background: rgba(30,48,74,.92); color: #cfe6ff;
+  font-size: 12px; line-height: 1; cursor: pointer; box-shadow: 0 4px 12px rgba(0,0,0,.45);
+  display: flex; align-items: center; justify-content: center; font-variant-numeric: tabular-nums; }
+.jump:hover { background: rgba(42,66,100,.96); }
+.jump.hidden { display: none; }

@@ -1,0 +1,12 @@
+node_modules/
+config.json
+state/
+audio/
+dist/
+_backups/
+roles/小鲸鱼.md
+plugins/surfcore/docs/
+*.bak
+*.bak-*
+.DS_Store
+Thumbs.db

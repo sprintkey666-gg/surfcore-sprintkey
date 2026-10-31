@@ -1,0 +1,9 @@
+{
+  "name": "surfcore-orb",
+  "productName": "SurfCore ������",
+  "version": "0.9.2",
+  "private": true,
+  "description": "SurfCore �������������������������˵����Ҳ�ܿ��������Ļ",
+  "main": "main.js",
+  "surfcoreOrb": true
+}

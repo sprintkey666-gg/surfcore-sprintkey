@@ -1,0 +1,821 @@
+// SurfCore 悬浮窗（Orb）宿主
+//
+// 这是一个**独立的 Electron 进程**，由插件（lib/orb.js）spawn 起来。它只做三件事：
+//   1. 在桌面右缘放一个半透明小球（无边框、透明、始终置顶、不进任务栏）；
+//   2. 悬停展开成对话面板，把 `state.json` 里的消息画出来、把用户输入交给插件；
+//   3. 跟插件（/dsh-surfcore/orb-api）通信，DSH 退出或端口漂移时自己收拾干净。
+//
+// 为什么不直接 fetch 插件的 HTTP：页面是 file:// 起的，跨源会被 CORS 拦；
+// 而且令牌要留在主进程里，渲染进程只拿数据。所有 HTTP 都走主进程。
+// 注意：这个文件是 **CommonJS**（package.json 没有 "type": "module"）。
+// 曾用 import 写过，Electron 会把它当 ES module 重新解析，于是 __dirname 未定义，
+// 窗口创建直接抛 ReferenceError、球根本不出现（2026-10-31 踩过）。别改回 import。
+const { app, BrowserWindow, ipcMain, screen, Menu } = require('electron');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+const COLLAPSED = 72;
+const MIN_BALL = 44;
+// 桌宠大小：右键滑条改的是这一档，和插件里的 ball.petSize 各管一边（本地微调优先）
+const PET_MIN = 120;
+const PET_MAX = 320;
+const MAX_BALL = 96;
+const PET_BUBBLE_SPACE = 110; // 桌宠头顶留给气泡的高度
+const PET_SIDE_SPACE = 40;    // 桌宠左右留白（甩动/反馈动画会往外一点）
+const EXPANDED = { width: 380, height: 540 };
+const STATE_POLL_MS = 3000;
+const MAX_STATE_FAILURES = 6;
+const ANIM_MS = 170;
+
+const ORB_DIR = process.env.SURFCORE_ORB_DIR || path.join(os.homedir(), '.dsh', 'surfcore', 'orb');
+const HOST_FILE = path.join(ORB_DIR, 'host.json');
+const LOG_FILE = path.join(ORB_DIR, 'orb-app.log');
+const PREFS_FILE = path.join(ORB_DIR, 'prefs.json');
+
+let win = null;
+let expanded = false;
+let failures = 0;
+let pollTimer = null;
+let animTimer = null;
+// 动画进行中不许记「球的尺寸」，否则会把中途的窗口尺寸当成球大小写进 prefs。
+let animating = false;
+// 动画期间被挡下的最后一次展开/收起请求（长按连点会让它们互相打架）
+let pendingExpand = null;
+let hostCache = { at: 0, data: null };
+// 收起状态下球的位置/大小。展开再收起必须回到这里，不然球会「跑位」。
+let ballRect = null;
+let prefs = { ballSize: COLLAPSED, x: null, y: null, panelWidth: EXPANDED.width, panelHeight: EXPANDED.height };
+
+/** 收起状态下的窗口尺寸：桌宠是「宠物 + 头顶气泡 + 一点余量」，球就是球。 */
+function baseSize() {
+  const pet = readPet();
+  if (pet && pet.mode === 'pet' && pet.manifest) {
+    const wanted = Number(prefs.petSize) || Number(pet.size) || 200;
+    const size = Math.min(Math.max(Math.round(wanted), PET_MIN), PET_MAX);
+    return { width: size + PET_SIDE_SPACE, height: size + PET_BUBBLE_SPACE, pet: true };
+  }
+  const size = Math.min(Math.max(Math.round(prefs.ballSize || COLLAPSED), MIN_BALL), MAX_BALL);
+  return { width: size, height: size, pet: false };
+}
+
+/** host.json 里插件写的形象配置（球/桌宠 + 素材目录 + 动画清单）。 */
+let petCache = { at: 0, data: null };
+function readPet() {
+  const now = Date.now();
+  if (now - petCache.at < 3000) return petCache.data;
+  let pet = null;
+  // host.json 是插件那边定时重写的，启动瞬间有可能正好读到写了一半的文件。
+  // 读到坏的先等一会儿再读一次，还不行就退回上一次成功的结果，别因为一次抢读就把形象踢回小球。
+  for (let i = 0; i < 3; i += 1) {
+    const host = readHost();
+    if (host?.pet && typeof host.pet === 'object') { pet = host.pet; break; }
+    if (i < 2) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150);
+  }
+  if (!pet) pet = petCache.data;
+  // host.json 里没有 pet（插件刚重写/还没轮到定时写），就直接读素材目录里的 manifest：
+  // 桌面端不该因为一份缓存文件没刷新就退回小球。
+  if (!pet) {
+    try {
+      const dir = path.join(ORB_DIR, 'pet');
+      const manifest = JSON.parse(fs.readFileSync(path.join(dir, 'manifest.json'), 'utf8'));
+      if (manifest && Array.isArray(manifest.idle) && manifest.idle.length) {
+        pet = { mode: 'pet', size: prefs.petSize || 200, dir, manifest, singleClickOpens: false, idleMinMs: 6000, idleMaxMs: 16000 };
+      }
+    } catch {}
+  }
+  petCache = { at: now, data: pet };
+  return pet;
+}
+
+function log(...args) {
+  const line = `${new Date().toISOString()} ${args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ')}`;
+  try { fs.mkdirSync(ORB_DIR, { recursive: true }); fs.appendFileSync(LOG_FILE, `${line}\n`); } catch {}
+  console.log(line);
+}
+
+function readHost() {
+  const now = Date.now();
+  if (hostCache.data && now - hostCache.at < 5000) return hostCache.data;
+  try {
+    const raw = fs.readFileSync(HOST_FILE, 'utf8');
+    const data = JSON.parse(raw);
+    if (!data?.baseUrl || !data?.token) throw new Error('host.json 缺 baseUrl/token');
+    hostCache = { at: now, data };
+    return data;
+  } catch (error) {
+    hostCache = { at: now, data: null };
+    log('[orb] 读 host.json 失败：', String(error?.message ?? error));
+    return null;
+  }
+}
+
+/** 所有对插件的请求都从这里走（主进程 fetch，令牌不出主进程）。 */
+async function call(apiPath, { method = 'GET', body = null, timeoutMs = 30000 } = {}) {
+  const host = readHost();
+  if (!host) return { ok: false, error: '还没连上 SurfCore（host.json 未生成，DSH 启动后会自动写）' };
+  const url = `${String(host.baseUrl).replace(/\/+$/, '')}${host.api || '/dsh-surfcore/orb-api'}${apiPath}`;
+  const headers = { 'x-orb-token': String(host.token), accept: 'application/json' };
+  if (body !== null) headers['content-type'] = 'application/json';
+  try {
+    const res = await fetch(url, {
+      method,
+      headers,
+      body: body === null ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const text = await res.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text.slice(0, 400) }; }
+    if (!res.ok) {
+      // 401 常见于「DSH 重启换了令牌」：强制下一次重读 host.json。
+      if (res.status === 401) hostCache = { at: 0, data: null };
+      return { ok: false, status: res.status, error: data?.error || `HTTP ${res.status}`, data };
+    }
+    return { ok: true, status: res.status, data };
+  } catch (error) {
+    return { ok: false, error: String(error?.message ?? error) };
+  }
+}
+
+function clampToDisplay(x, y, width, height) {
+  const area = screen.getDisplayNearestPoint({ x, y }).workArea;
+  const maxX = area.x + area.width - width;
+  const maxY = area.y + area.height - height;
+  return {
+    x: Math.min(Math.max(x, area.x), Math.max(area.x, maxX)),
+    y: Math.min(Math.max(y, area.y), Math.max(area.y, maxY)),
+  };
+}
+
+/**
+ * 按「此刻的形态」夹位置。
+ * 桌宠窗口左右各有 PET_SIDE_SPACE/2 的透明边——用整窗宽去夹，宠物身体就永远离屏幕边 20px，
+ * 主人会以为「明明还能再往里拖」。收起态的桌宠允许整窗出屏这 20px，宠物身体才真的贴得到边。
+ */
+function clampForMode(x, y, width, height) {
+  const petSide = baseSize().pet && displayMode !== 'expanded' ? Math.round(PET_SIDE_SPACE / 2) : 0;
+  if (!petSide) return clampToDisplay(x, y, width, height);
+  const area = screen.getDisplayNearestPoint({ x, y }).workArea;
+  const minX = area.x - petSide;
+  const maxX = area.x + area.width - width + petSide;
+  const maxY = area.y + area.height - height;
+  return {
+    x: Math.min(Math.max(x, minX), Math.max(minX, maxX)),
+    y: Math.min(Math.max(y, area.y), Math.max(area.y, maxY)),
+  };
+}
+
+function readPrefs() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(PREFS_FILE, 'utf8'));
+    const size = Number(raw?.ballSize);
+    const pw = Number(raw?.panelWidth);
+    const ph = Number(raw?.panelHeight);
+    const petSize = Number(raw?.petSize);
+    prefs = {
+      // 0 和 null 都算「没设过」：JSON 里 null 转 Number 是 0，直接夹会变成最小尺寸（踩过）
+      petSize: Number.isFinite(petSize) && petSize > 0 ? Math.min(Math.max(Math.round(petSize), PET_MIN), PET_MAX) : null,
+      ballSize: Number.isFinite(size) ? Math.min(Math.max(Math.round(size), MIN_BALL), MAX_BALL) : COLLAPSED,
+      x: Number.isFinite(Number(raw?.x)) ? Number(raw.x) : null,
+      y: Number.isFinite(Number(raw?.y)) ? Number(raw.y) : null,
+      panelWidth: Number.isFinite(pw) ? Math.round(pw) : EXPANDED.width,
+      panelHeight: Number.isFinite(ph) ? Math.round(ph) : EXPANDED.height,
+      // 主人拖过面板之后的位置：下次展开还回原处，收起时桌宠也落在那边。
+      // 0 当作「没设过」：否则面板会跑到左上角（历史上 commit 过一次 0,0）
+    panelX: Number.isFinite(Number(raw?.panelX)) && Number(raw.panelX) > 0 ? Math.round(Number(raw.panelX)) : null,
+      panelY: Number.isFinite(Number(raw?.panelY)) && Number(raw.panelY) > 0 ? Math.round(Number(raw.panelY)) : null,
+    };
+  } catch {
+    prefs = { ballSize: COLLAPSED, petSize: null, x: null, y: null, panelWidth: EXPANDED.width, panelHeight: EXPANDED.height, panelX: null, panelY: null };
+  }
+  return prefs;
+}
+
+function writePrefs(patch = {}) {
+  prefs = { ...prefs, ...patch };
+  try {
+    fs.mkdirSync(ORB_DIR, { recursive: true });
+    fs.writeFileSync(PREFS_FILE, `${JSON.stringify(prefs, null, 2)}\n`, 'utf8');
+  } catch (error) {
+    log('[orb] 写 prefs 失败：', String(error?.message ?? error));
+  }
+}
+
+/** 记住「收起时的球」在哪、多大——展开再收起要原样回去。 */
+function rememberBall() {
+  if (!win || win.isDestroyed() || expanded || animating) return;
+  const b = win.getBounds();
+  // 尺寸走 baseSize()：桌宠模式是「宠物+气泡」，球模式是球；
+  // 绝不能把动画中途的窗口尺寸当成基准尺寸写进 prefs（曾经写成 272 那种鬼数字）。
+  const base = baseSize();
+  const width = Math.min(Math.max(Math.round(base.width), MIN_BALL), PANEL_MAX_W);
+  const height = Math.min(Math.max(Math.round(base.height), MIN_BALL), PANEL_MAX_H);
+  ballRect = { x: b.x, y: b.y, width, height };
+  // 球的尺寸只可能是 MIN_BALL~MAX_BALL；桌宠模式一律不写，免得把 240 那种窗口宽度写进 ballSize
+  // （readPet 偶尔拿不到 pet 时会走到这里，曾经把 247 写进去，之后收起就变成一坨大窗口）。
+  // ballSize 只由 orb:resize 明确改，这里一律不写：桌宠窗口宽度、展开中途的尺寸都曾经被误记成球的大小。
+  writePrefs({ x: b.x, y: b.y });
+}
+
+/**
+ * 任何写进窗口的 bounds 都先过这里：
+ * 尺寸夹到 [MIN_BALL, PANEL_MAX_*]，位置保证整窗留在工作区内。
+ * 长按/拖拽/缩放这些路径都走它，避免窗口被撑大或推出屏幕（主人踩过：变大后进侧边栏就不见了）。
+ */
+function safeBounds(target) {
+  const width = Math.min(Math.max(Math.round(Number(target?.width) || MIN_BALL), MIN_BALL), PANEL_MAX_W);
+  const height = Math.min(Math.max(Math.round(Number(target?.height) || MIN_BALL), MIN_BALL), PANEL_MAX_H);
+  const rawX = Number(target?.x);
+  const rawY = Number(target?.y);
+  const pos = clampForMode(
+    Number.isFinite(rawX) ? Math.round(rawX) : prefs.x ?? 0,
+    Number.isFinite(rawY) ? Math.round(rawY) : prefs.y ?? 0,
+    width,
+    height,
+  );
+  return { ...pos, width, height };
+}
+
+/**
+ * 当前窗口「应该」是多大：模式不变量。
+ * 主人踩过两次：左键长按 / 面板误缩放之后窗口一直变大，最后钻进屏幕外找不回来。
+ * 根因是各条写窗口的路径各算各的尺寸，谁也没按「此刻该是什么形态」校一次。
+ * 现在只认三种形态，任何写窗口的地方都过 applyBounds() 校回来：
+ *   collapsed 收起态 —— 必须正好是宠物/小球的尺寸
+ *   expanded  展开态 —— 必须是面板尺寸（prefs 里记的，夹在 PANEL_MIN~MAX）
+ *   menu      菜单态 —— 窗口保持收起尺寸，菜单画在窗口内部，不撑大窗口
+ */
+let displayMode = 'collapsed';
+// 菜单态要用的额外尺寸（宽/高），由 orb:menurect 按菜单实际大小写进来
+let menuNeed = null;
+
+function expectedBounds() {
+  const cur = win && !win.isDestroyed() ? win.getBounds() : null;
+  const base = baseSize();
+  if (displayMode === 'menu' && menuNeed) {
+    const anchor = cur || { x: 0, y: 0, width: menuNeed.width, height: menuNeed.height };
+    return { x: anchor.x, y: anchor.y, width: menuNeed.width, height: menuNeed.height };
+  }
+  if (displayMode === 'expanded') {
+    const width = Math.min(PANEL_MAX_W, Math.max(PANEL_MIN_W, Math.round(prefs.panelWidth || EXPANDED.width)));
+    const height = Math.min(PANEL_MAX_H, Math.max(PANEL_MIN_H, Math.round(prefs.panelHeight || EXPANDED.height)));
+    const anchor = ballRect || cur || { x: 0, y: 0, width, height };
+    return { x: anchor.x + anchor.width - width, y: anchor.y, width, height };
+  }
+  const width = base.width;
+  const height = base.height;
+  // 收起态保住右下角不动：视觉上像从面板缩回宠物，不会「跳走」。
+  const x = cur ? cur.x + cur.width - width : (prefs.x ?? 0);
+  const y = cur ? cur.y + cur.height - height : (prefs.y ?? 0);
+  return { x, y, width, height };
+}
+
+/** 所有写窗口的唯一出口：先夹物理上限，再按模式锁死不该变的维度。 */
+function applyBounds(target, reason = '') {
+  if (!win || win.isDestroyed()) return null;
+  const want = safeBounds(target || {});
+  const lock = expectedBounds();
+  // 不变式：位置可以由调用方指定，尺寸只认「此刻该有的形态」。
+  // 主人踩过：点「移」拖面板时窗口一路变大——因为渲染端把当前宽高又传回来、叠加。
+  const next = {
+    x: Number.isFinite(Number(want.x)) ? want.x : lock.x,
+    y: Number.isFinite(Number(want.y)) ? want.y : lock.y,
+    width: reason === 'panel-move' ? lock.width : want.width,
+    height: reason === 'panel-move' ? lock.height : want.height,
+  };
+  if (displayMode !== 'expanded') {
+    // 收起态 / 菜单态：尺寸只有一个合法值（宠物或小球），任何路径都改不动它。
+    next.width = lock.width;
+    next.height = lock.height;
+  } else {
+    // 展开态：允许沿边缘缩放，但夹在面板上下限之间（applyBounds 的 want 已经夹过物理上限）。
+    next.width = Math.min(PANEL_MAX_W, Math.max(PANEL_MIN_W, next.width));
+    next.height = Math.min(PANEL_MAX_H, Math.max(PANEL_MIN_H, next.height));
+  }
+  const pos = clampToDisplay(next.x, next.y, next.width, next.height);
+  const final = { ...pos, width: next.width, height: next.height };
+  const before = win.getBounds();
+  if (
+    before.x === final.x && before.y === final.y &&
+    before.width === final.width && before.height === final.height
+  ) return final;
+  if (process.env.ORB_TRACE === '1') {
+    log(`[orb] bounds ${reason || '-'} ${JSON.stringify(before)} -> ${JSON.stringify(final)}`);
+  }
+  win.setBounds(final);
+  return final;
+}
+
+const easeOut = (t) => 1 - (1 - t) ** 3;
+
+/** 逐帧改窗口 bounds。Electron 在 Windows 上没有动画参数，自己插值才「丝滑」。 */
+function animateTo(target, { duration = ANIM_MS, reason = '' } = {}) {
+  if (!win || win.isDestroyed()) return Promise.resolve();
+  const from = win.getBounds();
+  const to = applyBounds(target, reason || 'animate');
+  if (!to) return Promise.resolve();
+  if (
+    from.x === to.x && from.y === to.y &&
+    from.width === to.width && from.height === to.height
+  ) return Promise.resolve();
+  if (animTimer) { clearInterval(animTimer); animTimer = null; }
+  animating = true;
+  const startedAt = Date.now();
+  return new Promise((resolve) => {
+    const step = () => {
+      if (!win || win.isDestroyed()) { clearInterval(animTimer); animTimer = null; animating = false; resolve(); return; }
+      const t = Math.min(1, (Date.now() - startedAt) / duration);
+      const k = easeOut(t);
+      win.setBounds({
+        x: Math.round(from.x + (to.x - from.x) * k),
+        y: Math.round(from.y + (to.y - from.y) * k),
+        width: Math.round(from.width + (to.width - from.width) * k),
+        height: Math.round(from.height + (to.height - from.height) * k),
+      });
+      if (t >= 1) { clearInterval(animTimer); animTimer = null; animating = false; resolve(); }
+    };
+    animTimer = setInterval(step, 8);
+    step();
+  });
+}
+
+/**
+ * 展开目标：面板要「贴着宠物长、又要整块留在屏幕里」。
+ *  - 主人拖过面板（prefs.panelX/Y）就回原位，这是他自己放的地方；
+ *  - 没拖过就按哪边空间大往哪边长；
+ *  - 竖直方向以宠物中心对齐面板中心，再夹进工作区（以前固定 y=宠物顶，靠近屏幕底就会压住宠物）。
+ */
+function expandTarget() {
+  const base = ballRect || { ...win.getBounds() };
+  const area = screen.getDisplayNearestPoint({ x: base.x, y: base.y }).workArea;
+  const width = Math.min(PANEL_MAX_W, Math.max(PANEL_MIN_W, Math.round(prefs.panelWidth || EXPANDED.width)));
+  const height = Math.min(PANEL_MAX_H, Math.max(PANEL_MIN_H, Math.round(prefs.panelHeight || EXPANDED.height)));
+  if (Number.isFinite(prefs.panelX) && Number.isFinite(prefs.panelY)) {
+    return { ...clampToDisplay(prefs.panelX, prefs.panelY, width, height), width, height };
+  }
+  const roomLeft = base.x - area.x;
+  const roomRight = area.x + area.width - (base.x + base.width);
+  // 空间够就贴着宠物长，两边都不够就挑大的那边、让面板覆盖在宠物上方
+  const growLeft = roomRight >= width || (roomLeft >= width ? false : roomLeft >= roomRight);
+  const x = growLeft ? base.x + base.width - width : base.x;
+  const centerY = base.y + Math.round((base.height - height) / 2);
+  const pos = clampToDisplay(x, centerY, width, height);
+  return { ...pos, width, height };
+}
+
+/** 「原地变小球」：把面板右下角收回去，视觉上像缩回球里（面板被拖过就落在面板那里）。 */
+function collapseTarget() {
+  if (ballRect) return { ...ballRect };
+  const cur = win.getBounds();
+  const base = baseSize();
+  return { ...clampToDisplay(cur.x + cur.width - base.width, cur.y, base.width, base.height), width: base.width, height: base.height };
+}
+
+function applyBallSize(px) {
+  if (!win || win.isDestroyed()) return prefs.ballSize;
+  if (baseSize().pet) return prefs.ballSize; // 桌宠大小走配置，不用滚轮改
+  const size = Math.min(Math.max(Math.round(px), MIN_BALL), MAX_BALL);
+  writePrefs({ ballSize: size });
+  if (!expanded) {
+    const cur = win.getBounds();
+    const area = screen.getDisplayNearestPoint({ x: cur.x, y: cur.y }).workArea;
+    // 以「右边缘和垂直中心」为锚点缩放，视觉上球是原地变大变小。
+    const cx = cur.x + cur.width;
+    const cy = cur.y + cur.height / 2;
+    const pos = clampToDisplay(cx - size, cy - size / 2, size, size);
+    animateTo({ ...pos, width: size, height: size }, { duration: 110 }).then(rememberBall);
+    ballRect = { ...pos, width: size, height: size };
+  }
+  return size;
+}
+
+async function setExpanded(on) {
+  if (!win || win.isDestroyed()) return false;
+  const want = Boolean(on);
+  if (want === expanded) return expanded;
+  // 动画没结束就再来一次展开/收起，会让「收回去的位置」和「长出来的尺寸」错位，
+  // 主人长按时正好把这对操作打成连环，窗口一次比一次大。这里串行化：只记最后一次请求。
+  if (animating) {
+    pendingExpand = want;
+    return expanded;
+  }
+  pendingExpand = null;
+  if (!want) {
+    // 收起 = 回到「主人把桌宠放在哪」那个位置（ballRect），**不跟着面板走**。
+    // 之前这里把 ballRect 改到面板右下角，结果一开一收桌宠就自己挪窝了（主人明确要求位置只由他决定）。
+    expanded = false;
+    displayMode = 'collapsed';
+    await animateTo(collapseTarget(), { reason: 'collapse' });
+    try { win.setAlwaysOnTop(true, 'screen-saver'); } catch {}
+    await flushPendingExpand();
+    return expanded;
+  }
+  rememberBall();
+  expanded = true;
+  displayMode = 'expanded';
+  await animateTo(expandTarget(), { reason: 'expand' });
+  try { win.setAlwaysOnTop(true, 'screen-saver'); win.moveTop(); } catch {}
+  await flushPendingExpand();
+  return expanded;
+}
+
+/** 动画结束后补做最后一次被挡住的展开/收起，避免请求丢失。 */
+async function flushPendingExpand() {
+  const want = pendingExpand;
+  pendingExpand = null;
+  if (want === null || want === undefined) return;
+  if (Boolean(want) === expanded) return;
+  await setExpanded(want);
+}
+
+
+function createWindow() {
+  readPrefs();
+  const area = screen.getPrimaryDisplay().workArea;
+  const base = baseSize();
+  const size = base.width;
+  const height = base.height;
+  const startX = prefs.x ?? area.x + area.width - size - 12;
+  const startY = prefs.y ?? area.y + Math.round(area.height * 0.42);
+  // 上次可能是在屏外（换分辨率/拔了副屏）存的坐标：开局先夹回可视区域，
+  // 否则球一启动就贴在屏幕外面，用户以为程序没跑起来。
+  const startPos = clampToDisplay(Math.round(startX), Math.round(startY), size, height);
+  win = new BrowserWindow({
+    width: size,
+    height: height,
+    x: startPos.x,
+    y: startPos.y,
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    hasShadow: false,
+    resizable: false,
+    movable: true,
+    skipTaskbar: true,
+    focusable: true,
+    fullscreenable: false,
+    minimizable: false,
+    maximizable: false,
+    alwaysOnTop: true,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+    },
+  });
+  win.setAlwaysOnTop(true, 'screen-saver');
+  // 注意：Windows 上不要调 setVisibleOnAllWorkspaces —— 它会把窗口标成「跨虚拟桌面可见」，
+  // 结果 DWM 直接把窗口 cloaked 掉：Electron 自己说 visible=true，屏幕上却什么都没有。
+  if (process.platform === 'darwin') {
+    win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  }
+  // 渲染进程出问题时球会「看得见窗口、看不见内容」：把渲染侧的报错也写进日志，
+  // 否则只有黑屏/透明一片，从日志里查不出来。
+  win.webContents.on('did-fail-load', (_e, code, desc, url) => log('[orb] 页面加载失败', code, desc, url));
+  win.webContents.on('render-process-gone', (_e, details) => log('[orb] 渲染进程挂了', JSON.stringify(details)));
+  win.webContents.on('console-message', (_e, level, message, line, source) => {
+    if (level >= 2) log('[orb][renderer]', String(message).slice(0, 300), `@${String(source || '').split('/').pop()}:${line}`);
+  });
+  win.loadFile(path.join(__dirname, 'index.html'));
+  win.once('ready-to-show', () => {
+    // 不要抢焦点：主人可能正在打字。
+    try { win.showInactive(); } catch { win.show(); }
+    // Windows 上 screen-saver 级别对某些全屏/顶置窗口压不住，每次显示后再提一次最前。
+    try { win.setAlwaysOnTop(true, 'screen-saver'); win.moveTop(); } catch {}
+    try {
+      const b = win.getBounds();
+      log('[orb] ready-to-show', `bounds=${b.x},${b.y},${b.width}x${b.height}`, `visible=${win.isVisible()}`);
+      ballRect = { x: b.x, y: b.y, width: b.width, height: b.height };
+      writePrefs({ ballSize: b.width, x: b.x, y: b.y });
+    } catch {}
+    // 自检：DOM 有没有真的画出来。球「窗口可见但屏幕上一片空」时，
+    // 十有八九是脚本/样式被 CSP 拦了（file:// 下 'self' 不认），这里直接问页面。
+    win.webContents.executeJavaScript(`(() => {
+      const ball = document.getElementById('ball');
+      const css = [...document.styleSheets].map(s => s.href || 'inline');
+      return {
+        title: document.title,
+        ready: document.readyState,
+        ball: ball ? { w: ball.offsetWidth, h: ball.offsetHeight, bg: getComputedStyle(ball).backgroundImage.slice(0, 60) } : null,
+        sheets: css,
+        hasOrb: typeof window.orb,
+        bodyChildren: document.body ? document.body.children.length : 0,
+      };
+    })()`).then((info) => log('[orb] dom', JSON.stringify(info))).catch((e) => log('[orb] dom check failed', String(e?.message ?? e)));
+  });
+  win.on('closed', () => { win = null; });
+  log('[orb] 窗口已创建');
+}
+
+function startPolling() {
+  const tick = async () => {
+    const res = await call('/state', { timeoutMs: 8000 });
+    if (!win || win.isDestroyed()) return;
+    if (!res.ok) {
+      failures += 1;
+      win.webContents.send('orb:conn', { ok: false, error: res.error || '连不上', failures });
+      if (failures >= MAX_STATE_FAILURES) {
+        log('[orb] 连续连不上插件，自己退出（DSH 可能已关）');
+        app.quit();
+      }
+      return;
+    }
+    failures = 0;
+    // 自愈：万一窗口被撑大 / 推到屏幕外（长按、缩放、停靠都可能），每 3 秒拉回来一次。
+    if (!expanded && !animating && !dragResize && !sizePanel) {
+      const cur = win.getBounds();
+      const base = baseSize();
+      const fix = safeBounds({ x: cur.x, y: cur.y, width: base.width, height: base.height });
+      // 1px 级别的差是 DPI 取整噪声，别每 3 秒拉一次（日志会刷屏、还闪）。
+      const drift = Math.abs(fix.x - cur.x) + Math.abs(fix.y - cur.y) + Math.abs(fix.width - cur.width) + Math.abs(fix.height - cur.height);
+      if (drift > 2) {
+        log('[orb] 收回异常窗口', cur, '->', fix);
+        animateTo(fix, { duration: 120 });
+      }
+    }
+    win.webContents.send('orb:conn', { ok: true });
+    win.webContents.send('orb:state', res.data || null);
+    // 有些窗口（全屏播放器、别的 Electron 应用）会把自己提到最前，球要定期抢回来。
+    try { if (!win.isAlwaysOnTop()) win.setAlwaysOnTop(true, 'screen-saver'); win.moveTop(); } catch {}
+  };
+  tick();
+  pollTimer = setInterval(tick, STATE_POLL_MS);
+}
+
+/** 渲染端拿形象配置：自己是不是桌宠、素材在哪、清单长什么样。 */
+ipcMain.handle('orb:petconfig', () => {
+  const pet = readPet();
+  return {
+    pet: pet
+      ? {
+        mode: pet.mode,
+        size: pet.size,
+        dir: pet.dir,
+        manifest: pet.manifest,
+        singleClickOpens: Boolean(pet.singleClickOpens),
+        idleMinMs: Number(pet.idleMinMs) || 0,
+        idleMaxMs: Number(pet.idleMaxMs) || 0,
+      }
+      : null,
+    base: baseSize(),
+  };
+});
+
+// 鼠标穿透：Windows 上 setIgnoreMouseEvents(true,{forward:true}) 并不能稳定把 move 事件转给渲染进程，
+// 一旦「穿透」了，渲染端就再也收不到 mousemove，命中判定永远翻不回来，她也就点不动了。
+// 所以这里保持窗口可点（不穿透），「只有身体能抓」交给渲染端 petBodyHit 判定。
+ipcMain.handle('orb:hit', (_event, _hit) => {
+  if (!win || win.isDestroyed()) return false;
+  try { win.setIgnoreMouseEvents(false); } catch (error) { log('[orb] 设置鼠标穿透失败', String(error?.message ?? error)); }
+  return true;
+});
+
+// 右键菜单现在由渲染端画成 HTML（原生菜单放不下滑条，而且一弹就是系统样式）。
+// 这个 handler 只留兜底：渲染端要什么就发事件，主进程不再自己 popup。
+ipcMain.handle('orb:menu', () => {
+  if (!win || win.isDestroyed()) return false;
+  try { win.webContents.send('orb:menurequest'); } catch {}
+  return true;
+});
+
+ipcMain.handle('orb:http', async (_event, payload = {}) => {  const apiPath = String(payload.path || '/state');
+  // 只允许相对路径，避免渲染进程把令牌带去别的主机。
+  if (!apiPath.startsWith('/')) return { ok: false, error: '非法路径' };
+  return call(apiPath, {
+    method: payload.method === 'POST' ? 'POST' : 'GET',
+    body: payload.body ?? null,
+    timeoutMs: Number(payload.timeoutMs) > 0 ? Number(payload.timeoutMs) : 60000,
+  });
+});
+
+ipcMain.handle('orb:expand', async (_event, on) => {
+  const result = await setExpanded(on);
+  return { ok: true, expanded: result };
+});
+
+/** 中键滚轮缩放球：传 size 就直接用，传 delta 就相对调。 */
+ipcMain.handle('orb:resize', (_event, payload = {}) => {
+  const current = prefs.ballSize;
+  const rawDelta = Number(payload.delta);
+  const rawSize = Number(payload.size);
+  // 一次滚轮最多 ±16：万一渲染端传了个离谱的 delta（长按、连发），也不能把球一口气吹到天上
+  const delta = Number.isFinite(rawDelta) ? Math.min(Math.max(rawDelta, -16), 16) : 0;
+  const size = Number.isFinite(rawSize) ? Math.min(Math.max(rawSize, MIN_BALL), MAX_BALL) : NaN;
+  const next = Number.isFinite(size) ? size : current + delta;
+  const applied = applyBallSize(next);
+  return { ok: true, size: applied };
+});
+
+ipcMain.handle('orb:prefs', () => ({ ...prefs, expanded, ball: ballRect }));
+
+// ---- 面板边缘拖拽缩放 ----------------------------------------------------
+// 无边框窗口在 Windows 上没有系统缩放边框，这里自己做一套：渲染进程在面板
+// 四边/四角放 8px 的感应区，按下后把鼠标位移传过来，主进程按边算新的 bounds。
+const PANEL_MIN_W = 300;
+const PANEL_MIN_H = 380;
+const PANEL_MAX_W = 960;
+const PANEL_MAX_H = 1000;
+let dragResize = null;
+
+ipcMain.handle('orb:panel-resize-start', (_event, edge) => {
+  if (!win || win.isDestroyed() || !expanded || displayMode !== 'expanded') return { ok: false };
+  dragResize = { edge: String(edge || ''), bounds: { ...win.getBounds() } };
+  return { ok: true, bounds: dragResize.bounds };
+});
+
+ipcMain.handle('orb:panel-resize-move', (_event, delta = {}) => {
+  if (!win || win.isDestroyed() || !dragResize) return { ok: false };
+  const b = dragResize.bounds;
+  const edge = dragResize.edge;
+  const dx = Math.round(Number(delta.dx) || 0);
+  const dy = Math.round(Number(delta.dy) || 0);
+  let x = b.x;
+  let y = b.y;
+  let width = b.width;
+  let height = b.height;
+  if (edge.includes('w')) {
+    width = Math.min(PANEL_MAX_W, Math.max(PANEL_MIN_W, b.width - dx));
+    x = b.x + (b.width - width);
+  }
+  if (edge.includes('e')) {
+    width = Math.min(PANEL_MAX_W, Math.max(PANEL_MIN_W, b.width + dx));
+  }
+  if (edge.includes('n')) {
+    height = Math.min(PANEL_MAX_H, Math.max(PANEL_MIN_H, b.height - dy));
+    y = b.y + (b.height - height);
+  }
+  if (edge.includes('s')) {
+    height = Math.min(PANEL_MAX_H, Math.max(PANEL_MIN_H, b.height + dy));
+  }
+  const area = screen.getDisplayNearestPoint({ x, y }).workArea;
+  width = Math.min(width, area.width);
+  height = Math.min(height, area.height);
+  const pos = applyBounds({ x, y, width, height }, 'resize');
+  return { ok: true, width, height, x: pos?.x ?? x, y: pos?.y ?? y };
+});
+
+ipcMain.handle('orb:panel-resize-end', () => {
+  if (win && !win.isDestroyed()) {
+    const cur = win.getBounds();
+    writePrefs({ panelWidth: cur.width, panelHeight: cur.height });
+  }
+  dragResize = null;
+  return { ok: true };
+});
+
+/** 渲染端松手时用真实 bounds 提交，别信 window.screenX（DPI 换算会漂）。 */
+ipcMain.handle('orb:panel-pos', () => {
+  if (!win || win.isDestroyed()) return { ok: false };
+  const b = win.getBounds();
+  return { ok: true, x: b.x, y: b.y, width: b.width, height: b.height };
+});
+
+/** 面板被人按住拖动：只在展开态生效，松手时才写预置位置。 */
+ipcMain.handle('orb:panel-move', (_event, pos = {}) => {
+  if (!win || win.isDestroyed() || displayMode !== 'expanded') return { ok: false };
+  // 拖动只改位置，尺寸由 applyBounds 锁死在面板尺寸上；拖动同时不做边缘缩放。
+  if (dragResize) return { ok: false };
+  const b = win.getBounds();
+  const x = Number(pos.x);
+  const y = Number(pos.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return { ok: false };
+  const next = applyBounds({ x, y, width: b.width, height: b.height }, 'panel-move');
+  if (pos.commit) writePrefs({ panelX: next.x, panelY: next.y });
+  return { ok: true, ...(next || {}) };
+});
+
+/**
+ * 右键菜单要多大，窗口就临时长多大：
+ * 菜单画在窗口里，宠物 120 时窗口只有 160x230，168x176 的菜单会被裁掉。
+ * 这里只往右下角长，宠物视觉位置由渲染端用 --pet-dx/--pet-dy 补回来。
+ */
+ipcMain.handle('orb:menurect', (_event, size = {}) => {
+  if (!win || win.isDestroyed()) return { ok: false };
+  const needW = Math.max(0, Math.round(Number(size.width) || 0));
+  const needH = Math.max(0, Math.round(Number(size.height) || 0));
+  const base = baseSize();
+  if (!needW && !needH) {
+    displayMode = 'collapsed';
+    menuNeed = null;
+    const back = applyBounds({ ...(ballRect || win.getBounds()), width: base.width, height: base.height }, 'menu-close');
+    return { ok: true, dx: 0, dy: 0, ...(back || {}) };
+  }
+  const cur = win.getBounds();
+  const width = Math.max(base.width, needW + 8);
+  const height = Math.max(base.height, needH + 8);
+  menuNeed = { width, height };
+  displayMode = 'menu';
+  const next = applyBounds({ x: cur.x, y: cur.y, width, height }, 'menu-open');
+  return {
+    ok: true,
+    dx: next ? (next.width - base.width) : 0,
+    dy: next ? (next.height - base.height) : 0,
+    ...(next || {}),
+  };
+});
+ipcMain.handle('orb:move', (_event, pos = {}) => {
+  if (!win || win.isDestroyed()) return { ok: false };
+  const bounds = win.getBounds();
+  const x = Number(pos.x);
+  const y = Number(pos.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return { ok: false };
+  const next = applyBounds({ x, y, width: bounds.width, height: bounds.height }, 'move');
+  if (!expanded) rememberBall();
+  return { ok: true, ...(next || {}) };
+});
+
+ipcMain.handle('orb:dock', () => {
+  if (!win || win.isDestroyed()) return { ok: false };
+  const bounds = win.getBounds();
+  const area = screen.getDisplayNearestPoint({ x: bounds.x, y: bounds.y }).workArea;
+  const distances = [
+    { side: 'left', d: bounds.x - area.x },
+    { side: 'right', d: area.x + area.width - (bounds.x + bounds.width) },
+  ].sort((a, b) => a.d - b.d);
+  // 只有真的贴着边才吸过去；丢在屏幕中间就停在中间（以前这里默认按右缘算，
+  // 所以主人拖到哪松手，球都会被拽回右边的「老位置」）。
+  if (distances[0].d >= 24) {
+    if (!expanded) rememberBall();
+    return { ok: true, docked: false };
+  }
+  const near = distances[0];
+  // 球模式停靠 = 只留 6px 露在屏幕边（鼠标靠近再展开）；
+  // 桌宠模式必须整个留在屏幕里，否则缩进去就再也点不到了（主人踩过）。
+  const petMode = baseSize().pet;
+  const visible = petMode ? 0 : 6;
+  const x = near.side === 'left' ? area.x - bounds.width + visible : area.x + area.width - bounds.width + visible;
+  const y = Math.min(Math.max(bounds.y, area.y), area.y + area.height - bounds.height);
+  applyBounds({ x, y, width: bounds.width, height: bounds.height }, 'dock');
+  if (!expanded) rememberBall();
+  return { ok: true, side: near.side };
+});
+
+// ---- 右键：桌宠大小 ------------------------------------------------------
+// 主人的要求：左键只负责拖动，改大小走右键弹出的小面板 + 滑条。
+const SIZE_PANEL_W = 360;
+const SIZE_PANEL_H = 250;
+let sizePanel = null;
+
+ipcMain.handle('orb:petsize', (_event, payload = {}) => {
+  const size = Math.min(Math.max(Math.round(Number(payload.size) || PET_MIN), PET_MIN), PET_MAX);
+  writePrefs({ petSize: size });
+  if (win && !win.isDestroyed() && !expanded) {
+    const base = baseSize();
+    const cur = win.getBounds();
+    const target = sizePanel
+      ? { x: sizePanel.bounds.x + (sizePanel.bounds.width - SIZE_PANEL_W), y: sizePanel.bounds.y }
+      : { x: cur.x + (cur.width - base.width), y: cur.y };
+    if (sizePanel) {
+      // 面板开着的时候窗口保持面板尺寸，只更新「关掉之后回到多大」
+      return { ok: true, size, base };
+    }
+    animateTo({ ...target, width: base.width, height: base.height }, { duration: 90 });
+  }
+  return { ok: true, size, base: baseSize() };
+});
+
+// 旧版「撑成 360×250 面板」的接口已经废弃：菜单改成窗口内绘制，任何调用都不许改窗口尺寸。
+ipcMain.handle('orb:sizepanel', () => {
+  log('[orb] 忽略已废弃的 orb:sizepanel（菜单已改成窗口内 HTML）');
+  return { ok: true, open: false, deprecated: true, size: baseSize().pet ? prefs.petSize : null };
+});
+
+ipcMain.handle('orb:quit', () => {
+  log('[orb] 用户从菜单退出');
+  app.quit();
+});
+
+ipcMain.handle('orb:log', (_event, text) => {
+  log('[renderer]', String(text ?? '').slice(0, 400));
+  return { ok: true };
+});
+
+app.on('window-all-closed', () => app.quit());
+app.on('before-quit', () => { if (pollTimer) clearInterval(pollTimer); });
+
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  log('[orb] 已有实例在跑，退出');
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (win && !win.isDestroyed()) win.showInactive();
+  });
+  app.whenReady().then(() => {
+    log('[orb] 启动', app.getVersion(), `pid=${process.pid}`, `dir=${ORB_DIR}`);
+    createWindow();
+    // 桌宠模式下窗口大部分是透明的，默认把鼠标事件让给下面：只有渲染端报告
+    // 「鼠标在宠物身上」时才收回点击权（否则会挡住桌面上其它窗口的点击）。
+    // 桌宠模式的窗口是「宠物 + 头顶气泡带」的矩形，保持可点击：
+    // Windows 上 setIgnoreMouseEvents(true,{forward:true}) 并不总把 move 事件转给渲染进程，
+    // 一旦收不到 move 就没法判断鼠标是否在宠物身上，单击/双击会整块失灵（踩过）。
+    // 先保证「点得到」，透明带的穿透留到以后用更精细的区域方案再说。
+    if (win) {
+      try { win.setIgnoreMouseEvents(false); } catch (error) { log('[orb] 鼠标穿透设置失败', String(error?.message ?? error)); }
+    }
+    startPolling();
+  });
+}
