@@ -295,7 +295,10 @@ export function apply(ctx) {
         return Array.isArray(dirs) ? dirs.map((x) => String(x || '').trim()).filter(Boolean) : [];
       } catch { return []; }
     },
-    adminQQ: () => adminQQ,
+    // 挑 QQ 收藏表情要主人的 QQ 号当会话 key：以前这里写的是 `() => adminQQ`，
+    // 但那个作用域里根本没有 adminQQ（只存在于 deriveIdentDefaults 内部），
+    // 一调就 ReferenceError，表情分支被 catch 吞掉 → 每次都掉到生图。
+    adminQQ: () => deriveIdentDefaults().meQQ,
   });
 
   // ── 组件更新（2026-10-26 用户要求）──────────────────────────────────────
@@ -326,6 +329,7 @@ export function apply(ctx) {
         const voice = updCfg.voice ?? {};
         list.push({
           id: 'surfvoice-local', name: '语音包（本地）', dir: path.join(packsDir, 'voice-local'),
+          // 1.1.x 起本机改版单独发（小鲸鱼音色 + RVC 唱歌），版本检查必须看 fork，不然会拿上游 loli12 版比。
           kind: 'auto', branch: 'main', versionUrl: voice.localVersionUrl || '', versionRepo: 'sprintkey666-gg/surfvoicelocal-sprintkey',
         });
         list.push({

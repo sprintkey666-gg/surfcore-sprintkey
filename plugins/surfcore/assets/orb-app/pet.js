@@ -25,6 +25,28 @@
     busy: false,
   };
 
+  // 素材帧 640×360，角色（含呆毛）的头顶大概在帧高的 15% 处。
+  // 用这个比例把气泡尾巴钉在她脑袋上，而不是钉在窗口顶边。
+  const PET_HEAD_RATIO = 0.152;
+  const PET_BUBBLE_BAND = 110; // main.js 里 PET_BUBBLE_SPACE：窗口比宠物高出的那一条
+
+  /** 把气泡摆到她头顶：算 video 里「实际画面」的顶边，再按角色在画面里的位置往下让。 */
+  function placeBubble() {
+    if (!bubble) return;
+    const video = vids.find((v) => v && v.classList.contains('on')) || vids[0];
+    if (!video) return;
+    const rect = video.getBoundingClientRect();
+    if (!rect.height || !rect.width) return;
+    const vw = video.videoWidth || 640;
+    const vh = video.videoHeight || 360;
+    const scale = Math.min(rect.width / vw, rect.height / vh);
+    const contentTop = rect.top + (rect.height - vh * scale) / 2;
+    const headTop = contentTop + vh * scale * PET_HEAD_RATIO;
+    const bottom = Math.max(12, Math.round(window.innerHeight - headTop + 8));
+    bubble.style.top = 'auto';
+    bubble.style.bottom = `${bottom}px`;
+  }
+
   function log(msg) {
     try { window.orb?.log?.(`[pet] ${msg}`); } catch {}
   }
@@ -61,6 +83,51 @@
       if (r <= 0) return item;
     }
     return pool[pool.length - 1];
+  }
+
+  /** 角色身高 = 窗口高度 - 头顶气泡带；pet.css 按这个值把整帧放大（--pet-size）。 */
+  function setSize(px) {
+    const size = Math.max(60, Number(px) || 200);
+    state.sizePx = Math.round(size);
+    document.documentElement.style.setProperty('--pet-size', `${Math.round(size)}px`);
+    placeBubble();
+  }
+
+  // 头顶气泡带现在多高（主进程按气泡内容放大窗口，这里同步一份给命中判定用）
+  let bandPx = PET_BUBBLE_BAND;
+  let fitTimer = null;
+
+  /**
+   * 气泡按内容长高：先放开文字限高量出「全文要多高」，再让主进程把窗口往上长那么多。
+   * 工作区装不下时主进程会把带高夹回来，这里再把文字限高收回可视高度（CSS 省略号）。
+   */
+  async function fitBubble() {
+    if (!bubble || bubble.classList.contains('hidden')) return;
+    const textEl = document.getElementById('bubbleText');
+    const pic = document.getElementById('bubblePic');
+    const hasPic = !!pic && !pic.classList.contains('hidden') && !!pic.getAttribute('src');
+    if (textEl) textEl.style.maxHeight = 'none'; // 先按全文量
+    const full = Math.ceil(bubble.getBoundingClientRect().height || 0);
+    if (!full) return;
+    const want = full + 16; // 小尾巴 8px + 顶部余量
+    let band = want;
+    try {
+      const res = await window.orb?.bubbleSpace?.(want);
+      if (res && Number.isFinite(Number(res.band))) band = Number(res.band);
+    } catch {}
+    bandPx = Math.max(PET_BUBBLE_BAND, Math.round(band));
+    if (textEl) {
+      const picH = hasPic ? Math.ceil(pic.getBoundingClientRect().height || 0) : 0;
+      const room = Math.floor(bandPx - 16 - picH);
+      textEl.style.maxHeight = want <= bandPx ? 'none' : `${Math.max(20, room)}px`;
+    }
+    placeBubble();
+  }
+
+  /** 防抖版：图片 onload / 窗口 resize 时不必每帧都量。 */
+  function scheduleFit() {
+    clearTimeout(fitTimer);
+    fitTimer = setTimeout(() => { void fitBubble(); }, 40);
   }
 
   function scheduleIdle() {
@@ -104,6 +171,8 @@
     next.classList.add('on');
     if (cur) cur.classList.remove('on');
     state.active = nextIdx;
+    // 不同动作里她的高矮会变一点，气泡跟着挪，别越飘越远
+    placeBubble();
     return true;
   }
 
@@ -129,6 +198,10 @@
     }
     state.cfg = pet;
     state.manifest = pet.manifest;
+    // 角色身高 = 窗口高度 - 头顶气泡带；CSS 按这个值放大整帧（pet.css → --pet-size）
+    const baseH = Number(cfg?.base?.height) || 0;
+    const petSize = baseH > PET_BUBBLE_BAND ? baseH - PET_BUBBLE_BAND : Number(pet.size) || 200;
+    setSize(petSize);
     const webmDir = `${String(pet.dir || '').replace(/[\\/]+$/, '')}/webm`;
     for (const name of [...(pet.manifest.idle || []), ...(pet.manifest.clicks || []), ...(pet.manifest.drag || [])]) {
       state.files.set(name, toFileUrl(`${webmDir}/${name}.webm`));
@@ -174,22 +247,57 @@
     return play(action.name, { mirror: action.mirror });
   }
 
-  /** 头顶气泡：显示她刚说的话（面板收起时才需要）。 */
-  function showBubble(text, { kind = 'her', ttlMs = 8000, onClick = null } = {}) {
+  /** 头顶气泡：显示她刚说的话（面板收起时才需要）。可带一张小图（图文一体）。 */
+  function showBubble(text, { kind = 'her', ttlMs = 8000, onClick = null, image = '' } = {}) {
     if (!bubble) return;
     const body = String(text || '').trim();
-    if (!body) return;
-    bubble.textContent = body.length > 80 ? `${body.slice(0, 79)}…` : body;
-    bubble.className = `bubble${kind === 'me' ? ' me' : ''}${kind === 'proactive' ? ' proactive' : ''}`;
+    const pic = document.getElementById('bubblePic');
+    const picSrc = image ? `file:///${encodeURI(String(image).replace(/\\/g, '/'))}` : '';
+    if (!body && !picSrc) return;
+    const clipped = body.length > 64 ? `${body.slice(0, 63)}…` : body;
+    const textEl = document.getElementById('bubbleText');
+    if (textEl) textEl.textContent = clipped;
+    else bubble.textContent = clipped;
+    if (pic) {
+      if (picSrc) {
+        pic.classList.remove('hidden', 'missing');
+        pic.alt = '';
+        pic.onerror = () => {
+          // 图被删了 / 路径失效：整块图收起来，气泡只剩文字（不留破图）。
+          pic.classList.add('hidden');
+          pic.removeAttribute('src');
+          placeBubble();
+        };
+        pic.onload = () => { placeBubble(); scheduleFit(); };
+        pic.src = picSrc;
+        bubble.classList.add('haspic');
+        bubble.classList.toggle('nopic', !body);
+      } else {
+        pic.classList.add('hidden');
+        pic.removeAttribute('src');
+        bubble.classList.remove('haspic', 'nopic');
+      }
+    }
+    if (textEl) textEl.classList.toggle('hidden', !body);
+    bubble.className = `bubble${kind === 'me' ? ' me' : ''}${kind === 'proactive' ? ' proactive' : ''}${picSrc ? ' haspic' : ''}${picSrc && !body ? ' nopic' : ''}`;
     bubble.classList.remove('hidden');
+    placeBubble();
+    // 内容定下来再按实际高度长窗口（图片要等 onload，这里先按文字量一次）
+    scheduleFit();
     bubble.onclick = () => { hideBubble(); onClick?.(); };
     if (state.bubbleTimer) clearTimeout(state.bubbleTimer);
     state.bubbleTimer = setTimeout(() => hideBubble(), Math.max(2000, Number(ttlMs) || 8000));
   }
 
   function hideBubble() {
+    const wasShown = bubble && !bubble.classList.contains('hidden');
     bubble?.classList.add('hidden');
     if (state.bubbleTimer) { clearTimeout(state.bubbleTimer); state.bubbleTimer = null; }
+    // 气泡收了，窗口回落到默认高度（别留一个长高版的空窗口挡桌面）
+    bandPx = PET_BUBBLE_BAND;
+    const textEl = document.getElementById('bubbleText');
+    if (textEl) textEl.style.maxHeight = '';
+    if (wasShown) { try { void window.orb?.bubbleSpace?.(0); } catch {} }
   }
 
   function stop() {
@@ -218,7 +326,13 @@
     showBubble,
     hideBubble,
     stop,
+    placeBubble,
+    setSize,
+    bubbleBand: () => bandPx,
     get ready() { return state.ready; },
     get element() { return stage; },
   };
+
+  // 窗口尺寸变了（右键改大小、展开/收起）气泡也得跟着回到头顶
+  window.addEventListener('resize', () => placeBubble());
 })();

@@ -15,7 +15,7 @@
         <video class="pv" id="pvA" muted playsinline preload="auto"></video>
         <video class="pv" id="pvB" muted playsinline preload="auto"></video>
       </div>
-      <div id="bubble" class="bubble hidden"></div>
+      <div id="bubble" class="bubble hidden"><img id="bubblePic" class="bubblePic hidden" alt=""><span id="bubbleText"></span></div>
     </div>
 
     <!-- 右键菜单：画在窗口内部，绝不改窗口尺寸（主人要求「界面大小刚好」） -->
@@ -24,10 +24,10 @@
       <button class="ctxitem" id="ctxAction" data-act="action">换个动作</button>
       <button class="ctxitem" id="ctxSizeToggle" data-act="size">大小<span class="ctxchev">›</span></button>
       <button class="ctxitem" id="ctxHide" data-act="hide">隐藏</button>
-      <!-- 点「大小」才展开的滑条：贴着菜单往旁边长，窗口还是原来那么大 -->
+      <!-- 点「大小」才展开的滑条：0-100% 映射到 120~320px，松手才改窗口 -->
       <div id="ctxSize" class="ctxsize hidden">
-        <input id="ctxSizeRange" class="szrange" type="range" min="120" max="320" step="4" value="200" />
-        <span id="ctxSizeValue" class="szvalue">200</span>
+        <input id="ctxSizeRange" class="szrange" type="range" min="0" max="100" step="1" value="40" />
+        <span id="ctxSizeValue" class="szvalue">40%</span>
       </div>
     </div>
 
@@ -65,6 +65,12 @@
       </footer>
       <div class="hint" id="hint"></div>
     </div>
+  </div>
+  <!-- 看图查看器：双击会话里的图打开，滚轮以鼠标位置为中心缩放、按住左键拖动 -->
+  <div id="viewer" class="viewer hidden">
+    <img id="viewerImg" alt="" />
+    <button id="viewerClose" class="viewer-close" title="关闭（Esc）">×</button>
+    <div class="viewer-tip">滚轮缩放 · 按住左键拖动 · Esc 关闭</div>
   </div>
   <script src="pet.js"></script>
   <script src="orb.js"></script>

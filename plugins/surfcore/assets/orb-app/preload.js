@@ -32,6 +32,8 @@ contextBridge.exposeInMainWorld('orb', {
   /** 右键弹出的大小面板：open(true/false)；滑条改大小走 petSize。 */
   sizePanel: (open) => ipcRenderer.invoke('orb:sizepanel', Boolean(open)),
   petSize: (size) => ipcRenderer.invoke('orb:petsize', { size }),
+  /** 头顶给气泡留多高（按气泡内容长高；传 0 复位）。 */
+  bubbleSpace: (px) => ipcRenderer.invoke('orb:bubble-space', { px: Number(px) || 0 }),
   onPetAction: (fn) => {
     const handler = () => { try { fn(); } catch {} };
     ipcRenderer.on('orb:petaction', handler);

@@ -56,6 +56,10 @@ export function defaultPicConfig() {
     quietTo: '07:00',
     scopes: { private: true, group: true, groupDeny: [], groupAllow: [] },
     textFirst: true,
+    // combineText：QQ 支持「文字 + 图片」放在同一条消息里（一个气泡）。
+    // 开=最后一句回复和这张图合成一条发；关=还是先文字、再单独一条图。
+    // 默认开，因为真人斗图本来就是「一句话配一张图」。
+    combineText: true,
     dedupeHours: 24,
     scenes: { ...DEFAULT_SCENES },
     seriousGuard: true,
@@ -134,6 +138,7 @@ export function normalizePicConfig(raw) {
       groupAllow: strList(scopes.groupAllow)
     },
     textFirst: bool(raw.textFirst, def.textFirst),
+    combineText: bool(raw.combineText, def.combineText),
     dedupeHours: Math.round(num(raw.dedupeHours, def.dedupeHours, 0, 720)),
     scenes: {},
     seriousGuard: bool(raw.seriousGuard, def.seriousGuard),
@@ -501,7 +506,12 @@ export function buildPicPromptLine(cfg, opts = {}) {
       }).replace(/\n/g, '；')}」，拿到图片路径后用 qq_send_image 发出去。`
     );
   }
-  lines.push('- 一次最多发一张；对方在说正事、报错、钱、隐私、健康这类话题时不要发图。文字和图片分成两条气泡。');
+  const combine = cfg.combineText !== false;
+  lines.push(
+    combine
+      ? '- 一次最多发一张；对方在说正事、报错、钱、隐私、健康这类话题时不要发图。想「一句话配一张图」时用 qq_send_pic{hint:"关键词", text:"那句话"}，桥接会把文字和图片放进同一条消息里发出去（像真人斗图那样一个气泡）。'
+      : '- 一次最多发一张；对方在说正事、报错、钱、隐私、健康这类话题时不要发图。图文一体是关着的：带 text 的 qq_send_pic 会先发文字、再发表情（两条气泡）；对方明确要「配一句话」就照做，用一次 qq_send_pic{hint, text}，别自己拆成两次调用。'
+  );
   // pending：桥接上一轮想补图但三条路都没有素材，已经替你把 prompt 算好了。
   // 这段必须显眼：它是一次「欠着的图」，拖着不发就等于那条降级链白装了。
   const pending = opts.pending && typeof opts.pending === 'object' ? opts.pending : null;

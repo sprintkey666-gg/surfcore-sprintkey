@@ -50,6 +50,9 @@ export const DEFAULT_ORB = {
     bubbleTtlSec: 8,
     maxBubbles: 3,
     maxPerTurn: 2,
+    // 气泡图文一体：同一条消息的图和字画在一个气泡里（图在上、字在下）。
+    // 关掉就拆成「图气泡 + 文字气泡」，跟以前一样。
+    richBubble: true,
     // 气泡上要不要显示头像/名字。默认显示——主人要求「像 QQ 那样一人一排」。
     ident: {
       showAvatar: true,
@@ -94,6 +97,8 @@ export const DEFAULT_ORB = {
     preferQqSticker: true,
     allowLocal: true,
     allowGenerate: true,
+    // 聊天里也能配图：她的聊天回复可以带一张图（只吃 QQ 表情/本地图库，不现场生图）。
+    attachToChat: false,
     maxPerHour: 12,
   },
 };
@@ -145,6 +150,7 @@ export function normalizeOrbConfig(raw) {
       bubbleTtlSec: clampNum(chat.bubbleTtlSec, DEFAULT_ORB.chat.bubbleTtlSec, 3, 30, { integer: true }),
       maxBubbles: clampNum(chat.maxBubbles, DEFAULT_ORB.chat.maxBubbles, 1, 5, { integer: true }),
       maxPerTurn: clampNum(chat.maxPerTurn, DEFAULT_ORB.chat.maxPerTurn, 1, 5, { integer: true }),
+      richBubble: chat.richBubble !== false,
       ident: {
         showAvatar: chat.ident?.showAvatar !== false,
         showName: chat.ident?.showName !== false,
@@ -180,6 +186,7 @@ export function normalizeOrbConfig(raw) {
       preferQqSticker: pic.preferQqSticker !== false,
       allowLocal: pic.allowLocal !== false,
       allowGenerate: pic.allowGenerate !== false,
+      attachToChat: pic.attachToChat === true,
       maxPerHour: clampNum(pic.maxPerHour, DEFAULT_ORB.pic.maxPerHour, 0, 200, { integer: true }),
     },
   };
@@ -246,20 +253,41 @@ export function createOrbService({ stateDir, pluginLog = () => {}, getSubprocess
         return {
           seq: Number(data.seq) || 0,
           messages: Array.isArray(data.messages) ? data.messages : [],
+          seenId: Number(data.seenId) || 0,
         };
       }
     } catch {}
-    return { seq: 0, messages: [] };
+    return { seq: 0, messages: [], seenId: 0 };
   }
 
   function writeState(state) {
     try {
       const tmp = `${stateFile}.${process.pid}.tmp`;
-      fs.writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+      const body = {
+        seq: Number(state?.seq) || 0,
+        messages: Array.isArray(state?.messages) ? state.messages : [],
+        seenId: Number(state?.seenId) || 0,
+      };
+      fs.writeFileSync(tmp, `${JSON.stringify(body, null, 2)}\n`, 'utf8');
       fs.renameSync(tmp, stateFile);
     } catch (error) {
       pluginLog('[orb] 写 state.json 失败：', String(error?.message ?? error));
     }
+  }
+
+  /** 已读水位：面板里看到第几条，就记到第几条（跨重启不丢）。 */
+  function readSeenId() {
+    return readState().seenId;
+  }
+
+  function markSeen(id) {
+    const state = readState();
+    const want = Number(id) || 0;
+    if (!want) return state.seenId;
+    // 水位只进不退；也不能超过当前最大消息号（客户端可能是旧状态）。
+    const next = Math.min(Math.max(state.seenId, want), Math.max(state.seq, state.seenId));
+    if (next !== state.seenId) writeState({ ...state, seenId: next });
+    return next;
   }
 
   /** 会话气泡里允许带的图片目录：<orb>/media 与「本地图库」里配的目录。 */
@@ -289,7 +317,7 @@ export function createOrbService({ stateDir, pluginLog = () => {}, getSubprocess
       ...(pic ? { image: pic } : {}),
     };
     const messages = [...state.messages, message].slice(-MESSAGE_LIMIT);
-    writeState({ seq, messages });
+    writeState({ seq, messages, seenId: state.seenId });
     return message;
   }
 
@@ -300,7 +328,8 @@ export function createOrbService({ stateDir, pluginLog = () => {}, getSubprocess
   }
 
   function clearMessages() {
-    writeState({ seq: readState().seq, messages: [] });
+    // 「新对话」= 消息清空、已读水位也归零，否则下一条新消息会被当成「已经读过」而不冒气泡。
+    writeState({ seq: readState().seq, messages: [], seenId: 0 });
     return { ok: true };
   }
 
@@ -498,6 +527,8 @@ export function createOrbService({ stateDir, pluginLog = () => {}, getSubprocess
     addMessage,
     listMessages,
     clearMessages,
+    readSeenId,
+    markSeen,
     readState,
     petInfo,
     petAssets: pets,

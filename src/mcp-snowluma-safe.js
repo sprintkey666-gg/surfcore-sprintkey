@@ -1298,19 +1298,20 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.getStickerI
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.sendSticker !== false) {
   server.tool(
     'qq_send_sticker',
-    '在指定会话发送一个 QQ 收藏表情包（自定义表情）。stickerId 直接写编号最省事（"#03" 或 "3"），也可以用 qq_list_stickers 返回的 id / md5 / url。注意：一条消息只能是一张表情，不能在同一气泡里附带文字；想说的话请先用 qq_send_message / qq_reply 作为单独气泡发送，再单独发这张表情。需要引用/点名时可用 replyToMessageId / atUserId（群聊）。真人偶尔用表情包很自然，但别刷屏。',
+    '在指定会话发送一个 QQ 收藏表情包（自定义表情）。stickerId 直接写编号最省事（"#03" 或 "3"），也可以用 qq_list_stickers 返回的 id / md5 / url。表情按 QQ 的原生表情方式发送（不会变成一张巨大的图片）。可以带 text：把一句话和这张表情放进同一条消息里发出去（一个气泡，像真人斗图）；text 为空就是纯表情气泡。需要引用/点名时可用 replyToMessageId / atUserId（群聊）。真人偶尔用表情包很自然，但别刷屏。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
       stickerId: z.string().describe('表情编号（"#03" / "3"，来自 qq_list_stickers 的 no），或 emoji_id / md5 / 图片 URL'),
+      text: z.string().optional().describe('想和这张表情放进同一条消息发送的文字（可选，最多 800 字）'),
       replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
       atUserId: z.union([z.number(), z.string()]).optional().describe('要 @ 的群成员 QQ 号（群聊中可选，私聊不可用）')
     },
-    async ({ key, token, stickerId, replyToMessageId, atUserId }) => {
+    async ({ key, token, stickerId, text, replyToMessageId, atUserId }) => {
       try {
         const data = await agentApi('/api/socialV2/send-sticker', {
           method: 'POST',
-          body: JSON.stringify({ key, stickerId: String(stickerId), replyToMessageId, atUserId: atUserId ?? null }),
+          body: JSON.stringify({ key, stickerId: String(stickerId), message: text ?? '', replyToMessageId, atUserId: atUserId ?? null }),
           headers: { 'x-agent-token': token },
           timeoutMs: 300000
         });
@@ -1325,19 +1326,20 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.sendSticker
 if (cfg.socialV2?.pic?.enabled !== false && cfg.socialV2?.tools?.sendPic !== false) {
   server.tool(
     'qq_send_pic',
-    '按当前语境发一张图：source="sticker" 发 QQ 收藏表情，source="local" 从主人指定的本地图库挑一张，source="auto" 让桥接按聊天情境自己决定走哪一路。hint 写此刻的语境（如“被夸得开心”“无语了”“刚起床”）能显著提高命中率。一次只发一张，别刷屏；对方在说正事、报错、钱、隐私、健康这类话题时不要发图。注意：图片是单独一条气泡，想说的话先用 qq_send_message 发完，再单独发图。想发一张现场生成的新图（自拍、刚做的事、此刻的样子）：本工具不能生图，请自己调 generate_image 生图，再用 qq_send_image 把图片路径发出去。',
+    '按当前语境发一张图：source="sticker" 发 QQ 收藏表情，source="local" 从主人指定的本地图库挑一张，source="auto" 让桥接按聊天情境自己决定走哪一路。hint 写此刻的语境（如“被夸得开心”“无语了”“刚起床”）能显著提高命中率。一次只发一张，别刷屏；对方在说正事、报错、钱、隐私、健康这类话题时不要发图。想「一句话配一张图」时传 text，桥接会把文字和图片放进同一条消息（一个气泡）；不传 text 就只是单独一张图。想发一张现场生成的新图（自拍、刚做的事、此刻的样子）：本工具不能生图，请自己调 generate_image 生图，再用 qq_send_image 把图片路径发出去。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
       source: z.enum(['auto', 'sticker', 'local']).optional().describe('来源：auto（默认，按情境自动挑）/ sticker / local'),
       hint: z.string().optional().describe('此刻的语境或想要的关键词，如“被夸开心”“无语”“猫”'),
+      text: z.string().optional().describe('要和这张图放进同一条消息的文字（可选，最多 800 字）；不传就只发图'),
       dryRun: z.boolean().optional().describe('true 只返回决策结果，不真发（调试用）')
     },
-    async ({ key, token, source, hint, dryRun }) => {
+    async ({ key, token, source, hint, text, dryRun }) => {
       try {
         const data = await agentApi('/api/socialV2/send-pic', {
           method: 'POST',
-          body: JSON.stringify({ key, source: source || 'auto', hint: hint ?? '', dryRun: dryRun === true }),
+          body: JSON.stringify({ key, source: source || 'auto', hint: hint ?? '', text: text ?? '', dryRun: dryRun === true }),
           headers: { 'x-agent-token': token },
           timeoutMs: 300000
         });

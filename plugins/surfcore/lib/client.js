@@ -1130,7 +1130,7 @@ F("sessionCwd", "会话工作目录", "留空用 surfcore 根目录", "text", { 
         F("fishGuard.failCooldownMinutes", "风控失败冷却（分钟）", "默认 60；遇到 -509/12015 等码自动停手", "number", { min: 1 }),
       ]},
       { group: "B站 会话权限", note: "只影响她自己的 DSH 会话（bili-whale-*），不影响 QQ 桥接；改完下一次 tick 生效", fields: [
-        F("agent.sandbox", "会话权限", "danger-full-access = 定时醒来能跑 bili.mjs（推荐；C:\\Users\\<用户名> 用 workspace-write 会因 WRITE_OWNER 起不了命令）；workspace-write = 更安全但可能什么都跑不了", "select", {
+        F("agent.sandbox", "会话权限", "danger-full-access = 定时醒来能跑 bili.mjs（推荐；C:\\Users\\Mieksido 用 workspace-write 会因 WRITE_OWNER 起不了命令）；workspace-write = 更安全但可能什么都跑不了", "select", {
           options: [["danger-full-access", "完全访问（推荐，能跑工具）"], ["workspace-write", "仅工作区（更安全，可能跑不了命令）"]],
         }),
       ]},
@@ -3572,6 +3572,8 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
         h(Section, { title: "节奏", defaultOpen: true, note: "宁可少发。刚刚发完、正在聊正事、或太晚了都不该甩图。" },
           h(Row, { label: "开启自动发图", hint: "关掉后桥接完全不补图，你仍然可以自己调 qq_send_pic。" },
             h("input", { className: "qbw-switch", type: "checkbox", checked: draft.enabled !== false, onChange: (e) => set("enabled", e.target.checked) })),
+          h(Row, { label: "文字和图片合成一条", hint: "开：最后一句回复会和这张图放进同一条消息（一个气泡，像真人斗图）。关：还是先文字、再单独一条图。" },
+            h("input", { className: "qbw-switch", type: "checkbox", checked: draft.combineText !== false, onChange: (e) => set("combineText", e.target.checked) })),
           h(Row, { label: "每轮最多几张", hint: "一次唤醒最多主动补图的数量。" },
             h("input", { className: "qbw-input", type: "number", min: 0, max: 5, value: draft.maxPerTurn ?? 1, onChange: (e) => set("maxPerTurn", Number(e.target.value)) })),
           h(Row, { label: "最小间隔（秒）", hint: "两张自动图之间至少隔多久。" },
@@ -3592,7 +3594,7 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
           h(Row, { label: "群黑名单", hint: "这些群绝不发图。" },
             h(ListInput, { className: "qbw-input", value: draft.scopes?.groupDeny || [], onChange: (v) => set("scopes", { ...(draft.scopes || {}), groupDeny: v }) }))),
 
-        h(Section, { title: "来源 · QQ 表情", defaultOpen: true, note: "最容易「自动」的一路：桥接自己就能发。" },
+        h(Section, { title: "来源 · QQ 表情", defaultOpen: true, note: "最容易「自动」的一路：桥接自己就能发，且按 QQ 表情的原生方式发送（不会被放大成一张普通图片）。" },
           h(Row, { label: "启用", hint: null },
             h("input", { className: "qbw-switch", type: "checkbox", checked: sticker.enabled !== false, onChange: (e) => set("sources", { ...src, sticker: { ...sticker, enabled: e.target.checked } }) })),
           h(Row, { label: "权重", hint: "三路按权重随机挑；表情权重高就更常发表情。" },
@@ -3649,7 +3651,7 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
           h(Row, { label: "正事话题不发图", hint: "报错、代码、钱、隐私、健康、作业、「帮我写/查」这类话题一律不发。" },
             h("input", { className: "qbw-switch", type: "checkbox", checked: draft.seriousGuard !== false, onChange: (e) => set("seriousGuard", e.target.checked) }))),
 
-        h(Section, { title: "收藏 · 偷图", defaultOpen: true, note: "别人发的表情/图，让 AI 自己决定值不值得收藏；喜欢的才收进 QQ 收藏表情。" },
+        h(Section, { title: "收藏 · 偷图", defaultOpen: true, note: "别人发的表情/图，让 AI 自己决定值不值得收藏；喜欢的才收进 QQ 收藏表情（走 QQ 的原生收藏，能保住动图）。" },
           h(Row, { label: "允许自己收藏表情", hint: "关掉后 AI 不主动收藏，你仍然可以自己叫它收。" },
             h("input", { className: "qbw-switch", type: "checkbox", checked: collect?.enabled !== false, onChange: (e) => setCollect((c) => ({ ...(c || {}), enabled: e.target.checked })) })),
           h(Row, { label: "每天最多收几张", hint: "0 表示不限；防止一口气把别人相册搬回家。" },
@@ -3660,7 +3662,8 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
 
         h(Section, { title: "安全", note: null },
           h("div", { className: "qbw-hint" }, "· 生图依赖 dsh-image-gen 的 provider；没配好 key 时 generate_image 会失败，失败后本轮就只发文字。"),
-          h("div", { className: "qbw-hint" }, "· 图片是单独气泡：桥接会等你把文字发完再补图，不会把图和字塞进同一条。"),
+          h("div", { className: "qbw-hint" }, "· 图片怎么发：「文字和图片合成一条」开着时，最后一句回复会和这张图进同一个气泡；关掉就分两条发。"),
+          h("div", { className: "qbw-hint" }, "· 表情走 QQ 的原生表情通道（send_custom_face），不会再把表情下载成普通大图。"),
           h("div", { className: "qbw-hint" }, "· 本地图库内容只在你自己电脑上，不会上传。")),
       );
     }
@@ -5759,7 +5762,12 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
             h("input", { className: "qbw-switch", type: "checkbox", checked: picCfg.allowGenerate !== false, onChange: (e) => set("pic.allowGenerate", e.target.checked) })),
           h(Row, { label: "每小时最多发几张", hint: "只算悬浮窗这边的，和 QQ 那边的额度互不影响。" },
             h("input", { className: "qbw-input", type: "number", min: 1, max: 60, value: picCfg.maxPerHour ?? 12, style: { maxWidth: "110px" }, onChange: (e) => set("pic.maxPerHour", Number(e.target.value)) })),
-          h("div", { className: "qbw-hint" }, "图和表情只从「本地图库」和「QQ 收藏表情」拿；现场画的图会先落到悬浮窗的 media 目录再显示。")),
+          h(Row, { label: "聊天里也能配图", hint: "打开后她的聊天回复可以带一张图（只吃 QQ 收藏表情和本地图库，不现场画——那要等一分钟）。", badge: picCfg.attachToChat === true ? "开" : "关" },
+            h("input", { className: "qbw-switch", type: "checkbox", checked: picCfg.attachToChat === true, onChange: (e) => set("pic.attachToChat", e.target.checked) })),
+          h(Row, { label: "气泡图文一体", hint: "开：一条消息的图和字在同一个气泡（图在上、字在下）；关：拆成图、字两个气泡。图会等比缩到 240px 内，小图不放大。", badge: chatCfg.richBubble !== false ? "开" : "关" },
+            h("input", { className: "qbw-switch", type: "checkbox", checked: chatCfg.richBubble !== false, onChange: (e) => set("chat.richBubble", e.target.checked) })),
+          h("div", { className: "qbw-hint" }, "图和表情只从「本地图库」和「QQ 收藏表情」拿；现场画的图会先落到悬浮窗的 media 目录再显示。"),
+          h("div", { className: "qbw-hint" }, "记忆：QQ 和悬浮窗共用同一张衰减记忆卡，不用单独开——她记得的事本来就是同一份，这边不另拉聊天原文。")),
 
         h(Section, { title: "试一试", defaultOpen: true, note: "这两下都是真的：发一句会出现在球上，试对话会真的走一次模型。" },
           h("input", {

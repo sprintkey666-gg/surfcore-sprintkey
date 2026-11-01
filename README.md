@@ -26,6 +26,13 @@
 新功能默认全部关闭，保存后约 1 分钟生效（桥接每个 tick 重读 `config.json`），不需要重启桥接。
 改动代码后仍需重启桥接进程。
 
+## 最近更新（2026-11-01）
+
+- **悬浮窗 0.12.0**：气泡自适应不再被裁切、已读不重弹、双击看图、QQ 近况互通。
+- **发图**：图文同一条消息；支持文字气泡 + 原生 QQ 表情两条；QQ 表情按原生方式发送/收藏。
+- **语音包 voice-local 1.1.1**：新用户首装即本 fork 的改版（含默认音色与 RVC），保留 `.venv-rvc` 不重下。
+- **文档**：[更新日志](docs/CHANGELOG.md) · [功能清单（入口/代码/配置/验证）](docs/sprintkey/FEATURES.md)。
+
 ---
 
 ## 安装
@@ -63,12 +70,12 @@ node scripts/setup-dsh.mjs
 模型与 vendor（约 3GB）在该仓库的 Release `voice-local-v1.1.0`，首次安装时由插件下载。
 源码取该仓库的 `main`（1.1.1 起音色定义 `voices/` 已入仓，装完即有默认音色）。
 
-这个本地包是**改版**，不是上游原版：默认大肥鱼音色 `da-fei-yu-gsv`，带 RVC 语音/唱歌转换
+这个本地包是**改版**，不是上游原版：默认小鲸鱼音色 `da-fei-yu-gsv`，带 RVC 语音/唱歌转换
 （Applio + `.venv-rvc`）。上游是
 [`Mieksido/surfvoicelocal`](https://github.com/Mieksido/surfvoicelocal)（loli12 音色），本仓库的
 修改部分与它同源。
 
-模型权重（大肥鱼 GPT-SoVITS / RVC）为 **CC BY-NC 4.0**（YinZilu / 尹紫鹭幻想社），
+模型权重（小鲸鱼 GPT-SoVITS / RVC）为 **CC BY-NC 4.0**（YinZilu / 尹紫鹭幻想社），
 非商业、需署名；代码 MIT。详见语音包仓库的 `THIRD_PARTY_NOTICES.md`。
 
 ---

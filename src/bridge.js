@@ -1819,6 +1819,13 @@ async function main() {
   acquireLock();
   loadState();
 
+  // QQ 图床（表情/头像/群头像/图片）走代理：本机 Clash 的 fake-ip 把这些域名解析成
+  // 198.18.x.x，safe-fetch 的本机 DNS 校验必然判「解析到内网」→ 表情图全挂。
+  // 只有下面这些后缀走代理隧道，白名单外的域名仍然被原来的 SSRF 校验管着。
+  const QQ_MEDIA_HOSTS = ['qq.com', 'qq.com.cn', 'qpic.cn', 'gtimg.cn', 'qlogo.cn', 'weixin.qq.com'];
+  const MEDIA_PROXY = String(process.env.HTTPS_PROXY || process.env.HTTP_PROXY || 'http://127.0.0.1:7897').trim();
+  const MEDIA_FETCH_OPTS = { allowHosts: QQ_MEDIA_HOSTS, proxy: MEDIA_PROXY };
+
   // ── 目的机制运行时（主动找主人）─────────────────────────────────────────
   // 只持久化「排程 + 心里惦记的事 + 最近说过什么」；在途回合放内存，重启后由
   // 「下次排程」自然重来，不补发上一枪（避免重启后突然连发好几条）。
@@ -2606,7 +2613,60 @@ async function main() {
     return { ...sent, key, file: target.path, via: target.via, verification, readback: readbackText };
   }
 
-  // 发送一个收藏表情（按 emoji_id/url/md5 解析，发图片段）。
+  // 发送一个收藏表情。两条路：
+  //   ① 纯表情 → 走 SnowLuma 的 send_custom_face（QQ 原生的「收藏表情」发送方式，
+  //      客户端按表情渲染，尺寸由 QQ 自己决定，动图也保留）；
+  //   ② 带文字 → 一条消息里 [reply][at][text][image{sub_type:1,summary}]，
+  //      这是 QQ 支持的「图文同条」（2026-11-01 主人要求）。
+  // 为什么以前会发出巨大图片：老实现把表情图下载下来当 base64 普通图片发，
+  // 没有 sub_type，QQ 就按原始像素铺开（见 PITFALLS #108）。
+  const STICKER_CDN_HOSTS = new Set(['p.qpic.cn', 'gchat.qpic.cn', 'multimedia.qq.com']);
+
+  // QQ 表情的 image 段：sub_type=1 + summary 才会被客户端当成「表情」而不是照片。
+  function stickerImageSegment(entry) {
+    const url = String(entry?.url ?? '').trim();
+    let host = '';
+    try {
+      host = url ? new URL(url).hostname.toLowerCase() : '';
+    } catch {
+      host = '';
+    }
+    if (url && host && STICKER_CDN_HOSTS.has(host)) {
+      return { type: 'image', data: { file: url, sub_type: 1, summary: '[动画表情]' } };
+    }
+    return null; // 非 QQ 图片 CDN（用户自传/外链）→ 调用方回退 base64 字节
+  }
+
+  // 单独发一条纯文字气泡。用于「图文一体关掉、但对方明确要一句话配一张图」时：
+  // 不发同一条消息，也不拒绝，而是先文字、再表情，两条气泡——这才是关掉开关后的真实节奏。
+  async function sendTextBubbleV2(key, text, options = {}) {
+    const clean = String(text ?? '').trim().slice(0, 800);
+    if (!clean) return null;
+    const keyMatch = /^(group|private):(\d+)$/.exec(String(key || '').trim());
+    if (!keyMatch) throw new Error('key 格式应为 group:群号 或 private:QQ号');
+    const kind = keyMatch[1];
+    const id = Number(keyMatch[2]);
+    const hasKnownToken = [...KNOWN_AGENT_TOKENS].some((t) => t && clean.includes(t));
+    if (hasKnownToken) throw new Error('发送内容包含会话令牌，已阻止发送');
+    const segments = [];
+    const replyToMessageId = options.replyToMessageId;
+    if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
+      const rid = String(replyToMessageId).trim();
+      if (!/^-?[1-9]\d*$/.test(rid)) throw new Error('replyToMessageId 必须是非零整数（消息 id 可能为负数）');
+      segments.push({ type: 'reply', data: { id: rid } });
+    }
+    const atUserId = options.atUserId;
+    if (atUserId !== undefined && atUserId !== null && String(atUserId).trim() !== '') {
+      const at = String(atUserId).trim();
+      if (!/^\d+$/.test(at)) throw new Error('atUserId 必须是正整数 QQ 号，且不能为 all');
+      segments.push({ type: 'at', data: { qq: at } });
+    }
+    segments.push({ type: 'text', data: { text: escapeCqText(clean) } });
+    await sleep(randInt(800, 2000));
+    const data = await onebotSendSegments(kind, id, segments);
+    return data?.message_id ?? null;
+  }
+
   async function sendStickerV2(key, stickerRef, options = {}) {
     const assertSendAllowed = captureSendGuard(key);
     // 发送前强制同步一次，确保“刚新增的表情能立即用、刚删除的表情不会继续发”。
@@ -2616,11 +2676,40 @@ async function main() {
     const url = entry.url;
     if (!url) throw new Error(`表情 ${entry.id} 没有可发送的图片地址`);
     const [kind, id] = key.split(':');
-    const segments = [];
+    const text = String(options.text ?? '').trim().slice(0, 800);
     const replyToMessageId = options.replyToMessageId;
     const atUserId = options.atUserId;
-    // 仿真常识：一条消息只能是一张表情，不能在同一气泡里附带文字说明。
-    // 想说的话请用 qq_send_message / qq_reply 作为单独气泡发送。
+    const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+
+    // ① 纯表情：优先 QQ 原生表情发送。失败（比如这张表情不在收藏列表里、
+    //    或者 SnowLuma 版本没有这个 action）就落到段路径，但不能因此不发。
+    if (!text) {
+      // 收藏表情的 QQ 标识：同步来的条目 id/resId 就是 emoji_id（也可能是 32 位 md5，
+      // SnowLuma 两种都认）。URL 或本地文件名不是 id，不要拿去调 send_custom_face。
+      const emojiId = String(entry.resId || entry.id || '').trim();
+      const usableAsId = /^[A-Za-z0-9_-]{4,64}$/.test(emojiId);
+      if (usableAsId) {
+        try {
+          const params = { emoji_id: emojiId };
+          if (kind === 'private') params.user_id = Number(id);
+          else params.group_id = Number(id);
+          if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
+            params.reply_to = String(replyToMessageId).trim();
+          }
+          await sleep(randInt(800, 2000));
+          assertSendAllowed();
+          const data = await onebotAction('send_custom_face', params);
+          const updated = markStickerUsed(stickerEntries, entry.id, 'sticker');
+          stickerEntries = updated.entries;
+          saveStickerStoreSafe();
+          return { entry: updated.entry, messageId: data?.message_id ?? null, native: true };
+        } catch (error) {
+          log(`[sticker] send_custom_face 失败，回退成图片段（表情 ${entry.id}）：${error?.message ?? error}`);
+        }
+      }
+    }
+
+    const segments = [];
     if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
       const rid = String(replyToMessageId).trim();
       if (!/^-?[1-9]\d*$/.test(rid)) throw new Error('replyToMessageId 必须是非零整数（消息 id 可能为负数）');
@@ -2631,17 +2720,25 @@ async function main() {
       if (!/^\d+$/.test(at)) throw new Error('atUserId 必须是正整数 QQ 号，且不能为 all');
       segments.push({ type: 'at', data: { qq: at } });
     }
-    // 在桥接内完成带 DNS 固定、逐跳校验和大小限制的下载；不能把 URL 交给网关重新抓取。
-    let image;
-    try {
-      image = await safeFetchBuffer(url, MAX_MEDIA_BYTES);
-    } catch (error) {
-      throw new Error(`表情 ${entry.id} 的图片下载失败（QQ CDN 网络异常或地址已失效）：${error?.message ?? error}`);
+    if (text) {
+      const hasKnownToken = [...KNOWN_AGENT_TOKENS].some((t) => t && text.includes(t));
+      if (hasKnownToken) throw new Error('发送内容包含会话令牌，已阻止发送');
+      segments.push({ type: 'text', data: { text: escapeCqText(text) } });
     }
-    segments.push({ type: 'image', data: { file: 'base64://' + image.buffer.toString('base64') } });
+    let imageSeg = stickerImageSegment(entry);
+    if (!imageSeg) {
+      // 在桥接内完成带 DNS 固定、逐跳校验和大小限制的下载；不能把任意 URL 交给网关重新抓取。
+      let buf;
+      try {
+        buf = await safeFetchBuffer(url, MAX_MEDIA_BYTES, MEDIA_FETCH_OPTS);
+      } catch (error) {
+        throw new Error(`表情 ${entry.id} 的图片下载失败（QQ CDN 网络异常或地址已失效）：${error?.message ?? error}`);
+      }
+      imageSeg = { type: 'image', data: { file: 'base64://' + buf.buffer.toString('base64'), sub_type: 1, summary: '[动画表情]' } };
+    }
+    segments.push(imageSeg);
     const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
     const params = kind === 'private' ? { user_id: Number(id), message: segments } : { group_id: Number(id), message: segments };
-    const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
     // 与文本发送共用 sendChain，保证“先文字后表情”的真人顺序不被并发工具调用打乱。
     let sendResolve;
     let sendReject;
@@ -2678,7 +2775,7 @@ async function main() {
     const updated = markStickerUsed(stickerEntries, entry.id, 'sticker');
     stickerEntries = updated.entries;
     saveStickerStoreSafe();
-    return { entry: updated.entry, messageId: data?.message_id ?? null };
+    return { entry: updated.entry, messageId: data?.message_id ?? null, native: false };
   }
 
   // 更新本地 AI 认知（含义/标签/用法/情绪/内容/关键词）。
@@ -2822,11 +2919,19 @@ async function main() {
     if (buf.length > maxBytes) throw new Error(`本地图片超过 ${Math.round(maxBytes / 1048576)}MB 上限：${absPath}`);
     if (!looksLikeImageBuffer(buf)) throw new Error(`本地图库文件不是图片：${absPath}`);
     const [kind, id] = key.split(':');
-    const segments = [{ type: 'image', data: { file: 'base64://' + buf.toString('base64') } }];
+    const text = String(options.text ?? '').trim().slice(0, 800);
+    const segments = [];
     const replyToMessageId = options.replyToMessageId;
     if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
-      segments.unshift({ type: 'reply', data: { id: String(replyToMessageId).trim() } });
+      segments.push({ type: 'reply', data: { id: String(replyToMessageId).trim() } });
     }
+    // combineText：文字和图片放同一条消息（一个气泡），跟真人斗图一致。
+    if (text) {
+      const hasKnownToken = [...KNOWN_AGENT_TOKENS].some((t) => t && text.includes(t));
+      if (hasKnownToken) throw new Error('发送内容包含会话令牌，已阻止发送');
+      segments.push({ type: 'text', data: { text: escapeCqText(text) } });
+    }
+    segments.push({ type: 'image', data: { file: 'base64://' + buf.toString('base64') } });
     const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
     const params = kind === 'private' ? { user_id: Number(id), message: segments } : { group_id: Number(id), message: segments };
     const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
@@ -2966,30 +3071,7 @@ async function main() {
       }
       if (tried.length > 1) sent.fallback = tried.join('->');
 
-      rt.lastAt = now;
-      rt.times.push(now);
-      rt.perTurnSent = (Number(rt.perTurnSent) || 0) + 1;
-      if (sent.id) rt.sentIds = [...rt.sentIds, sent.id].slice(-20);
-      const day = picDayKey(now);
-      if (rt.day !== day) {
-        rt.day = day;
-        rt.dayCount = 0;
-      }
-      rt.dayCount += 1;
-      const record = {
-        at: now,
-        key,
-        source: sent.source,
-        id: sent.id,
-        detail: sent.detail,
-        reason: decision.reason,
-        fallback: sent.fallback ?? null,
-        loose: sent.loose === true,
-        text: ctxText.slice(0, 80)
-      };
-      appendPicLog(record);
-      appendActivity(`${key} 自动发图（${sent.source}${sent.fallback ? `，降级 ${sent.fallback}` : ''}）：${sent.detail || sent.id}`);
-      return record;
+      return recordPicSentV2(key, rt, sent, decision.reason, ctxText);
     } catch (error) {
       const message = error?.message ?? String(error);
       // 失败原因留在 runtime 上：否则这条路径全是「不发」，日志里只有一行，
@@ -3001,6 +3083,143 @@ async function main() {
       log('自动发图失败：', message);
       return null;
     }
+  }
+
+  // 记账：runtime + pic-log + 活动流。
+  // 两条路径（自动补图 / 图文同条）共用同一份账，否则「今天发了几张」「最近发过的」
+  // 会各算一套，额度翻倍、还会把刚发过的图再挑一次。
+  function recordPicSentV2(key, rt, sent, reason, ctxText) {
+    const now = Date.now();
+    rt.lastAt = now;
+    rt.times.push(now);
+    rt.perTurnSent = (Number(rt.perTurnSent) || 0) + 1;
+    if (sent.id) rt.sentIds = [...rt.sentIds, sent.id].slice(-20);
+    const day = picDayKey(now);
+    if (rt.day !== day) {
+      rt.day = day;
+      rt.dayCount = 0;
+    }
+    rt.dayCount += 1;
+    const record = {
+      at: now,
+      key,
+      source: sent.source,
+      id: sent.id,
+      detail: sent.detail,
+      reason,
+      fallback: sent.fallback ?? null,
+      loose: sent.loose === true,
+      combined: sent.combined === true,
+      text: String(ctxText ?? '').slice(0, 80)
+    };
+    appendPicLog(record);
+    appendActivity(`${key} 自动发图（${sent.source}${sent.fallback ? `，降级 ${sent.fallback}` : ''}${sent.combined ? '，图文同条' : ''}）：${sent.detail || sent.id}`);
+    return record;
+  }
+
+  // 为「这句话」挑一张要合并发送的图（只挑不发）。
+  // 为什么挑和发要分开：图和文字必须进同一条消息，而发送时机由 sendMessagesV2
+  // 的 sendChain 决定；这里只负责决策 + 找素材。
+  async function pickPicForCombineV2(key, ctxText) {
+    try {
+      const cfgNow = picCfgNow();
+      if (cfgNow.enabled === false || cfgNow.combineText === false) return null;
+      const [kind] = key.split(':');
+      const rt = picRuntimeFor(key);
+      const now = Date.now();
+      if (Number(rt.pausedUntil) > now) return null;
+      const text = String(ctxText ?? '').trim();
+      if (!text) return null;
+      const localDirs = Array.isArray(cfgNow.sources.local.dirs) ? cfgNow.sources.local.dirs : [];
+      const available = {
+        sticker: cfg.socialV2?.sticker?.enabled !== false && Array.isArray(stickerEntries) && stickerEntries.length > 0,
+        local: cfgNow.sources.local.enabled === true && localDirs.length > 0,
+        // 生图不可能和文字同条：图得等 agent 下次唤醒才生成出来。
+        generate: false
+      };
+      const decision = decidePicSource(cfgNow, {
+        text,
+        kind,
+        chatId: key.split(':')[1],
+        now,
+        lastAt: rt.lastAt,
+        hourCount: picHourCount(rt, now),
+        perTurnSent: Number(rt.perTurnSent) || 0,
+        available
+      });
+      if (!decision) return null;
+      const chain = picFallbackChain(cfgNow, { available, first: decision.source }).filter((s) => s !== 'generate');
+      const looseAllowed = chain.length === 1 && chain[0] === 'sticker'
+        && cfgNow.sources.sticker.looseFallback !== false;
+      const tried = [];
+      for (const source of chain) {
+        tried.push(source);
+        if (source === 'sticker') {
+          const pick = pickStickerFor(stickerEntries, text, {
+            minScore: cfgNow.sources.sticker.minScore,
+            annotatedOnly: cfgNow.sources.sticker.annotatedOnly,
+            exclude: rt.sentIds.slice(-5),
+            now
+          });
+          if (pick) return { source, id: pick.id, detail: pick.emotionLabel || pick.emotion || '', reason: decision.reason };
+          if (looseAllowed) {
+            const loose = pickStickerLoose(stickerEntries, { exclude: rt.sentIds.slice(-5) });
+            if (loose) return { source, id: loose.id, detail: `${loose.emotionLabel || loose.emotion || ''}（折中）`, loose: true, reason: decision.reason };
+          }
+          continue;
+        }
+        if (source === 'local') {
+          const picked = pickLocalImage(localDirs, {
+            warmth: cfgNow.sources.local.warmth,
+            emotions: detectEmotions(text).map((h) => h.key),
+            keywords: cfgNow.sources.local.keywords,
+            emotionSubdir: cfgNow.sources.local.emotionSubdir,
+            exclude: rt.sentIds.filter((id) => String(id).includes(path.sep)).slice(-5)
+          });
+          if (!picked) continue;
+          return { source, id: picked, detail: path.basename(picked), reason: decision.reason };
+        }
+      }
+      return null;
+    } catch (error) {
+      log('图文同条挑图失败：', error?.message ?? error);
+      return null;
+    }
+  }
+
+  // 把「一句话 + 一张图」拼成同一条消息发出去（QQ 的图文同条）。
+  async function sendMergedTextPicV2(key, text, pick, options = {}) {
+    const [kind, id] = key.split(':');
+    const segments = [];
+    if (options.replyToMessageId !== undefined && options.replyToMessageId !== null && String(options.replyToMessageId).trim() !== '') {
+      segments.push({ type: 'reply', data: { id: String(options.replyToMessageId).trim() } });
+    }
+    if (options.atUserId !== undefined && options.atUserId !== null && String(options.atUserId).trim() !== '') {
+      segments.push({ type: 'at', data: { qq: String(options.atUserId).trim() } });
+    }
+    segments.push({ type: 'text', data: { text: escapeCqText(String(text ?? '')) } });
+    if (pick.source === 'sticker') {
+      const entry = findSticker(stickerEntries, pick.id);
+      if (!entry) throw new Error(`找不到表情 ${pick.id}`);
+      let seg = stickerImageSegment(entry);
+      if (!seg) {
+        const buf = await safeFetchBuffer(entry.url, MAX_MEDIA_BYTES, MEDIA_FETCH_OPTS);
+        seg = { type: 'image', data: { file: 'base64://' + buf.buffer.toString('base64'), sub_type: 1, summary: '[动画表情]' } };
+      }
+      segments.push(seg);
+      const updated = markStickerUsed(stickerEntries, entry.id, 'sticker');
+      stickerEntries = updated.entries;
+      saveStickerStoreSafe();
+    } else {
+      const maxBytes = Math.max(1, Number(cfg.socialV2?.media?.maxImageMB) || 20) * 1024 * 1024;
+      const buf = fs.readFileSync(pick.id);
+      if (!buf.length) throw new Error(`本地图库文件为空：${pick.id}`);
+      if (buf.length > maxBytes) throw new Error(`本地图片超过上限：${pick.id}`);
+      if (!looksLikeImageBuffer(buf)) throw new Error(`本地图库文件不是图片：${pick.id}`);
+      segments.push({ type: 'image', data: { file: 'base64://' + buf.toString('base64') } });
+    }
+    await sleep(randInt(500, 1200));
+    return onebotSendSegments(kind, id, segments);
   }
 
   // 给「刚到的消息」算一条表情推荐（编号 + 情绪 + 内容）。
@@ -3082,7 +3301,22 @@ async function main() {
     if (!mediaList.length) throw new Error('这条消息没有可收藏的图片/表情');
     const media = mediaList[0];
     let file = '';
-    if (media?.kind === 'image') {
+    // 优先走 QQ 自己的表情 CDN 直传：SnowLuma 自己拉原图，动图不会被拆成静态 base64，
+    // 也不会在「添加收藏」这一步失真。只放行 QQ 的表情 CDN 域名，
+    // 其余来源仍必须由桥接自己抓字节（不让 OneBot 去下载任意 URL）。
+    const cdnUrl = (() => {
+      const raw = String(media?.url ?? '').trim();
+      if (!raw) return '';
+      try {
+        const host = new URL(raw).hostname.toLowerCase();
+        return STICKER_CDN_HOSTS.has(host) ? raw : '';
+      } catch {
+        return '';
+      }
+    })();
+    if (cdnUrl && (media?.kind === 'image' || media?.kind === 'sticker')) {
+      file = cdnUrl;
+    } else if (media?.kind === 'image') {
       // 优先取图片字节转 base64，避免 SnowLuma 直接下载聊天图片 URL 失败（带签名/防盗链）。
       // 严禁把消息里的原始 media.url / media.file 直接交给 OneBot 去下载：那会绕过 SSRF/本地文件防护。
       const img = await fetchOneBotImage(media);
@@ -3097,7 +3331,17 @@ async function main() {
     }
     if (!file) throw new Error('无法获取该表情的图片源');
     assertSendAllowed();
-    const addRes = await bot.request('add_custom_face', { file });
+    let addRes = await bot.request('add_custom_face', { file });
+    // 直传 URL 失败（比如 CDN 需要额外签名）就退回自己抓字节，别因为优化把收藏弄挂。
+    if ((!addRes || addRes.status !== 'ok' || addRes.retcode !== 0) && file === cdnUrl) {
+      log(`[sticker] 收藏时直传 CDN 失败，回退抓字节：${addRes?.wording || addRes?.retcode || 'unknown'}`);
+      try {
+        const img = await fetchOneBotImage(media);
+        if (img?.buffer) addRes = await bot.request('add_custom_face', { file: 'base64://' + img.buffer.toString('base64') });
+      } catch (error) {
+        log(`[sticker] 回退抓字节也失败：${error?.message ?? error}`);
+      }
+    }
     if (!addRes || addRes.status !== 'ok' || addRes.retcode !== 0) {
       throw new Error(`add_custom_face 失败: ${addRes?.wording || addRes?.retcode || 'unknown'}`);
     }
@@ -7449,7 +7693,7 @@ async function main() {
           if (req.headers['x-agent-token'] && !v2ToolEnabled('getStickerImage')) { sendJson({ ok: false, error: '工具未启用：qq_get_sticker_image' }, 403); return; }
           try {
             const entry = await getStickerImageData(stickerId);
-            const fetched = await safeFetchBuffer(entry.url, MAX_MEDIA_BYTES);
+            const fetched = await safeFetchBuffer(entry.url, MAX_MEDIA_BYTES, MEDIA_FETCH_OPTS);
             const dims = getImageDimensions(fetched.buffer);
             if (dims && dims.width * dims.height > MAX_MEDIA_PIXELS) {
               sendJson({ ok: false, error: `表情图片像素超限（${dims.width}x${dims.height}），已拒绝` }, 400);
@@ -8156,11 +8400,11 @@ async function main() {
           const replyToMessageId = body.replyToMessageId;
           const atUserId = body.atUserId ?? null;
           if (!key || !stickerId) { sendJson({ ok: false, error: 'key 和 stickerId 不能为空' }, 400); return; }
-          // 仿真常识：表情消息只能是一张表情，不能在同一气泡里附带文字说明。
-          if (caption) {
-            sendJson({ ok: false, error: '表情消息不能附带文字；请先用 qq_send_message / qq_reply 把想说的话作为单独气泡发送，再单独 qq_send_sticker 发表情' }, 400);
-            return;
-          }
+          // 图文同条：combineText 开着 → 「一句话 + 一张表情」进同一条消息；
+          // 关着 → 不合并也不拒绝：先发一条文字气泡，再发原生表情（两条），
+          // 因为对方明确要求配一句话时，开关不该把需求驳回（2026-11-01 主人追问）。
+          const combineOn = picCfgNow().enabled !== false && picCfgNow().combineText !== false;
+          const splitText = caption && !combineOn ? caption : '';
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('sendSticker')) { sendJson({ ok: false, error: '工具未启用：qq_send_sticker' }, 403); return; }
@@ -8210,13 +8454,19 @@ async function main() {
             }
             st.sendTimes.push(now);
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+            // 关掉图文一体时：引用/@ 留给文字气泡，表情本身干干净净地发。
+            let splitTextMessageId = null;
+            if (splitText) {
+              splitTextMessageId = await sendTextBubbleV2(key, splitText, { replyToMessageId: actualReplyToMessageId, atUserId });
+            }
             const sent = await sendStickerV2(key, stickerId, {
-              replyToMessageId: actualReplyToMessageId,
-              atUserId
+              replyToMessageId: splitText ? undefined : actualReplyToMessageId,
+              atUserId: splitText ? undefined : atUserId,
+              text: combineOn ? caption : ''
             });
             // 记录到二代会话的 recentMessages，让 AI 知道自己发过这个表情
             const label = sent.entry?.desc || sent.entry?.localNote || '表情包';
-            const text = `[表情包:${label}]`;
+            const text = (combineOn || splitText) && caption ? `${caption} [表情包:${label}]` : `[表情包:${label}]`;
             st.recentMessages.push({
               messageId: sent.messageId ? String(sent.messageId) : null,
               sender: '我',
@@ -8245,7 +8495,7 @@ async function main() {
             scheduleReplyCheckV2(key);
             log(`[sticker] 工具发送表情 ${key}: ${sent.entry?.id || stickerId}`);
             appendActivity(`${key} [sticker] 工具发送表情：${label}`);
-            sendJson({ ok: true, key, sticker: sent.entry, sent: 1, failed: 0, quoted: quotedInfo });
+            sendJson({ ok: true, key, sticker: sent.entry, sent: 1, failed: 0, quoted: quotedInfo, split: Boolean(splitText), textMessageId: splitTextMessageId });
           } catch (error) {
             const st = getSocialV2State(key);
             const idx = st.sendTimes.indexOf(now);
@@ -8408,6 +8658,7 @@ async function main() {
             },
             stickerCount: Array.isArray(stickerEntries) ? stickerEntries.length : 0,
             localCount,
+            combineText: cfgPic.combineText !== false,
             log: picLogList(20)
           });
           return;
@@ -8463,6 +8714,8 @@ async function main() {
           const key = String(body.key ?? '').trim();
           const source = ['auto', 'sticker', 'local', 'generate'].includes(body.source) ? body.source : 'auto';
           const hint = String(body.hint ?? body.text ?? '').slice(0, 400);
+          // text：要跟这张图放进同一条消息里的话（图文同条）；hint 只用于挑图。
+          const sendText = String(body.text ?? '').trim().slice(0, 800);
           const dryRun = body.dryRun === true;
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
@@ -8479,6 +8732,8 @@ async function main() {
           if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403); return; }
 
           const cfgPic = picCfgNow();
+          // 关掉图文一体时，显式要「配一句话」也不驳回：文字先单独一条，图再单独一条。
+          const mergeText = cfgPic.combineText !== false;
           const genCfg = cfgPic.sources.generate;
           const localDirs = Array.isArray(cfgPic.sources.local.dirs) ? cfgPic.sources.local.dirs : [];
           const ctxText = hint || String(getSocialV2State(key).lastWakeReason ?? '');
@@ -8542,7 +8797,7 @@ async function main() {
               : [source];
             const looseAllowed = order.length === 1 && order[0] === 'sticker'
               && cfgPic.sources.sticker.looseFallback !== false;
-            sendJson({ ok: true, dryRun: true, decision, order, looseAllowed });
+            sendJson({ ok: true, dryRun: true, decision, order, looseAllowed, combineText: cfgPic.combineText, text: sendText || '' });
             return;
           }
 
@@ -8574,13 +8829,17 @@ async function main() {
                   loose = Boolean(chosen);
                 }
                 if (!chosen) continue;
-                const res = await sendStickerV2(key, chosen.id, {});
+                const splitTextId = sendText && !mergeText ? await sendTextBubbleV2(key, sendText) : null;
+                const res = await sendStickerV2(key, chosen.id, { text: mergeText ? sendText : '' });
                 sent = {
                   source: 'sticker',
                   id: chosen.id,
                   emotion: chosen.emotionLabel || chosen.emotion || '',
                   caption: chosen.content || '',
                   loose,
+                  text: sendText || '',
+                  split: Boolean(splitTextId),
+                  textMessageId: splitTextId,
                   messageId: res?.messageId ?? null
                 };
                 break;
@@ -8593,8 +8852,9 @@ async function main() {
                   emotionSubdir: cfgPic.sources.local.emotionSubdir
                 });
                 if (!picked) continue;
-                const res = await sendLocalImageV2(key, picked);
-                sent = { source: 'local', id: picked, file: path.basename(picked), messageId: res?.messageId ?? null };
+                const splitLocalId = sendText && !mergeText ? await sendTextBubbleV2(key, sendText) : null;
+                const res = await sendLocalImageV2(key, picked, { text: mergeText ? sendText : '' });
+                sent = { source: 'local', id: picked, file: path.basename(picked), text: sendText || '', split: Boolean(splitLocalId), textMessageId: splitLocalId, messageId: res?.messageId ?? null };
                 break;
               }
               if (src === 'generate') {
@@ -8638,6 +8898,7 @@ async function main() {
               reason: '手动/试发',
               fallback: sent.fallback ?? null,
               loose: sent.loose === true,
+              combined: Boolean(sendText),
               text: ctxText.slice(0, 80)
             });
             sendJson({ ok: true, sent });
@@ -10776,7 +11037,7 @@ async function main() {
     const tryUrls = async () => {
       for (const url of urls) {
         try {
-          const fetched = await safeFetchBuffer(url, MAX_MEDIA_BYTES);
+          const fetched = await safeFetchBuffer(url, MAX_MEDIA_BYTES, MEDIA_FETCH_OPTS);
           const accepted = acceptImageBuffer(fetched.buffer, `${label} URL `);
           if (accepted) return { ...accepted, mimeType: accepted.mimeType || mimeFromUrl(url) };
           failures.push(`${url} 不是有效图片`);
@@ -10805,7 +11066,7 @@ async function main() {
         }
         if (obj.url) {
           try {
-            const fetched = await safeFetchBuffer(String(obj.url), MAX_MEDIA_BYTES);
+            const fetched = await safeFetchBuffer(String(obj.url), MAX_MEDIA_BYTES, MEDIA_FETCH_OPTS);
             const accepted = acceptImageBuffer(fetched.buffer, 'get_image URL 图片');
             if (accepted) return { ...accepted, mimeType: accepted.mimeType || mimeFromUrl(obj.url) };
           } catch (error) {
@@ -10848,7 +11109,7 @@ async function main() {
         const desc = face.q_des || (Array.isArray(face.emoji_name_alias) && face.emoji_name_alias[0]) || '';
         if (face.url) {
           try {
-            const fetched = await safeFetchBuffer(String(face.url), MAX_MEDIA_BYTES);
+            const fetched = await safeFetchBuffer(String(face.url), MAX_MEDIA_BYTES, MEDIA_FETCH_OPTS);
             const accepted = acceptImageBuffer(fetched.buffer, '表情图片');
             if (accepted) return { ...accepted, mimeType: accepted.mimeType || mimeFromUrl(face.url), text: desc ? `[表情:${desc}]` : '' };
           } catch (error) {
@@ -11050,13 +11311,28 @@ async function main() {
     const [kind, id] = key.split(':');
     const sent = [];
     const failed = [];
+    // 图文同条：最后一条消息发出去的瞬间才挑图，避免「早就挑好了但中间又说了别的话」。
+    const picCfg = picCfgNow();
+    const combineOn = picCfg.enabled !== false && picCfg.combineText !== false;
+    let combinedRecord = null;
     for (let i = 0; i < messages.length; i++) {
       const msg = messages[i];
       const useReply = i === 0 ? replyToMessageId : null;
       const useAt = i === 0 ? atUserId : null;
+      const isLast = i === messages.length - 1;
       sendChain = sendChain
         .then(async () => {
           assertSendAllowed();
+          if (combineOn && isLast) {
+            const pick = await pickPicForCombineV2(key, msg);
+            if (pick) {
+              await sendMergedTextPicV2(key, msg, pick, { replyToMessageId: useReply, atUserId: useAt });
+              sent.push(msg);
+              const rt = picRuntimeFor(key);
+              combinedRecord = recordPicSentV2(key, rt, { ...pick, combined: true }, pick.reason, msg);
+              return;
+            }
+          }
           await onebotSend(kind, id, msg, useReply, useAt);
           sent.push(msg);
         })
@@ -11077,7 +11353,8 @@ async function main() {
       }
       if (sent.length) recordSelfMemoryEvent(key, sent.join('\n'));
       // 文字已经出去了，再按情境决定要不要补一张图。不 await：发图慢不能拖住回复。
-      if (sent.length) void maybeAutoPicV2(key, { selfText: sent.join('\n') });
+      // 这一轮已经合并发过图就不再补 —— 一次唤醒最多一张，otherwise 会连甩两张。
+      if (sent.length && !combinedRecord) void maybeAutoPicV2(key, { selfText: sent.join('\n') });
       return sent;
     });
   }

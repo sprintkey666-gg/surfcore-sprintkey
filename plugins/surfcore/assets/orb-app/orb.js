@@ -102,29 +102,57 @@
         }
         col.appendChild(name);
       }
-      const bubble = document.createElement('div');
-      bubble.className = `bubble ${mine ? 'me' : 'her'}${m.kind === 'proactive' ? ' proactive' : ''}${m.image ? ' haspic' : ''}`;
-      // 带图的消息：图片在上、文字在下（发表情包时常常没字）。
-      if (m.image) {
-        const pic = document.createElement('img');
-        pic.className = 'pic';
-        pic.alt = '';
-        pic.src = 'file:///' + encodeURI(String(m.image).replace(/\\/g, '/'));
-        bubble.appendChild(pic);
+      // 气泡图文一体（设置 → 悬浮窗 → 发图）：开 = 同一条消息的图和字在一个气泡里；
+      // 关 = 图、字各占一个气泡。纯图/纯字两种都只有一个气泡。
+      const rich = state?.config?.chat?.richBubble !== false;
+      const splitPic = !rich && !!m.image && !!m.text;
+      const makeBubble = (withPic, withText, withMeta) => {
+        const el = document.createElement('div');
+        el.className = `bubble ${mine ? 'me' : 'her'}${m.kind === 'proactive' ? ' proactive' : ''}${withPic ? ' haspic' : ''}`;
+        // 带图的消息：图片在上、文字在下（发表情包时常常没字）。
+        if (withPic) {
+          const pic = document.createElement('img');
+          pic.className = 'pic';
+          pic.alt = '';
+          pic.src = 'file:///' + encodeURI(String(m.image).replace(/\\/g, '/'));
+          // 图被删了 / 路径失效：塌成一条小提示，别留个破图占着气泡（球里没有 devtools）。
+          pic.addEventListener('error', () => {
+            pic.classList.add('missing');
+            pic.alt = '图片加载不出来';
+            pic.removeAttribute('src');
+          });
+          // 双击看图（像 QQ 一样）：滚轮缩放、左键拖动、右上角 ×。
+          pic.addEventListener('dblclick', (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            if (pic.classList.contains('missing')) return;
+            openViewer(pic.src);
+          });
+          el.appendChild(pic);
+        }
+        if (withText && m.text) el.appendChild(document.createTextNode(esc(m.text)));
+        if (withMeta) {
+          const meta = document.createElement('span');
+          meta.className = 'meta';
+          meta.textContent = hhmm(m.at);
+          el.appendChild(meta);
+        }
+        return el;
+      };
+      if (splitPic) {
+        col.appendChild(makeBubble(true, false, false));
+        col.appendChild(makeBubble(false, true, true));
+      } else {
+        col.appendChild(makeBubble(!!m.image, true, true));
       }
-      if (m.text) bubble.appendChild(document.createTextNode(esc(m.text)));
-      const meta = document.createElement('span');
-      meta.className = 'meta';
-      meta.textContent = hhmm(m.at);
-      bubble.appendChild(meta);
-      col.appendChild(bubble);
       div.appendChild(col);
       bubbles.appendChild(div);
     }
     // 新消息一律把最新那条顶到最下面（像 QQ 一样）；但他正在翻历史时不要抢滚动，
     // 改成右下角亮一个小圆按钮，点了才回去。
-    if (items.length > prevCount && !atBottom) {
-      // 主人翻在历史里：不抢滚动，改成计数
+    // 未读只在「面板开着、而且他翻在历史里」时才计数——收起来的时候没人看得见小圆，
+    // 之前一收起就默默攒数字，再打开直接蹦出个 7，很怪。
+    if (items.length > prevCount && !atBottom && expanded) {
       setJump(true, unreadCount + (items.length - prevCount));
     } else {
       setJump(false, 0);
@@ -172,30 +200,33 @@
     if (picBtn) picBtn.classList.toggle('hidden', screenState?.picEnabled !== true);
   }
 
+  /**
+   * 把 /screen/eye 的回包并回本地 state：服务端改完配置会回一份「新的」screen，
+   * 只信它，别自己猜 mode（之前拿旧 state 硬改，按钮就卡在「手动」不动）。
+   */
+  function applyScreenResult(res) {
+    const fromScreen = res?.screen && typeof res.screen === 'object' ? res.screen : null;
+    const next = fromScreen || (res && (typeof res.mode === 'string' || typeof res.enabled === 'boolean')
+      ? { mode: res.mode || (res.enabled === false ? 'off' : 'manual'), enabled: res.enabled !== false }
+      : null);
+    if (!next) return;
+    state = { ...(state || {}), screen: { ...(state?.screen || {}), ...next } };
+    try { renderScreenHint(state.screen); } catch {}
+  }
+
+  /** 单击「眼」：开着（手动/自动）就关掉；已经关着什么都不做（交给单击提示）。 */
   async function toggleEye() {
     if (eyeBusy) return;
     const btn = document.getElementById('btnEye');
-    const wantOn = !(state?.screen?.enabled === true);
     eyeBusy = true;
     if (btn) { btn.disabled = true; btn.classList.add('busy'); }
     try {
-      if (!wantOn) {
-        await window.orb.http('/screen/eye', { method: 'POST', body: { enabled: false } });
-        setHint('眼睛关上了');
-        showHintBriefly('眼睛已关闭 · 双击「眼」让她看一次');
-        try {
-          if (btn) btn.classList.remove('on');
-          renderScreenHint({ ...(state?.screen || {}), mode: 'off', enabled: false });
-        } catch {}
-        return;
-      }
-      setHint('正在看她看到的画面…');
-      const res = await window.orb.http('/screen/eye', { method: 'POST', body: { enabled: true }, timeoutMs: 120000 });
-      if (res?.visionOk === false) setHint('当前模型看不了图，开了也没用');
-      else if (res?.ok) setHint('看过了');
-      else setHint(String(res?.error || '这次没看成'));
+      const res = await window.orb.http('/screen/eye', { method: 'POST', body: { enabled: false }, timeoutMs: 20000 });
+      applyScreenResult(res);
+      setHint('眼睛关上了');
+      showHintBriefly('眼睛已关闭 · 双击「眼」让她看一次');
     } catch (error) {
-      setHint('开眼睛失败：' + String(error?.message ?? error).slice(0, 60));
+      setHint('关眼睛失败：' + String(error?.message ?? error).slice(0, 60));
     } finally {
       eyeBusy = false;
       if (btn) { btn.disabled = false; btn.classList.remove('busy'); }
@@ -206,20 +237,29 @@
   // 单击要等一下再执行，才能区分出双击（230ms 内没有第二下才算单击）。
   let eyeClickTimer = null;
 
-  /** 双击：先确保眼睛打开，再拍一张给她看。 */
+  /**
+   * 双击：不管当前开没开，都请求「现在看一次」。
+   * 服务端把 enabled:true 理解成「打开 + 立刻拍一张」，所以一条请求就够；
+   * 以前是先 POST 打开、再 toggleEye 把它关掉，等于开了就关，纯属自己绕自己。
+   */
   async function lookOnce() {
     if (eyeBusy) return;
-    if (state?.screen?.enabled !== true) {
-      eyeBusy = true;
-      const btn = document.getElementById('btnEye');
-      if (btn) { btn.disabled = true; btn.classList.add('busy'); }
-      try { await window.orb.http('/screen/eye', { method: 'POST', body: { enabled: true } }); } catch {}
-      finally {
-        eyeBusy = false;
-        if (btn) { btn.disabled = false; btn.classList.remove('busy'); }
-      }
+    const btn = document.getElementById('btnEye');
+    eyeBusy = true;
+    if (btn) { btn.disabled = true; btn.classList.add('busy'); }
+    setHint('正在看她看到的画面…');
+    try {
+      const res = await window.orb.http('/screen/eye', { method: 'POST', body: { enabled: true }, timeoutMs: 120000 });
+      applyScreenResult(res);
+      if (res?.visionOk === false) setHint('当前模型看不了图，开了也没用');
+      else if (res?.ok) setHint('看过了');
+      else setHint(String(res?.error || '这次没看成'));
+    } catch (error) {
+      setHint('看一眼失败：' + String(error?.message ?? error).slice(0, 60));
+    } finally {
+      eyeBusy = false;
+      if (btn) { btn.disabled = false; btn.classList.remove('busy'); }
     }
-    await toggleEye();
   }
 
   document.getElementById('btnEye')?.addEventListener('click', (ev) => {
@@ -228,7 +268,7 @@
     if (eyeClickTimer) return;
     eyeClickTimer = setTimeout(() => {
       eyeClickTimer = null;
-      if (state?.screen?.enabled === true) { void toggleEye(); return; }
+      if (screenModeOf(state?.screen) !== 'off') { void toggleEye(); return; }
       showHintBriefly('眼睛已关闭 · 双击「眼」让她看一次');
     }, 230);
   });
@@ -266,14 +306,15 @@
     if (btn) { btn.disabled = true; btn.classList.add('busy'); }
     try {
       const hint = String(document.getElementById('input')?.value || '').trim();
-      const res = await window.orb.http('/pic', { method: 'POST', body: { hint }, timeoutMs: 30000 });
+      // 现场生图要 30~120 秒，别用 30 秒的短超时把它掐掉。
+      const res = await window.orb.http('/pic', { method: 'POST', body: { hint }, timeoutMs: 180000 });
       if (res?.ok) {
-        setHint(res.source === 'sticker' ? '偷了张表情包发给你' : res.source === 'local' ? '从图库挑了一张' : '图发出来了');
+        setHint(res.source === 'sticker' ? '偷了张表情包发给你' : res.source === 'local' ? '从图库挑了一张' : '刚画好，发给你');
         return;
       }
       if (res?.needGenerate) {
-        // 插件自己没有生图能力：把 prompt 记下来，等聊天这边叫 agent 画完再 /pic/image 回填。
-        setHint('这条要现场画：在聊天里叫她画，画完会自动出现在这里');
+        // 服务端已经尽力画过了：画不出来才把 prompt 交回聊天里的 agent（/pic/image 回填）。
+        setHint(String(res.error || '这张画不出来，叫我在聊天里给你画一张也行'));
         return;
       }
       setHint(String(res?.error || '这次没找到合适的图'));
@@ -291,6 +332,93 @@
     void sendPic();
   });
 
+  // ==== 看图查看器（双击会话里的图打开）==================================
+  const viewerEl = document.getElementById('viewer');
+  const viewerImg = document.getElementById('viewerImg');
+  const viewerClose = document.getElementById('viewerClose');
+  const view = { open: false, scale: 1, tx: 0, ty: 0, drag: null };
+
+  function applyView() {
+    if (!viewerImg) return;
+    viewerImg.style.transform = `translate(${view.tx}px, ${view.ty}px) scale(${view.scale})`;
+  }
+
+  /** 按窗口装得下的大小显示：小图不放大，大图缩进窗口并居中。 */
+  function fitViewer() {
+    if (!viewerEl || !viewerImg) return;
+    const nw = Number(viewerImg.naturalWidth) || 0;
+    const nh = Number(viewerImg.naturalHeight) || 0;
+    const box = viewerEl.getBoundingClientRect();
+    if (!nw || !nh || !box.width || !box.height) return;
+    const fit = Math.min(1, (box.width * 0.92) / nw, (box.height * 0.92) / nh);
+    view.scale = fit;
+    view.tx = (box.width - nw * fit) / 2;
+    view.ty = (box.height - nh * fit) / 2;
+    applyView();
+  }
+
+  function openViewer(src) {
+    if (!viewerEl || !viewerImg || !src) return;
+    view.open = true;
+    view.scale = 1;
+    view.tx = 0;
+    view.ty = 0;
+    view.drag = null;
+    viewerImg.classList.remove('grabbing');
+    viewerImg.onload = () => fitViewer();
+    viewerImg.src = src;
+    viewerEl.classList.remove('hidden');
+    // 已经解码过的图（缓存命中）onload 不会再触发，直接量。
+    if (viewerImg.complete && Number(viewerImg.naturalWidth) > 0) fitViewer();
+  }
+
+  function closeViewer() {
+    if (!view.open || !viewerEl) return;
+    view.open = false;
+    view.drag = null;
+    viewerEl.classList.add('hidden');
+    viewerImg?.classList.remove('grabbing');
+  }
+
+  viewerClose?.addEventListener('click', (ev) => { ev.preventDefault(); closeViewer(); });
+  viewerEl?.addEventListener('mousedown', (ev) => {
+    if (!view.open) return;
+    // 点空白背景 = 关闭；点在图上 = 开始拖动
+    if (ev.target === viewerEl) { closeViewer(); return; }
+    if (ev.button !== 0 || ev.target !== viewerImg) return;
+    view.drag = { sx: ev.clientX, sy: ev.clientY, tx: view.tx, ty: view.ty };
+    viewerImg.classList.add('grabbing');
+  });
+  window.addEventListener('mousemove', (ev) => {
+    if (!view.open || !view.drag) return;
+    view.tx = view.drag.tx + (ev.clientX - view.drag.sx);
+    view.ty = view.drag.ty + (ev.clientY - view.drag.sy);
+    applyView();
+  });
+  window.addEventListener('mouseup', () => {
+    if (!view.drag) return;
+    view.drag = null;
+    viewerImg?.classList.remove('grabbing');
+  });
+  viewerEl?.addEventListener('wheel', (ev) => {
+    if (!view.open) return;
+    ev.preventDefault();
+    const k = Math.exp(-Number(ev.deltaY || 0) * 0.0015);
+    const next = Math.max(0.2, Math.min(8, view.scale * k));
+    if (!Number.isFinite(next) || next === view.scale) return;
+    // 以鼠标位置为锚点缩放：先求指针落在图上的点，缩放后再把它挪回同一屏幕位置
+    const box = viewerEl.getBoundingClientRect();
+    const px = ev.clientX - box.left;
+    const py = ev.clientY - box.top;
+    const ax = (px - view.tx) / view.scale;
+    const ay = (py - view.ty) / view.scale;
+    view.scale = next;
+    view.tx = px - ax * next;
+    view.ty = py - ay * next;
+    applyView();
+  }, { passive: false });
+  window.addEventListener('resize', () => { if (view.open) fitViewer(); });
+
   function onState(next) {
     if (!next) return;
     state = next;
@@ -302,19 +430,64 @@
     if (seq !== lastSeq || bubbles.querySelectorAll('.bubble').length !== list.length) {
       lastSeq = seq;
       renderMessages(list);
-      try { renderScreenHint(next.screen); } catch {}
-      const hasProactive = list.some((m) => m.kind === 'proactive' && Number(m.at) > Date.now() - 60_000);
-      badge.classList.toggle('hidden', !(hasProactive && !expanded));
       try { maybeBubble(list); } catch {}
     }
+    // 面板开着就算读过了：收起后不再为她看过的消息冒气泡。
+    if (expanded) markSeen(list);
+    // 眼睛/发图的开关状态跟消息无关，每份状态都要刷：设置页改了档位，
+    // 球得在几秒内自己变过来，不能等下次来消息。
+    try { renderScreenHint(next.screen); } catch {}
+    const hasProactive = list.some((m) => m.kind === 'proactive' && Number(m.at) > Date.now() - 60_000);
+    badge.classList.toggle('hidden', !(hasProactive && !expanded));
     if (next.chat && next.chat.enabled === false) {
       input.disabled = true;
       btnSend.disabled = true;
       setHint('她现在不在这边聊（设置 → 悬浮窗 → 互动）');
     } else {
       input.disabled = false;
-      btnSend.disabled = sending;
+      btnSend.disabled = false;
     }
+    // 排队里还有没回的：球上转圈、别自动收起面板。
+    const q = next.chat?.queue;
+    const waiting = !!(q && (Number(q.pending) > 0 || q.busy === true));
+    if (waiting) ball.classList.add('thinking');
+    else if (!sending) ball.classList.remove('thinking');
+  }
+
+  /** 排队里还有没回完的？ */
+  function queueBusy() {
+    const q = state?.chat?.queue;
+    return !!(q && (Number(q.pending) > 0 || q.busy === true));
+  }
+
+  /** 从插件拉一次完整状态：球收起时收不到推送，打开面板先对一次账。 */
+  async function refreshState() {
+    try {
+      const res = await window.orb.http('/state', { timeoutMs: 8000 });
+      if (res?.ok && res.data) onState(res.data);
+    } catch {}
+  }
+
+  // ==== 已读水位：面板里看过 = 读过 = 收起后别再冒气泡 ====================
+  let seenPosted = 0;
+  let seenTimer = null;
+  function markSeen(list) {
+    if (!expanded) return;
+    const items = Array.isArray(list) ? list : [];
+    const lastId = Number(items.length ? items[items.length - 1].id : 0) || 0;
+    const known = Number(state?.read?.seenId || 0) || 0;
+    const upto = Math.max(known, lastId);
+    if (!upto || upto <= seenPosted) return;
+    seenPosted = upto;
+    clearTimeout(seenTimer);
+    // 攒一下再发：面板开着时勾选一次就够，别每 3 秒打一次接口。
+    seenTimer = setTimeout(async () => {
+      try {
+        const res = await window.orb.http('/seen', { method: 'POST', body: { id: upto }, timeoutMs: 8000 });
+        const nextSeen = Number(res?.data?.seenId || upto) || upto;
+        if (state) state = { ...state, read: { ...(state.read || {}), seenId: Math.max(known, nextSeen) } };
+      } catch {}
+    }, 1200);
   }
 
   function show() {
@@ -326,6 +499,11 @@
     badge.classList.add('hidden');
     ball.classList.remove('thinking');
     window.orb?.expand(true);
+    // 收起期间消息和开关都在变：先把最新状态拉回来，再贴到底部（不然一打开是旧的）。
+    void refreshState();
+    markSeen(state?.messages);
+    setJump(false, 0);
+    requestAnimationFrame(() => { bubbles.scrollTop = bubbles.scrollHeight; });
     // 每次打开会话先露 3 秒提示条（看屏幕现在的档位），然后自己渐隐，不留常驻条。
     try {
       const mode = screenModeOf(state?.screen);
@@ -341,6 +519,7 @@
   function hide(force = false) {
     try { window.SurfPet?.resume?.(); } catch {}
     if (!expanded) return;
+    if (view.open) return; // 正在看图，别把面板收走
     if (pinned && !force) return;
     expanded = false;
     root.classList.remove('expanded');
@@ -407,6 +586,7 @@
 
   window.addEventListener('mousedown', (ev) => {
     if (ev.button !== 0 || !expanded) return;
+    if (view.open) return; // 看图时不改窗口大小
     // 「移」开着的时候，按下就只可能是想挪窗口，不许同时开始缩放。
     if (moveMode) return;
     const edge = edgeAt(ev);
@@ -538,25 +718,30 @@
 
   async function send() {
     const text = input.value.trim();
-    if (!text || sending) return;
-    sending = true;
+    if (!text) return;
+    // 先把输入框清掉再发：她回多久都不耽误主人接着打字（回复在后台排队逐条来）。
+    input.value = '';
     btnSend.disabled = true;
     ball.classList.add('thinking');
     setHint('她在想…');
     try {
-      const res = await window.orb.http('/chat', { method: 'POST', body: { text }, timeoutMs: 120000 });
-      if (!res.ok) setHint(res.error || '没发出去', true);
-      else {
-        input.value = '';
-        setHint('');
+      const res = await window.orb.http('/chat', { method: 'POST', body: { text, queue: true }, timeoutMs: 15000 });
+      if (!res.ok) {
+        // 没发出去就把话说还给他，别让他白打一遍。
+        if (!input.value) input.value = text;
+        setHint(res.error || '没发出去', true);
+        ball.classList.remove('thinking');
+      } else {
+        const pos = Number(res.data?.position || 0);
+        setHint(pos > 1 ? `已排队：前面还有 ${pos - 1} 条` : '');
         if (res.data?.state) onState(res.data.state);
       }
     } catch (error) {
+      if (!input.value) input.value = text;
       setHint(String(error?.message ?? error), true);
-    } finally {
-      sending = false;
-      btnSend.disabled = false;
       ball.classList.remove('thinking');
+    } finally {
+      btnSend.disabled = false;
     }
   }
 
@@ -566,13 +751,17 @@
   });
   // 全局 Esc 收起（输入框里和面板任意处都管用）。
   window.addEventListener('keydown', (ev) => {
-    if (ev.key === 'Escape') { setPinned(false); hide(true); }
+    if (ev.key === 'Escape') {
+      // 看图时 Esc 只关图，不收起面板（不然一次按两件事）
+      if (view.open) { closeViewer(); return; }
+      setPinned(false); hide(true);
+    }
     touch();
   });
 
   // 面板上没动静太久就自己缩回球（钉住的不收）。
   setInterval(() => {
-    if (!expanded || pinned || sending) return;
+    if (!expanded || pinned || sending || queueBusy() || view.open) return;
     if (isComposing()) return;
     if (Date.now() - lastActivity > IDLE_COLLAPSE_MS) hide();
   }, 15000);
@@ -607,23 +796,27 @@
   let petMode = false;
   // 本地微调过的大小（右键滑条写的 prefs.petSize），开菜单时要用它回填滑条
   let petPrefs = null;
+  // 滑条用 0-100%，再映射到 120~320px。拖动途中不改窗口：窗口一变、菜单就被重新夹位，
+  // 滑条会从指针底下溜走，手感就成了「一滑就跳到很远」。所以只跟手更新数字，松手才真改。
+  const PET_MIN_SIZE = 120;
+  const PET_MAX_SIZE = 320;
+  const sizeToPercent = (px) => Math.round(((Number(px) - PET_MIN_SIZE) / (PET_MAX_SIZE - PET_MIN_SIZE)) * 100);
+  const percentToSize = (pct) => Math.round(PET_MIN_SIZE + ((PET_MAX_SIZE - PET_MIN_SIZE)
+    * Math.max(0, Math.min(100, Number(pct) || 0))) / 100);
 
   /**
-   * 命中判定：只有「她身体那一块」才算抓到。
-   * 不能直接用 video 的矩形——video 是 height:100% 铺满整个 stage（含头顶 110px 的气泡带和左右留白），
-   * 那样窗口里任何一点按下都会被当成抓住她。这里按宠物实际尺寸算一个居中的底部方块。
-   */
-  /**
-   * 命中判定：窗口 = 宠物(size) + 头顶气泡带(110) + 左右各 20 的透明边。
+   * 命中判定：窗口 = 宠物(size) + 头顶气泡带 + 左右各 20 的透明边。
    * 用「窗口几何」判断最稳：干掉头顶那条气泡带、左右各 12px 的透明边，剩下就是她的身体区域。
-   * （不按 video 的矩形算——video 是 height:100% 铺满整个 stage，等于窗口里任何一点都算抓到她。）
+   * （不按 video 的矩形算——video 现在按 pet-size 放大、还会横向超出窗口，整块都算不得。）
+   * 气泡带的高度会随气泡内容变（pet.js 的 fitBubble 写主进程），这里跟它同步。
    */
   const petBodyHit = (ev) => {
     if (!petStage || petStage.classList.contains('hidden')) return false;
     const stage = petStage.getBoundingClientRect();
     if (stage.width <= 0 || stage.height <= 0) return false;
-    // PET_BUBBLE_SPACE=110（头顶留给气泡），PET_SIDE_SPACE=40（左右各 20）
-    const bubbleBand = Math.min(110, Math.round(stage.height * 0.42));
+    // 动态带高：气泡长高多少，顶上就让出多少；兜底 110（PET_BUBBLE_SPACE）
+    const bandRaw = Number(window.SurfPet?.bubbleBand?.()) || Math.min(110, Math.round(stage.height * 0.42));
+    const bubbleBand = Math.min(Math.round(stage.height * 0.8), Math.max(0, Math.round(bandRaw)));
     const sidePad = Math.min(12, Math.round(stage.width * 0.08));
     const inside = ev.clientX >= stage.left + sidePad && ev.clientX <= stage.right - sidePad
       && ev.clientY >= stage.top + bubbleBand - 6 && ev.clientY <= stage.bottom;
@@ -724,8 +917,9 @@
       else apply(box);
     } catch {}
     const size = Number(petPrefs?.petSize) || Number(window.__petCfg?.size) || 200;
-    if (ctxSizeRange) ctxSizeRange.value = String(size);
-    if (ctxSizeValue) ctxSizeValue.textContent = String(size);
+    const pct = sizeToPercent(size);
+    if (ctxSizeRange) ctxSizeRange.value = String(pct);
+    if (ctxSizeValue) ctxSizeValue.textContent = `${pct}%`;
   }
 
   function closeCtxMenu() {
@@ -745,7 +939,6 @@
       };
       if (box && typeof box.then === 'function') box.then(apply).catch(() => {});
       else apply(box);
-      if (ctxSizeShown) window.orb?.petSize?.(Number(ctxSizeRange?.value) || 200);
     } catch {}
   }
 
@@ -760,9 +953,16 @@
     placeCtxMenu(null);
   });
   ctxSizeRange?.addEventListener('input', () => {
-    const v = Number(ctxSizeRange.value);
-    if (ctxSizeValue) ctxSizeValue.textContent = String(v);
-    window.orb?.petSize?.(v);
+    // 拖动时只更新数字；窗口尺寸等松手（change）再改，避免滑条被重新夹位甩飞
+    const pct = Number(ctxSizeRange.value) || 0;
+    if (ctxSizeValue) ctxSizeValue.textContent = `${Math.round(pct)}%`;
+  });
+  ctxSizeRange?.addEventListener('change', () => {
+    const pct = Number(ctxSizeRange.value) || 0;
+    const size = percentToSize(pct);
+    if (ctxSizeValue) ctxSizeValue.textContent = `${Math.round(pct)}%`;
+    try { window.SurfPet?.setSize?.(size); } catch {}
+    void window.orb?.petSize?.(size);
   });
   // 点菜单外面 / Esc / 开始拖动，都把菜单收起来
   window.addEventListener('mousedown', (ev) => {
@@ -775,12 +975,22 @@
   let lastBubbleMsgId = '';
   function maybeBubble(list) {
     if (!petMode || expanded) return;
-    const last = [...list].reverse().find((m) => m && m.text && (m.who === 'her' || m.who === undefined));
+    const last = [...list].reverse().find((m) => m && (m.text || m.image) && (m.who === 'her' || m.who === undefined));
     if (!last || !last.id || last.id === lastBubbleMsgId) return;
+    // 面板里已经看过这条了（已读水位），收起后不要再弹一次。
+    const seenId = Number(state?.read?.seenId || 0) || 0;
+    if (seenId > 0 && Number(last.id) <= seenId) return;
     try { window.orb?.log?.('[pet] bubble ' + String(last.id)); } catch {}
     lastBubbleMsgId = last.id;
     const ttl = Number(state?.config?.chat?.bubbleTtlSec || 8) * 1000;
-    window.SurfPet?.showBubble(last.text, { kind: last.kind === 'proactive' ? 'proactive' : 'her', ttlMs: ttl, onClick: () => show() });
+    // 图文一体时头顶气泡也带图；关掉就只冒字（图在面板里看）。
+    const withPic = !!last.image && state?.config?.chat?.richBubble !== false;
+    window.SurfPet?.showBubble(String(last.text || ''), {
+      kind: last.kind === 'proactive' ? 'proactive' : 'her',
+      ttlMs: ttl,
+      image: withPic ? last.image : '',
+      onClick: () => show(),
+    });
   }
 
   window.orb.onState(onState);

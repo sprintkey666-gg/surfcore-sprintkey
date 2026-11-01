@@ -36,7 +36,7 @@ export const DEFAULT_MANIFESTS = [
     id: 'voice-local',
     name: '本地语音包',
     version: '1.1.1',
-    // 2026-11-01：本机改版（大肥鱼音色 + RVC 语音/唱歌）自包含分发。
+    // 2026-11-01：本机改版（小鲸鱼音色 + RVC 语音/唱歌）自包含分发。
     // vendor 约 2.5GB（GPT-SoVITS 1.9GB + Applio 0.6GB）、models 约 0.6GB。
     sizeBytes: 3_200_000_000,
     // 峰值空间 = 下载 2.9GB + 解压 3.1GB + .venv/.venv-gsv/.venv-rvc 3.6GB。
@@ -58,12 +58,12 @@ export const DEFAULT_MANIFESTS = [
     url: process.env.SURFCORE_VOICE_LOCAL_URL || devPackUrl('voice-local'),
     requires: { gpu: true, network: false },
     voices: [
-      { id: 'da-fei-yu-gsv', label: '大肥鱼（本地 · 女声）' },
+      { id: 'da-fei-yu-gsv', label: '小鲸鱼（本地 · 女声）' },
       { id: 'huayan', label: '华研（本地兜底）' },
     ],
     about: {
       summary: '在你自己的电脑上跑，不联网也能说话、唱歌。',
-      pros: ['完全免费', '断网可用', '含大肥鱼音色与 RVC 唱歌'],
+      pros: ['完全免费', '断网可用', '含小鲸鱼音色与 RVC 唱歌'],
       cons: ['需要 NVIDIA 显卡（6G 显存以上）', '下载约 3GB，首次装依赖 40~60 分钟'],
     },
   },

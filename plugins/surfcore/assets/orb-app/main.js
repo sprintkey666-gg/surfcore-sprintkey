@@ -46,6 +46,13 @@ let hostCache = { at: 0, data: null };
 // 收起状态下球的位置/大小。展开再收起必须回到这里，不然球会「跑位」。
 let ballRect = null;
 let prefs = { ballSize: COLLAPSED, x: null, y: null, panelWidth: EXPANDED.width, panelHeight: EXPANDED.height };
+// 头顶给气泡留多高：随气泡内容放大（0 = 用默认值），收起时复位。
+// 窗口向上长，她脚底不动，所以长高不会把她挪位置。
+let bubbleBand = 0;
+
+function bandFor() {
+  return Math.max(PET_BUBBLE_SPACE, Math.round(Number(bubbleBand) || 0));
+}
 
 /** 收起状态下的窗口尺寸：桌宠是「宠物 + 头顶气泡 + 一点余量」，球就是球。 */
 function baseSize() {
@@ -53,7 +60,7 @@ function baseSize() {
   if (pet && pet.mode === 'pet' && pet.manifest) {
     const wanted = Number(prefs.petSize) || Number(pet.size) || 200;
     const size = Math.min(Math.max(Math.round(wanted), PET_MIN), PET_MAX);
-    return { width: size + PET_SIDE_SPACE, height: size + PET_BUBBLE_SPACE, pet: true };
+    return { width: size + PET_SIDE_SPACE, height: size + bandFor(), pet: true };
   }
   const size = Math.min(Math.max(Math.round(prefs.ballSize || COLLAPSED), MIN_BALL), MAX_BALL);
   return { width: size, height: size, pet: false };
@@ -152,17 +159,24 @@ function clampToDisplay(x, y, width, height) {
  * 按「此刻的形态」夹位置。
  * 桌宠窗口左右各有 PET_SIDE_SPACE/2 的透明边——用整窗宽去夹，宠物身体就永远离屏幕边 20px，
  * 主人会以为「明明还能再往里拖」。收起态的桌宠允许整窗出屏这 20px，宠物身体才真的贴得到边。
+ * 四个方向都再放宽 PET_KEEP：想把她甩到屏幕边缘/半出屏都行，但至少留这么多像素在屏里，
+ * 不然拖出去就再也抓不回来了（主人 2026-10-31 提的）。
  */
+const PET_KEEP = 60;
+
 function clampForMode(x, y, width, height) {
   const petSide = baseSize().pet && displayMode !== 'expanded' ? Math.round(PET_SIDE_SPACE / 2) : 0;
   if (!petSide) return clampToDisplay(x, y, width, height);
   const area = screen.getDisplayNearestPoint({ x, y }).workArea;
-  const minX = area.x - petSide;
-  const maxX = area.x + area.width - width + petSide;
-  const maxY = area.y + area.height - height;
+  const keepX = Math.max(petSide, Math.min(PET_KEEP, Math.round(width * 0.5)));
+  const keepY = Math.min(PET_KEEP, Math.round(height * 0.5));
+  const minX = area.x - keepX;
+  const maxX = area.x + area.width - width + keepX;
+  const minY = area.y - keepY;
+  const maxY = area.y + area.height - height + keepY;
   return {
     x: Math.min(Math.max(x, minX), Math.max(minX, maxX)),
-    y: Math.min(Math.max(y, area.y), Math.max(area.y, maxY)),
+    y: Math.min(Math.max(y, minY), Math.max(minY, maxY)),
   };
 }
 
@@ -401,6 +415,8 @@ async function setExpanded(on) {
     return expanded;
   }
   pendingExpand = null;
+  // 开/收面板一律把头顶气泡带复位：面板态用不上它，收起时也不会留下一个「长高版」的窗口。
+  bubbleBand = 0;
   if (!want) {
     // 收起 = 回到「主人把桌宠放在哪」那个位置（ballRect），**不跟着面板走**。
     // 之前这里把 ballRect 改到面板右下角，结果一开一收桌宠就自己挪窝了（主人明确要求位置只由他决定）。
@@ -609,7 +625,27 @@ ipcMain.handle('orb:resize', (_event, payload = {}) => {
   return { ok: true, size: applied };
 });
 
-ipcMain.handle('orb:prefs', () => ({ ...prefs, expanded, ball: ballRect }));
+ipcMain.handle('orb:prefs', () => ({ ...prefs, expanded, ball: ballRect, bubbleBand: bandFor() }));
+
+/**
+ * 头顶气泡带高度：气泡内容多高，窗口就往上长多高（脚底不动）。
+ * 传 { px } —— 0 表示复位；传数字则夹在 [PET_BUBBLE_SPACE, 工作区高 - 宠物高 - 80]。
+ */
+ipcMain.handle('orb:bubble-space', (_event, payload = {}) => {
+  if (!win || win.isDestroyed()) return { ok: false, band: bandFor() };
+  const pet = readPet();
+  if (!pet || pet.mode !== 'pet' || !pet.manifest) return { ok: false, band: bandFor() };
+  if (displayMode === 'expanded') return { ok: false, band: bandFor() };
+  const area = screen.getDisplayNearestPoint(win.getBounds()).workArea;
+  const size = Math.min(Math.max(Math.round(Number(prefs.petSize) || Number(pet.size) || 200), PET_MIN), PET_MAX);
+  const maxBand = Math.max(PET_BUBBLE_SPACE, Math.min(600, Math.round(area.height - size - 80)));
+  const want = Math.round(Number(payload.px) || 0);
+  const next = want <= 0 ? PET_BUBBLE_SPACE : Math.min(maxBand, Math.max(PET_BUBBLE_SPACE, want));
+  if (next === bandFor()) return { ok: true, band: next, unchanged: true };
+  bubbleBand = next === PET_BUBBLE_SPACE ? 0 : next;
+  applyBounds(null, 'bubble-space');
+  return { ok: true, band: bandFor() };
+});
 
 // ---- 面板边缘拖拽缩放 ----------------------------------------------------
 // 无边框窗口在 Windows 上没有系统缩放边框，这里自己做一套：渲染进程在面板

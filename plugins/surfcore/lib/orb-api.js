@@ -13,8 +13,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { isLoopbackReq, json, readBody, sameOrigin, safeEqual } from './http-guard.js';
+import { QQ_STATE_DIR } from './paths.js';
 
 export const ORB_API_PREFIX = '/dsh-surfcore/orb-api';
 const HOST_FILE_VERSION = 1;
@@ -138,6 +139,16 @@ export function createOrbApiService({
   // 截图记账：跨重启也要能算「今天看了几次」，所以落盘
   const shotsFile = path.join(root, 'shots.json');
   const picDir = path.join(root, 'media');
+  // 最近发出去的图（内存即可）：气泡里只有图没有字，聊天时要能跟模型说清「你刚发了什么」。
+  // 每条 { at, note }，note 是给模型看的一句说明（表情包描述 / 本地图名 / 生图场景）。
+  let picNotes = [];
+  function notePic(note) {
+    picNotes = [...picNotes, { at: Date.now(), note: String(note || '一张图').slice(0, 120) }].slice(-10);
+  }
+  function freshPics(limit = 3) {
+    const cut = Date.now() - 15 * 60 * 1000;
+    return picNotes.filter((x) => x.at >= cut).slice(-limit).map((x) => x.note);
+  }
 
   function dayKey(now = Date.now()) {
     const d = new Date(now);
@@ -182,12 +193,284 @@ export function createOrbApiService({
     return dest;
   }
 
+  // ── 现场生图 ───────────────────────────────────────────────────────────
+  // 插件本身不带生图通道（没有 API key / undici），借 state/agents/codex-gen.mjs：
+  // 那是走 ChatGPT 订阅的脚本，必须带代理（DSH 后端不吃系统代理，7897 是兜底）。
+  // ⚠️ 生图脚本在「仓根/state/agents」下，不在插件状态目录（~/.dsh/surfcore）——
+  // stateDir 是插件自己的状态，拿它拼出来必然是「本机没有生图脚本」。
+  const GEN_SCRIPT = path.join(QQ_STATE_DIR, 'agents', 'codex-gen.mjs');
+  const GEN_TIMEOUT_MS = 180 * 1000;
+  let genBusy = false;
+
+  function proxyEnv() {
+    const env = { ...process.env, NODE_USE_ENV_PROXY: '1' };
+    const url = [process.env.HTTPS_PROXY, process.env.HTTP_PROXY, process.env.ALL_PROXY, 'http://127.0.0.1:7897']
+      .map((x) => String(x || '').trim()).filter(Boolean)[0];
+    if (url) { env.HTTPS_PROXY = url; env.HTTP_PROXY = url; }
+    return env;
+  }
+
+  /** 现场画一张（30~120 秒）：成功返回 {ok:true,path}，失败带一句能给她看的 error。 */
+  function generateNow(prompt) {
+    return new Promise((resolve) => {
+      const out = path.join(picDir, `gen-${Date.now()}-${crypto.randomBytes(3).toString('hex')}.png`);
+      let settled = false;
+      const finish = (payload) => {
+        if (settled) return;
+        settled = true;
+        genBusy = false;
+        resolve(payload);
+      };
+      if (!fs.existsSync(GEN_SCRIPT)) {
+        finish({ ok: false, error: '本机没有生图脚本（state/agents/codex-gen.mjs），只能用现成的图' });
+        return;
+      }
+      let child;
+      try {
+        fs.mkdirSync(picDir, { recursive: true });
+        child = spawn(process.execPath, [GEN_SCRIPT, out, prompt, '1024x1024'], {
+          env: proxyEnv(), windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+        });
+      } catch (error) {
+        finish({ ok: false, error: `起不了生图脚本：${String(error?.message ?? error)}` });
+        return;
+      }
+      let stderr = '';
+      let stdout = '';
+      child.stdout?.on('data', (d) => { stdout = (stdout + String(d)).slice(-2000); });
+      child.stderr?.on('data', (d) => { stderr = (stderr + String(d)).slice(-2000); });
+      const timer = setTimeout(() => {
+        try { child.kill(); } catch {}
+        finish({ ok: false, error: '画了 3 分钟还没出来，先放弃这一张' });
+      }, GEN_TIMEOUT_MS);
+      child.on('error', (error) => {
+        clearTimeout(timer);
+        finish({ ok: false, error: `生图脚本起不来：${String(error?.message ?? error)}` });
+      });
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        let size = 0;
+        try { size = fs.statSync(out).size; } catch {}
+        if (code === 0 && size > 1024) {
+          try {
+            const dest = savePic(fs.readFileSync(out), '.png');
+            try { fs.unlinkSync(out); } catch {}
+            finish({ ok: true, path: dest });
+            return;
+          } catch (error) {
+            finish({ ok: false, error: `图读不进来：${String(error?.message ?? error)}` });
+            return;
+          }
+        }
+        try { fs.unlinkSync(out); } catch {}
+        const tail = (stderr.trim() || stdout.trim()).split('\n').filter(Boolean).slice(-1)[0] || '未知原因';
+        finish({ ok: false, error: `没画出来（exit ${code}）：${String(tail).slice(0, 120)}` });
+      });
+    });
+  }
+
   /** 看完就删：截图里是主人的桌面，除非他明确要留档，否则不该在盘上堆着。 */
   function dropShot(file) {
     try {
       if (file && fs.existsSync(file)) fs.unlinkSync(file);
     } catch (error) {
       pluginLog('[orb-api] 删截图失败：', String(error?.message ?? error));
+    }
+  }
+
+  /**
+   * 挑一张现成的图：①QQ 收藏表情 ②本地图库。
+   * 只挑不记——发不发、写成哪条消息，由调用方（`/pic`、聊天配图）决定。
+   */
+  async function pickPic({ hint = '', source = '', cfg = null } = {}) {
+    // ① QQ 收藏表情：找得到就发，最贴「斗图」的场景
+    if (source !== 'local' && cfg?.pic?.preferQqSticker !== false && typeof consoleCall === 'function') {
+      try {
+        const qq = String(adminQQ() || '').replace(/[^0-9]/g, '');
+        if (qq) {
+          const key = `private:${qq}`;
+          const listed = await consoleCall(`/api/socialV2/sticker-list?key=${encodeURIComponent(key)}&count=60`);
+          const raw = listed?.json || {};
+          const entries = Array.isArray(raw.entries) ? raw.entries
+            : Array.isArray(raw.stickers) ? raw.stickers
+              : Array.isArray(raw.items) ? raw.items : [];
+          if (entries.length) {
+            const near = hint
+              ? entries.filter((e) => {
+                const hay = `${e.caption || ''} ${e.desc || ''} ${e.localNote || ''} ${(e.keywords || []).join(' ')}`;
+                return hint.split(/[\s，,。]/).filter(Boolean).some((w) => hay.includes(w));
+              })
+              : [];
+            const pool = near.length ? near : entries;
+            const pick = pool[Math.floor(Math.random() * pool.length)];
+            const id = String(pick.id ?? pick.emojiId ?? pick.md5 ?? '').trim();
+            if (id) {
+              const got = await consoleCall(`/api/socialV2/sticker-image?key=${encodeURIComponent(key)}&stickerId=${encodeURIComponent(id)}`);
+              const data = got?.json?.image?.data;
+              const mime = String(got?.json?.image?.mimeType || 'image/png');
+              if (data) {
+                const ext = mime.includes('jpeg') ? '.jpg' : mime.includes('gif') ? '.gif' : mime.includes('webp') ? '.webp' : '.png';
+                const dest = savePic(Buffer.from(data, 'base64'), ext);
+                return {
+                  ok: true,
+                  dest,
+                  source: 'sticker',
+                  sticker: { desc: pick.caption || pick.desc || '', id },
+                  note: `QQ 表情包：${pick.caption || pick.desc || hint || '表情'}`,
+                };
+              }
+            }
+          }
+        }
+      } catch (error) {
+        pluginLog('[orb-api] 挑 QQ 表情失败：', String(error?.message ?? error));
+      }
+    }
+
+    // ② 本地图库：主人自己按情绪分目录放的图，命中率最高
+    if (source !== 'sticker' && cfg?.pic?.allowLocal !== false) {
+      try {
+        const dirs = (picLocalDirs() || []).filter((d) => {
+          try { return fs.statSync(d).isDirectory(); } catch { return false; }
+        });
+        const files = [];
+        for (const dir of dirs) {
+          let names = [];
+          try { names = fs.readdirSync(dir); } catch { continue; }
+          for (const name of names) {
+            if (!/\.(png|jpe?g|gif|webp)$/i.test(name)) continue;
+            files.push(path.join(dir, name));
+          }
+        }
+        if (files.length) {
+          const pick = files[Math.floor(Math.random() * files.length)];
+          const buf = fs.readFileSync(pick);
+          const ext = path.extname(pick).toLowerCase() || '.png';
+          const dest = savePic(buf, ext);
+          return {
+            ok: true,
+            dest,
+            source: 'local',
+            file: pick,
+            note: `本地图库：${path.basename(pick)}${hint ? `（挑图时说：${hint}）` : ''}`,
+          };
+        }
+      } catch (error) {
+        pluginLog('[orb-api] 本地图库挑图失败：', String(error?.message ?? error));
+      }
+    }
+
+    return { ok: false, error: '这次没找到合适的图' };
+  }
+
+  /** 拍一张给她看：图读进内存，磁盘那张按设置立刻删。 */
+  async function shotForChat(reason, cfg) {
+    const shot = await look({ reason, small: true });
+    if (!shot.ok || !shot.screenshot) return null;
+    let image = null;
+    try {
+      const buf = fs.readFileSync(shot.screenshot);
+      if (buf.length > 0 && buf.length <= 900 * 1024) {
+        image = { mimeType: 'image/jpeg', data: buf.toString('base64') };
+      }
+    } catch {}
+    if (cfg?.screen?.deleteAfterRead !== false) dropShot(shot.screenshot);
+    return image;
+  }
+
+  /** 她这一小时还能不能配图（和 /pic 共用同一个额度）。 */
+  function picQuotaLeft(cfg) {
+    const perHour = Math.max(1, Number(cfg?.pic?.maxPerHour) || 12);
+    const hourAgo = Date.now() - 3600 * 1000;
+    picHits = picHits.filter((x) => x > hourAgo);
+    return perHour - picHits.length;
+  }
+
+  /**
+   * 跑一轮聊天（不含「我」那条消息、不含响应）：
+   * 自动档两段式看屏幕 → 问 chat.chat() → 剥掉 [[配图:]] 标记 → 按开关挑一张图。
+   */
+  async function runChatTurn({ text, cfg }) {
+    const desktop = await desktopContext();
+    const mode = cfg.screen.mode || (cfg.screen.enabled === true ? 'manual' : 'off');
+    // 她刚发过的图，气泡里没有文字，得单独告诉模型，否则她以为自己没发过。
+    const pics = freshPics(3);
+    // 聊天里能不能带图：开关在，才让她在回复里写 [[配图: …]]
+    const allowPic = cfg.pic?.enabled === true && cfg.pic?.attachToChat === true;
+
+    let image = null;
+    let result;
+    if (mode === 'auto' && cfg.screen.enabled === true) {
+      // 自动档两段式：先让她自己决定要不要看（只在回复里出一句 [[看一眼]]），
+      // 真要看才拍一张、拍完再问一遍，用第二次的回复当正式回答。
+      // 额度由 look() 把关（每小时 maxPerHour），且一轮最多一次。
+      const first = await chat.chat({ text, modality: 'text', desktop, pics, screenMode: 'auto', allowPic });
+      const firstText = String(first.reply?.text || '');
+      if (first.ok && /\[\[看一眼\]\]/.test(firstText)) {
+        image = await shotForChat('auto', cfg);
+        if (image) {
+          result = await chat.chat({ text, modality: 'text', desktop, image, pics, screenMode: 'auto', allowPic });
+          if (!result.ok) result = { ...first, reply: { ...(first.reply || {}), text: firstText.replace(/\[\[看一眼\]\]/g, '').trim() } };
+        } else {
+          result = { ...first, reply: { ...(first.reply || {}), text: firstText.replace(/\[\[看一眼\]\]/g, '').trim() } };
+        }
+      } else {
+        result = first;
+      }
+    } else {
+      // 手动档 / 老配置（attachToChat）：每条消息都顺手拍一张给她看。
+      if (cfg.screen.enabled === true && cfg.screen.attachToChat !== false) image = await shotForChat('chat', cfg);
+      result = await chat.chat({ text, modality: 'text', desktop, image, pics, allowPic });
+    }
+    if (!result.ok) return { ok: false, result };
+
+    // ⚠️ 用 rawReply：chat.chat() 返回的 reply.text 已经是剥掉标记的历史文本，
+    // 拿它匹配永远匹配不到，配图就永远发不出来。
+    let replyText = String(result.rawReply || result.reply?.text || '').trim();
+    // 配图标记：不管用不用得上，都必须从给她看的话里剥掉，否则会原样显示给主人。
+    const marker = replyText.match(/\[\[配图[:：]\s*([^\]\n]{1,60})\]\]/);
+    if (marker) replyText = replyText.replace(/\[\[配图[:：]\s*[^\]\n]{1,60}\]\]/g, '').replace(/\n{3,}/g, '\n\n').trim();
+
+    let picDest = '';
+    if (marker && allowPic && picQuotaLeft(cfg) > 0) {
+      // 只用快来源（表情/本地图库）：生图要一分钟，不能拿来堵聊天。
+      const picked = await pickPic({ hint: String(marker[1] || '').trim(), cfg });
+      if (picked.ok) {
+        picHits.push(Date.now());
+        notePic(picked.note);
+        picDest = picked.dest;
+      }
+    }
+    return { ok: true, result, replyText, image: picDest };
+  }
+
+  const chatQueue = [];
+  let chatBusy = false;
+  const CHAT_QUEUE_MAX = 20;
+
+  /** 一条一条回，回完一条再回下一条；单条失败只提示一句，不堵后面。 */
+  async function pumpChatQueue() {
+    if (chatBusy) return;
+    chatBusy = true;
+    try {
+      while (chatQueue.length) {
+        const job = chatQueue.shift();
+        try {
+          const turn = await runChatTurn({ text: job.text, cfg: job.cfg });
+          if (!turn.ok) {
+            const why = String(turn.result?.error || '未知原因').slice(0, 120);
+            orb.addMessage({ who: 'her', kind: 'system', text: `（这条没回上来：${why}）` });
+            continue;
+          }
+          if (turn.replyText || turn.image) {
+            orb.addMessage({ who: 'her', text: turn.replyText, kind: 'reply', image: turn.image });
+          }
+        } catch (error) {
+          orb.addMessage({ who: 'her', kind: 'system', text: `（这条没回上来：${String(error?.message ?? error).slice(0, 120)}）` });
+        }
+      }
+    } finally {
+      chatBusy = false;
     }
   }
 
@@ -483,8 +766,15 @@ export function createOrbApiService({
       ui: resolveIdent(cfg),
       screen: screenSnapshot(cfg),
       role: chat?.status?.().role ?? null,
-      chat: { enabled: cfg.chat.enabled, llm: chat?.status?.().llm ?? null },
+      chat: {
+        enabled: cfg.chat.enabled,
+        llm: chat?.status?.().llm ?? null,
+        // 排队状态：球上的「在想」和输入框的空闲收起都看这个。
+        queue: { pending: chatQueue.length, busy: chatBusy },
+      },
       purpose: { focus },
+      // 已读水位：面板里看到第几条，收起后就不用再弹气泡了（跨重启记住）。
+      read: { seenId: orb.readSeenId() },
       theme: (() => {
         const t = cfg.ball.theme;
         return t === 'light' || t === 'dark' ? t : 'dark';
@@ -570,6 +860,14 @@ export function createOrbApiService({
       json(res, 200, { ok: true });
       return;
     }
+    // 已读水位：面板看过就记一下，收起时不再为同一条冒气泡。
+    if (req.method === 'POST' && suffix === '/seen') {
+      let body = {};
+      try { body = JSON.parse((await readBody(req, ORB_BODY_LIMIT)) || '{}'); } catch {}
+      const seenId = orb.markSeen(Number(body.id) || 0);
+      json(res, 200, { ok: true, seenId });
+      return;
+    }
     if (req.method === 'POST' && suffix === '/pic') {
       let body = {};
       try { body = JSON.parse((await readBody(req, ORB_BODY_LIMIT)) || '{}'); } catch {}
@@ -588,78 +886,25 @@ export function createOrbApiService({
       const hint = String(body.hint ?? '').trim().slice(0, 200);
       const source = String(body.source ?? '').trim();
 
-      // ① QQ 收藏表情：找得到就发，最贴「斗图」的场景
-      if (source !== 'local' && cfg.pic.preferQqSticker !== false && typeof consoleCall === 'function') {
-        try {
-          const qq = String(adminQQ() || '').replace(/[^0-9]/g, '');
-          if (qq) {
-            const key = `private:${qq}`;
-            const listed = await consoleCall(`/api/socialV2/sticker-list?key=${encodeURIComponent(key)}&count=60`);
-            const raw = listed?.json || {};
-            const entries = Array.isArray(raw.entries) ? raw.entries
-              : Array.isArray(raw.stickers) ? raw.stickers
-                : Array.isArray(raw.items) ? raw.items : [];
-            if (entries.length) {
-              const near = hint
-                ? entries.filter((e) => {
-                  const hay = `${e.caption || ''} ${e.desc || ''} ${e.localNote || ''} ${(e.keywords || []).join(' ')}`;
-                  return hint.split(/[\s，,。]/).filter(Boolean).some((w) => hay.includes(w));
-                })
-                : [];
-              const pool = near.length ? near : entries;
-              const pick = pool[Math.floor(Math.random() * pool.length)];
-              const id = String(pick.id ?? pick.emojiId ?? pick.md5 ?? '').trim();
-              if (id) {
-                const got = await consoleCall(`/api/socialV2/sticker-image?key=${encodeURIComponent(key)}&stickerId=${encodeURIComponent(id)}`);
-                const data = got?.json?.image?.data;
-                const mime = String(got?.json?.image?.mimeType || 'image/png');
-                if (data) {
-                  const ext = mime.includes('jpeg') ? '.jpg' : mime.includes('gif') ? '.gif' : mime.includes('webp') ? '.webp' : '.png';
-                  const dest = savePic(Buffer.from(data, 'base64'), ext);
-                  picHits.push(Date.now());
-                  const msg = orb.addMessage({ who: 'her', kind: 'pic', text: '', image: dest });
-                  json(res, 200, { ok: true, source: 'sticker', sticker: { desc: pick.caption || pick.desc || '', id }, message: msg, screen: screenSnapshot(cfg) });
-                  return;
-                }
-              }
-            }
-          }
-        } catch (error) {
-          pluginLog('[orb-api] 挑 QQ 表情失败：', String(error?.message ?? error));
-        }
+      // ① QQ 收藏表情 → ② 本地图库：先试试现成的
+      const picked = await pickPic({ hint, source, cfg });
+      if (picked.ok) {
+        picHits.push(Date.now());
+        const msg = orb.addMessage({ who: 'her', kind: 'pic', text: '', image: picked.dest });
+        notePic(picked.note);
+        json(res, 200, {
+          ok: true,
+          source: picked.source,
+          sticker: picked.sticker,
+          file: picked.file,
+          message: msg,
+          screen: screenSnapshot(cfg),
+        });
+        return;
       }
 
-      // ② 本地图库：主人自己按情绪分目录放的图，命中率最高
-      if (source !== 'sticker' && cfg.pic.allowLocal !== false) {
-        try {
-          const dirs = (picLocalDirs() || []).filter((d) => {
-            try { return fs.statSync(d).isDirectory(); } catch { return false; }
-          });
-          const files = [];
-          for (const dir of dirs) {
-            let names = [];
-            try { names = fs.readdirSync(dir); } catch { continue; }
-            for (const name of names) {
-              if (!/\.(png|jpe?g|gif|webp)$/i.test(name)) continue;
-              files.push(path.join(dir, name));
-            }
-          }
-          if (files.length) {
-            const pick = files[Math.floor(Math.random() * files.length)];
-            const buf = fs.readFileSync(pick);
-            const ext = path.extname(pick).toLowerCase() || '.png';
-            const dest = savePic(buf, ext);
-            picHits.push(Date.now());
-            const msg = orb.addMessage({ who: 'her', kind: 'pic', text: '', image: dest });
-            json(res, 200, { ok: true, source: 'local', file: pick, message: msg, screen: screenSnapshot(cfg) });
-            return;
-          }
-        } catch (error) {
-          pluginLog('[orb-api] 本地图库挑图失败：', String(error?.message ?? error));
-        }
-      }
-
-      // ③ 现场生图：插件自己没有生图通道，把 prompt 交回给聊天里的 agent
+      // ③ 现场生图：自己调订阅通道画一张（30~120 秒）。真画不出来，才把 prompt
+      // 交回给聊天里的 agent 回填（/pic/image），别让她在球里干等一句「没找到图」。
       if (cfg.pic.allowGenerate !== false) {
         const base = hint || '主人这会儿想看你发张图';
         const prompt = [
@@ -667,7 +912,27 @@ export function createOrbApiService({
           `场景：${base}`,
           '表情自然、有梗，适合当聊天表情包。',
         ].join('\n');
-        json(res, 200, { ok: false, needGenerate: true, prompt, hint: base, error: '没有现成的图，这条得现场画', screen: screenSnapshot(cfg) });
+        if (genBusy) {
+          json(res, 202, { ok: false, needGenerate: true, prompt, hint: base, error: '上一张还在画，等它出来再点一下', screen: screenSnapshot(cfg) });
+          return;
+        }
+        genBusy = true;
+        const gen = await generateNow(prompt);
+        if (gen.ok) {
+          picHits.push(Date.now());
+          const msg = orb.addMessage({ who: 'her', kind: 'pic', text: '', image: gen.path });
+          notePic(`自己现画的图（场景：${base}）`);
+          json(res, 200, { ok: true, source: 'generate', prompt, message: msg, screen: screenSnapshot(orb.readConfig()) });
+          return;
+        }
+        json(res, 200, {
+          ok: false,
+          needGenerate: true,
+          prompt,
+          hint: base,
+          error: gen.error || '没有现成的图，这条得现场画',
+          screen: screenSnapshot(orb.readConfig()),
+        });
         return;
       }
       json(res, 404, { ok: false, error: '这次没找到合适的图' });
@@ -689,7 +954,9 @@ export function createOrbApiService({
         const st = fs.statSync(src);
         if (!st.isFile() || st.size > 20 * 1024 * 1024) { json(res, 400, { ok: false, error: '图太大或不是文件' }); return; }
         const dest = savePic(fs.readFileSync(src), path.extname(src).toLowerCase());
-        const msg = orb.addMessage({ who: 'her', kind: 'pic', text: String(body.text ?? '').trim().slice(0, 200), image: dest });
+        const caption = String(body.text ?? '').trim().slice(0, 200);
+        const msg = orb.addMessage({ who: 'her', kind: 'pic', text: caption, image: dest });
+        notePic(`补发的图${caption ? `（配字：${caption}）` : ''}`);
         json(res, 200, { ok: true, source: 'generate', message: msg, screen: screenSnapshot(cfg) });
       } catch (error) {
         json(res, 500, { ok: false, error: `回填图片失败：${String(error?.message ?? error)}` });
@@ -710,56 +977,32 @@ export function createOrbApiService({
       }
       const text = String(body.text ?? '').trim();
       if (!text) { json(res, 400, { ok: false, error: '说点什么吧' }); return; }
-      orb.addMessage({ who: 'me', text, kind: 'chat' });
-      const desktop = await desktopContext();
-      const mode = cfg.screen.mode || (cfg.screen.enabled === true ? 'manual' : 'off');
 
-      /** 拍一张给她看：图读进内存，磁盘那张按设置立刻删。 */
-      async function shotForChat(reason) {
-        const shot = await look({ reason, small: true });
-        if (!shot.ok || !shot.screenshot) return null;
-        let image = null;
-        try {
-          const buf = fs.readFileSync(shot.screenshot);
-          if (buf.length > 0 && buf.length <= 900 * 1024) {
-            image = { mimeType: 'image/jpeg', data: buf.toString('base64') };
-          }
-        } catch {}
-        if (cfg.screen.deleteAfterRead !== false) dropShot(shot.screenshot);
-        return image;
-      }
-
-      let image = null;
-      let result;
-      if (mode === 'auto' && cfg.screen.enabled === true) {
-        // 自动档两段式：先让她自己决定要不要看（只在回复里出一句 [[看一眼]]），
-        // 真要看才拍一张、拍完再问一遍，用第二次的回复当正式回答。
-        // 额度由 look() 把关（每小时 maxPerHour），且一轮最多一次。
-        const first = await chat.chat({ text, modality: 'text', desktop, screenMode: 'auto' });
-        const firstText = String(first.reply?.text || '');
-        if (first.ok && /\[\[看一眼\]\]/.test(firstText)) {
-          image = await shotForChat('auto');
-          if (image) {
-            result = await chat.chat({ text, modality: 'text', desktop, image, screenMode: 'auto' });
-            if (!result.ok) result = { ...first, reply: { ...(first.reply || {}), text: firstText.replace(/\[\[看一眼\]\]/g, '').trim() } };
-          } else {
-            result = { ...first, reply: { ...(first.reply || {}), text: firstText.replace(/\[\[看一眼\]\]/g, '').trim() } };
-          }
-        } else {
-          result = first;
+      // 排队模式：先把「我」这条写进去、立刻回 200，让她在后台一条条回。
+      // 客户端把非 2xx 当失败，所以这里必须 200，不能 202。
+      if (body.queue === true) {
+        if (chatQueue.length >= CHAT_QUEUE_MAX) {
+          json(res, 429, { ok: false, error: `排队太多条了（最多 ${CHAT_QUEUE_MAX} 条），等前面几条回完再说` });
+          return;
         }
-      } else {
-        // 手动档 / 老配置（attachToChat）：每条消息都顺手拍一张给她看。
-        if (cfg.screen.enabled === true && cfg.screen.attachToChat !== false) image = await shotForChat('chat');
-        result = await chat.chat({ text, modality: 'text', desktop, image });
-      }
-      if (!result.ok) {
-        json(res, 400, { ...result, state: stateForOrb() });
+        orb.addMessage({ who: 'me', text, kind: 'chat' });
+        chatQueue.push({ text, cfg });
+        const position = chatQueue.length + (chatBusy ? 1 : 0);
+        void pumpChatQueue();
+        json(res, 200, { ok: true, queued: true, position, state: stateForOrb() });
         return;
       }
-      const replyText = String(result.reply?.text || '').trim();
-      if (replyText) orb.addMessage({ who: 'her', text: replyText, kind: 'reply' });
-      json(res, 200, { ...result, state: stateForOrb() });
+
+      orb.addMessage({ who: 'me', text, kind: 'chat' });
+      const turn = await runChatTurn({ text, cfg });
+      if (!turn.ok) {
+        json(res, 400, { ...turn.result, state: stateForOrb() });
+        return;
+      }
+      if (turn.replyText || turn.image) {
+        orb.addMessage({ who: 'her', text: turn.replyText, kind: 'reply', image: turn.image });
+      }
+      json(res, 200, { ...turn.result, state: stateForOrb() });
       return;
     }
     if (req.method === 'POST' && suffix === '/screen/eye') {
@@ -787,10 +1030,17 @@ export function createOrbApiService({
 
       if (body.enabled === false) {
         if (setScreenEnabled) setScreenEnabled(false);
-        json(res, 200, { ok: true, enabled: false, visionOk, screen: screenSnapshot(cfg) });
+        // 关掉之后必须重读配置：setScreenEnabled 刚刚把 mode 写成了 off，
+        // 拿改之前的 cfg 回包，球的按钮会一直显示「手动」，点一下还是关——来回打转。
+        const closed = orb.readConfig();
+        const closedScreen = screenSnapshot(closed);
+        json(res, 200, { ok: true, enabled: false, mode: closedScreen.mode, visionOk, screen: closedScreen });
         return;
       }
       if (setScreenEnabled) setScreenEnabled(true);
+      // 打开也一样：回包要反映「现在」的 mode，而不是 handler 开头那一份。
+      const opened = orb.readConfig();
+      const openedScreen = screenSnapshot(opened);
       // 手动档：只拦 3 秒连点，不占「每小时最多几张」的额度。
       const nowMs = Date.now();
       if (nowMs - lastEyeAt < EYE_COOLDOWN_MS) {
@@ -798,10 +1048,11 @@ export function createOrbApiService({
         json(res, 429, {
           ok: false,
           enabled: true,
+          mode: openedScreen.mode,
           visionOk,
           reason: 'cooldown',
           error: `刚看过，歇 ${wait} 秒再点`,
-          screen: screenSnapshot(cfg),
+          screen: openedScreen,
         });
         return;
       }
@@ -811,10 +1062,11 @@ export function createOrbApiService({
         json(res, 200, {
           ok: false,
           enabled: true,
+          mode: openedScreen.mode,
           visionOk,
           reason: shot.reason,
           error: shot.error || '拍不到屏幕',
-          screen: screenSnapshot(cfg),
+          screen: openedScreen,
         });
         return;
       }
@@ -859,11 +1111,12 @@ export function createOrbApiService({
       json(res, 200, {
         ok: Boolean(reply) && visionOk !== false,
         enabled: true,
+        mode: openedScreen.mode,
         visionOk,
         reply: text,
         shotAt: shot.at,
         active: shot.active ?? null,
-        screen: screenSnapshot(cfg),
+        screen: screenSnapshot(orb.readConfig()),
         state: stateForOrb(),
       });
       return;
