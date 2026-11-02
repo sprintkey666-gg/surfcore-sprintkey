@@ -81,17 +81,19 @@ import {
   activeMemoryPaths, activePersonaFile, activePlatformStateDir, characterPaths, readCurrentCharacter,
 } from './character-persona.js';
 import {
-  createMemoryCardBackupService, normalizeMemoryCardBackupConfig,
+  createMemoryCardBackupService, defaultBackupDir, normalizeMemoryCardBackupConfig,
 } from './memory-backup.js';
+import { createChatArchiveWriter } from './chat-archive.js';
 import {
   buildExpressionPrompt, characterExpressionState, normalizeSelfExpressionConfig,
   parseExpressionDecision, readSelfExpressionState, sanitizeExpressionText,
   selfExpressionDue, selfExpressionStateFile, writeSelfExpressionState,
 } from './self-expression.js';
 import {
-  appendDiaryEntry, buildDiaryPrompt, characterDiaryState, cleanDiaryText,
-  diaryFileFor, diaryStateFile, formatDiaryEntry, isDiaryDue, normalizeDiaryConfig,
-  readDiaryState, readDiaryTail, writeDiaryState,
+  appendDiaryEntry, appendDiaryEntryGrouped, buildDiaryPrompt, characterDiaryState, cleanDiaryText,
+  diaryBaseDir, diaryCharDir, diaryFileFor, diaryPublicBaseDir, diaryPublicCharDir, diaryStateFile,
+  formatDiaryEntry, isDiaryDue, listDiaryEntries, listDiaryFiles, migrateLegacyDiary,
+  normalizeDiaryConfig, publicPublishQuota, readDiaryState, readDiaryTail, scrubPublicText, writeDiaryState,
 } from './diary.js';
 import {
   buildVoiceLines, disableSample as disableVoiceSample, listPairs, listSamples as listVoiceSamples, minePairsFromMessages, mineSample,
@@ -147,6 +149,16 @@ import {
   pickLocalImage,
   pickStickerFor
 } from './pic-auto.js';
+
+// 好友申请：判定规则同样是纯函数（src/friend-guard.js），这里只管查群成员、发动作、记账。
+import {
+  buildFriendPromptLine,
+  dailyKey,
+  decideFriend,
+  defaultFriendConfig,
+  normalizeFriendConfig,
+  scopeVerdict
+} from './friend-guard.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -953,7 +965,7 @@ function loadConfig() {
     },
     socialV2: {
       enabled: true,
-      autoReplyCheckMs: 30000,
+      autoReplyCheckMs: 10000,
       agentPreset: 'qq-chat-v2',
       provideRecommendations: true,
       tools: {
@@ -988,7 +1000,10 @@ function loadConfig() {
         closeConversation: true,
         // 扩展工具投递（2026-10-28）：图片 / 文件 / 视频发到 QQ。
         // 之前 AI 只能发文字与收藏表情，插件产出的截图、表情、附件没有出口。
-        sendMedia: true
+        sendMedia: true,
+        // 好友申请（2026-11-01）：只读列表 / 拍板通过或拒绝。
+        friendRequests: true,
+        friendDecide: true
       },
       // 跨会话共享记忆（2026-10-28 重设计）：不再是「只看私聊→群里、最多 8 条、72 小时过期」，
       // 改成双向的主人环 + 记忆强度衰减 + 字数预算注入。开关在 Sprintkey 扩展插件分区。
@@ -1045,6 +1060,28 @@ function loadConfig() {
         noActionLimit: 3,
         maxWakeConfigReminders: 2
       },
+      // 「原版 / 快回复」两套参数并存、互不读取：mode 决定这一轮用哪组。
+      // 快回复 = 短批量窗 + 定期换会话（借鉴 QQ-agent 的「每轮新会话」，避免上下文越滚越长）。
+      reply: {
+        mode: 'legacy',
+        legacy: {
+          batchWindowMs: 8000,
+          typingMinMs: 2000,
+          typingMaxMs: 8000,
+          takeover: false,
+          sessionRotate: { enabled: false, everyTurns: 8, idleOnly: true, inheritTasks: true, deleteOld: false },
+          cleanup: { enabled: false, keep: 50, days: 7 }
+        },
+        fast: {
+          batchWindowMs: 800,
+          typingMinMs: 150,
+          typingMaxMs: 500,
+          takeover: true,
+          sessionRotate: { enabled: true, everyTurns: 8, idleOnly: true, inheritTasks: true, deleteOld: false },
+          cleanup: { enabled: true, keep: 50, days: 7 }
+        }
+      },
+
       send: {
         burstEnabled: true,
         burstMaxMessages: 8,
@@ -1094,6 +1131,9 @@ function loadConfig() {
       // 自动发图（2026-10-31 主人要求）：按聊天气景决定要不要补图、补哪一路。
       // 默认只开 QQ 收藏表情；本地图库和现场生图是开关项，默认关。
       pic: defaultPicConfig(),
+      // 好友申请（2026-11-01 主人要求）：白名单范围内的人才可能通过；
+      // autoApprove 关着时只通知 + 等 AI/主人拍板。默认整个功能关。
+      friend: defaultFriendConfig(),
       proactive: {
         enabled: true,
         checkIntervalMinMs: 30 * 60 * 1000,
@@ -1176,6 +1216,8 @@ function loadConfig() {
     closeConversation: true,
     sendVoice: false,
     sendMedia: true,
+    friendRequests: true,
+    friendDecide: true,
     ...(cfg.socialV2.tools ?? {})
   };
 
@@ -3222,7 +3264,233 @@ async function main() {
     return onebotSendSegments(kind, id, segments);
   }
 
-  // 给「刚到的消息」算一条表情推荐（编号 + 情绪 + 内容）。
+  // ── 好友申请（2026-11-01）─────────────────────────────────────────────
+  // 网关不支持「主动加好友」（add_friend 等动作全是 1404 unknown action），
+  // 所以这里做的是「别人来加我们」这一侧：先判范围，再交给 AI/主人拍板。
+  const FRIEND_FILE = path.join(STATE_DIR, 'friend-requests.json');
+  const FRIEND_MAX_PENDING = 50;
+  // qq -> {at, groups}：查「在不在这几个白名单群里」要逐个群问 member_info，
+  // 一次申请要问 1~N 个群，必须缓存，不然刷屏时把网关问爆。
+  const friendScopeCache = new Map();
+
+  function friendCfgNow() {
+    return normalizeFriendConfig(cfg.socialV2?.friend);
+  }
+
+  function readFriendState() {
+    try {
+      const doc = JSON.parse(fs.readFileSync(FRIEND_FILE, 'utf8'));
+      if (doc && typeof doc === 'object') {
+        return {
+          pending: Array.isArray(doc.pending) ? doc.pending : [],
+          counters: doc.counters && typeof doc.counters === 'object' ? doc.counters : {},
+          denied: doc.denied && typeof doc.denied === 'object' ? doc.denied : {},
+          updatedAt: Number(doc.updatedAt) || 0
+        };
+      }
+    } catch {
+      // 文件不存在或坏了都当空：申请列表丢了也不能让桥接起不来。
+    }
+    return { pending: [], counters: {}, denied: {}, updatedAt: 0 };
+  }
+
+  function saveFriendState(doc) {
+    try {
+      fs.mkdirSync(STATE_DIR, { recursive: true });
+      atomicWriteJson(FRIEND_FILE, { ...doc, updatedAt: Date.now() });
+    } catch (error) {
+      log(`[friend] 保存失败：${error?.message ?? error}`);
+    }
+  }
+
+  // 配额按「本地日 / 本地小时」算，跟发图的 picDayKey 同理（UTC 会错位 8 小时）。
+  function friendCountersNow(doc, now = Date.now()) {
+    const d = new Date(now);
+    const day = dailyKey(d);
+    const hour = `${day}T${String(d.getHours()).padStart(2, '0')}`;
+    const c = doc.counters || {};
+    return {
+      day,
+      hour,
+      dayCount: c.day === day ? Number(c.dayCount) || 0 : 0,
+      hourCount: c.hour === hour ? Number(c.hourCount) || 0 : 0,
+      raw: c
+    };
+  }
+
+  function bumpFriendCounters(doc, counters) {
+    const d = new Date();
+    doc.counters = {
+      day: dailyKey(d),
+      hour: `${dailyKey(d)}T${String(d.getHours()).padStart(2, '0')}`,
+      dayCount: counters.dayCount + 1,
+      hourCount: counters.hourCount + 1
+    };
+  }
+
+  // 这个人是不是「白名单私聊对象」或「白名单群里的人」。
+  // get_group_member_list 对当前号是 AUTHORITY_FAIL，只能逐个群问 member_info。
+  async function friendScopeOf(qq, { force = false } = {}) {
+    const id = String(qq ?? '').trim();
+    if (!id) return { ok: false, via: null, group: null, groups: [], reason: '没有 QQ 号' };
+    const now = Date.now();
+    const cached = friendScopeCache.get(id);
+    let groups;
+    if (!force && cached && now - cached.at < 10 * 60 * 1000) {
+      groups = cached.groups;
+    } else {
+      groups = [];
+      for (const gid of Array.isArray(cfg.allow?.groups) ? cfg.allow.groups : []) {
+        try {
+          const info = await withTimeout(
+            onebotAction('get_group_member_info', { group_id: gid, user_id: id, no_cache: true }),
+            8000,
+            'get_group_member_info'
+          );
+          const uid = String(info?.user_id ?? info?.data?.user_id ?? '').trim();
+          if (uid === id) groups.push(String(gid));
+        } catch {
+          // 不在这个群 / 没权限：都按「不在」处理，安全性优先。
+        }
+      }
+      friendScopeCache.set(id, { at: now, groups });
+    }
+    const scope = scopeVerdict({ cfg, qq: id, groups });
+    return { ...scope, groups };
+  }
+
+  async function friendNicknameOf(qq, event = {}) {
+    let name = String(event.nickname ?? event.sender?.nickname ?? '').trim();
+    if (name) return name;
+    try {
+      const info = await withTimeout(onebotAction('get_stranger_info', { user_id: qq, no_cache: true }), 8000, 'get_stranger_info');
+      name = String(info?.nickname ?? info?.data?.nickname ?? '').trim();
+    } catch {
+      // 拿不到昵称不影响判定，用 QQ 号当显示名。
+    }
+    return name;
+  }
+
+  async function notifyOwnerFriend(item) {
+    const ownerQQ = String(cfg.ownerQQ ?? '').trim();
+    if (!ownerQQ) return;
+    const conf = friendCfgNow();
+    if (!conf.notifyOwner) return;
+    const text = [
+      '【好友申请】',
+      `${item.nickname || item.qq}（${item.qq}）`,
+      item.comment ? `留言：${item.comment}` : '',
+      `范围：${item.scope?.reason ?? '未知'}`,
+      `结论：${item.verdict?.allow ? '可以加，等我拍板' : `不能加（${item.verdict?.reason}）`}`
+    ].filter(Boolean).join('\n');
+    try {
+      await onebotAction('send_private_msg', { user_id: ownerQQ, message: [{ type: 'text', data: { text } }] });
+    } catch (error) {
+      log(`[friend] 通知主人失败：${error?.message ?? error}`);
+    }
+  }
+
+  // 真正执行「通过/拒绝」：调 set_friend_add_request，成功才记账。
+  async function applyFriendDecision({ flag, approve, reason = '', remark = '', qq = '' }) {
+    const conf = friendCfgNow();
+    if (!flag) throw new Error('缺少 flag（申请事件里的标识）');
+    const doc = readFriendState();
+    const pendingItem = doc.pending.find((x) => String(x.flag) === String(flag))
+      || doc.pending.find((x) => qq && String(x.qq) === String(qq))
+      || null;
+    if (approve && conf.requireWhitelisted) {
+      const targetQQ = String(qq || pendingItem?.qq || '').trim();
+      if (!targetQQ) throw new Error('通过申请需要 QQ 号，先调 qq_friend_requests 看一眼');
+      const scope = await friendScopeOf(targetQQ, { force: true });
+      if (!scope.ok) throw new Error(`不能通过：${scope.reason}`);
+    }
+    await onebotAction('set_friend_add_request', { flag: String(flag), approve: Boolean(approve) });
+
+    const now = Date.now();
+    doc.pending = doc.pending.filter((x) => String(x.flag) !== String(flag) && (!qq || String(x.qq) !== String(qq)));
+    if (approve) {
+      const counters = friendCountersNow(doc, now);
+      bumpFriendCounters(doc, counters);
+      if (pendingItem?.qq) delete doc.denied[String(pendingItem.qq)];
+      if (conf.autoRemark && pendingItem?.qq) {
+        const label = String(remark || pendingItem.nickname || '').trim();
+        if (label) {
+          try {
+            await onebotAction('set_friend_remark', { user_id: String(pendingItem.qq), remark: label.slice(0, 24) });
+          } catch (error) {
+            log(`[friend] 改备注失败：${error?.message ?? error}`);
+          }
+        }
+      }
+    } else if (pendingItem?.qq && conf.rejectCooldownDays > 0) {
+      doc.denied[String(pendingItem.qq)] = now + conf.rejectCooldownDays * 24 * 60 * 60 * 1000;
+    }
+    saveFriendState(doc);
+    log(`[friend] ${approve ? '通过' : '拒绝'} ${pendingItem?.qq ?? qq ?? '?'}${reason ? `（${reason}）` : ''}`);
+    appendActivity(`${pendingItem?.qq ?? qq} [friend] ${approve ? '通过' : '拒绝'}${reason ? `：${reason}` : ''}`);
+    return { approve: Boolean(approve), qq: pendingItem?.qq ?? qq ?? null, pending: doc.pending.length };
+  }
+
+  // 收到好友申请事件：记录 → 判范围 → 按要求通知/自动处理。
+  async function handleFriendRequestV2(event = {}) {
+    const conf = friendCfgNow();
+    const qq = String(event.user_id ?? event.qq ?? '').trim();
+    if (!qq) return;
+    const scope = await friendScopeOf(qq);
+    const nickname = await friendNicknameOf(qq, event);
+    const doc = readFriendState();
+    const counters = friendCountersNow(doc);
+    const deniedAt = Number(doc.denied?.[qq]) || 0;
+    const verdict = decideFriend({
+      cfg,
+      request: { user_id: qq, comment: event.comment },
+      sharedGroups: scope.groups,
+      counters: { dayCount: counters.dayCount, hourCount: counters.hourCount },
+      deniedRecently: deniedAt > Date.now()
+    });
+    const item = {
+      id: `${qq}-${Date.now()}`,
+      qq,
+      user_id: qq,
+      nickname,
+      comment: String(event.comment ?? '').trim().slice(0, 200),
+      flag: String(event.flag ?? ''),
+      at: Date.now(),
+      scope: { ok: scope.ok, via: scope.via, group: scope.group, reason: scope.reason },
+      verdict
+    };
+    // 同一个人的旧申请先删掉，免得列表里挂一串重复。
+    doc.pending = [item, ...doc.pending.filter((x) => String(x.qq) !== qq)].slice(0, FRIEND_MAX_PENDING);
+    saveFriendState(doc);
+
+    if (!conf.enabled) {
+      log(`[friend] 收到 ${qq} 的申请，但功能没开，只记录`);
+      return item;
+    }
+    if (!verdict.allow) {
+      log(`[friend] ${qq} 不在可加范围：${verdict.reason}`);
+      await notifyOwnerFriend(item);
+      return item;
+    }
+    if (conf.autoApprove) {
+      try {
+        await applyFriendDecision({ flag: item.flag, approve: true, reason: '自动通过（白名单范围内）', qq });
+      } catch (error) {
+        log(`[friend] 自动通过失败：${error?.message ?? error}`);
+      }
+      return item;
+    }
+    await notifyOwnerFriend(item);
+    // 叫醒私聊，让 AI 拍板；AI 不吭声时申请就留在列表里等下次。
+    try {
+      scheduleWakeV2(`private:${String(cfg.ownerQQ ?? qq)}`, 'friendRequest');
+    } catch (error) {
+      log(`[friend] 唤醒失败：${error?.message ?? error}`);
+    }
+    return item;
+  }
+
+
   //
   // 为什么不能只放在唤醒提示里：消息经常**在 AI 已经醒着的时候**到达（长轮询
   // qq_wait_for_messages、或翻 qq_get_unread_messages），这时不会重新构建唤醒提示，
@@ -4392,16 +4660,26 @@ async function main() {
   // 全量记忆卡备份服务：定时器挂在 startSocialLoop() 的 60 秒节拍上，不在这里自建。
   // 设置页保存走插件 /config 直接写 config.json，不经过桥接 POST；所以每次 tick 从磁盘读，
   // 保存后约 1 分钟生效，不用重启桥接。读失败时退回内存里的 cfg。
+  let memoryBackupConfigCache = { at: 0, value: null };
+  function liveMemoryBackupConfig() {
+    const now = Date.now();
+    if (memoryBackupConfigCache.value && now - memoryBackupConfigCache.at < 5000) {
+      return memoryBackupConfigCache.value;
+    }
+    let value;
+    try {
+      const file = readJsonSafe(path.join(ROOT, 'config.json'), null, true);
+      value = file?.socialV2?.memoryCardBackup ?? cfg.socialV2?.memoryCardBackup;
+    } catch {
+      value = cfg.socialV2?.memoryCardBackup;
+    }
+    memoryBackupConfigCache = { at: now, value };
+    return value;
+  }
+
   const memoryCardBackup = createMemoryCardBackupService({
     dshHome: DSH_HOME,
-    getConfig: () => {
-      try {
-        const file = readJsonSafe(path.join(ROOT, 'config.json'), null, true);
-        return file?.socialV2?.memoryCardBackup ?? cfg.socialV2?.memoryCardBackup;
-      } catch {
-        return cfg.socialV2?.memoryCardBackup;
-      }
-    },
+    getConfig: liveMemoryBackupConfig,
     getSource: () => {
       const paths = memoryCardPaths();
       const cur = readCurrentCharacter() || {};
@@ -4422,6 +4700,19 @@ async function main() {
       await onebotSendSegments('private', owner, segments);
     },
     log,
+  });
+
+  // 聊天全量存档：和记忆卡备份共用同一个备份根目录；私聊/群聊各写各的 jsonl。
+  const chatArchive = createChatArchiveWriter({
+    getConfig: liveMemoryBackupConfig,
+    getCharacterId: () => String((readCurrentCharacter() || {}).id || ''),
+    getBaseDir: () => {
+      const config = normalizeMemoryCardBackupConfig(liveMemoryBackupConfig());
+      const custom = String(config.dir || '').trim();
+      if (custom) return path.resolve(custom);
+      return defaultBackupDir(DSH_HOME, (readCurrentCharacter() || {}).id);
+    },
+    now: () => Date.now(),
   });
 
   // ── 自我表达（QQ 签名 / 空间动态）与日记 ─────────────────────────────
@@ -4623,8 +4914,10 @@ async function main() {
     const cfgDiary = normalizeDiaryConfig(live.diary ?? cfg.socialV2?.diary);
     const root = readDiaryState(diaryStateFile(DSH_HOME));
     const st = characterDiaryState(root, ch.id);
-    const file = diaryFileFor({ dshHome: DSH_HOME, dir: cfgDiary.dir, characterId: ch.id });
-    return { ch, cfgDiary, root, st, file, fileState: diaryStateFile(DSH_HOME) };
+    // 新版：保存目录只是「存放所有日记的文件夹」，里面按角色分子目录，文件名按时间。
+    const baseDir = diaryBaseDir(DSH_HOME, cfgDiary.dir);
+    const charDir = diaryCharDir({ dshHome: DSH_HOME, dir: cfgDiary.dir, characterId: ch.id });
+    return { ch, cfgDiary, root, st, fileState: diaryStateFile(DSH_HOME), baseDir, charDir };
   }
 
   async function sendDiaryEntry(entry, file, diaryCfg) {
@@ -4671,31 +4964,51 @@ async function main() {
       const output = await runLifePrompt(prompt);
       const text = cleanDiaryText(output, snap.cfgDiary.maxChars);
       if (text.length < 80) throw new Error(`日记正文过短（${text.length} 字）`);
+      // 旧版是一个角色一个 md：第一次写新日记时顺手拆成「一篇一档」。
+      try {
+        const migrated = migrateLegacyDiary({
+          dshHome: DSH_HOME,
+          dir: snap.cfgDiary.dir,
+          characterId: snap.ch.id,
+          perFile: snap.cfgDiary.perFile,
+        });
+        if (migrated.migrated) log(`日记：旧单文件已拆成 ${migrated.files.length} 个文件（备份 ${migrated.backup || '无'}）`);
+        else if (migrated.reason !== 'no-legacy') log(`日记：旧单文件未迁移（${migrated.reason}）`);
+      } catch (error) {
+        log(`日记：旧单文件迁移失败（${error?.message ?? error}），继续写新文件`);
+      }
       const entry = formatDiaryEntry(Date.now(), text);
-      const written = appendDiaryEntry(snap.file, entry);
+      const written = appendDiaryEntryGrouped({
+        dir: snap.charDir,
+        now: Date.now(),
+        entry,
+        perFile: snap.cfgDiary.perFile,
+      });
       snap.st.lastWriteAt = Date.now();
       snap.st.lastAttemptAt = Date.now();
       snap.st.lastEntry = entry;
       snap.st.lastChars = text.length;
+      snap.st.lastFile = written.file;
+      snap.st.lastFileEntries = written.entriesInFile;
       snap.st.lastError = '';
       if (snap.cfgDiary.send?.enabled) {
         if (snowlumaHealth.connected === true) {
           try {
-            await sendDiaryEntry(entry, snap.file, snap.cfgDiary);
+            await sendDiaryEntry(entry, written.file, snap.cfgDiary);
             snap.st.lastSendAt = Date.now();
             snap.st.pending = null;
             snap.st.lastSendError = '';
           } catch (error) {
-            snap.st.pending = { entry, file: snap.file, at: Date.now(), lastAttemptAt: Date.now(), error: error?.message ?? String(error) };
+            snap.st.pending = { entry, file: written.file, at: Date.now(), lastAttemptAt: Date.now(), error: error?.message ?? String(error) };
             snap.st.lastSendError = error?.message ?? String(error);
           }
         } else {
-          snap.st.pending = { entry, file: snap.file, at: Date.now(), error: 'QQ 未连接' };
+          snap.st.pending = { entry, file: written.file, at: Date.now(), error: 'QQ 未连接' };
         }
       }
       writeDiaryState(snap.fileState, snap.root);
-      log(`日记：已写 ${written.bytes} 字节 → ${snap.file}`);
-      return { ok: true, bytes: written.bytes, file: snap.file, status: lifeStatus() };
+      log(`日记：已写 ${written.bytes} 字节 → ${written.file}`);
+      return { ok: true, bytes: written.bytes, file: written.file, status: lifeStatus() };
     } catch (error) {
       const message = error?.message ?? String(error);
       try {
@@ -4728,7 +5041,7 @@ async function main() {
         writeDiaryState(snap.fileState, snap.root);
         return { ok: false, error: 'QQ 未连接，等上线后自动补发' };
       }
-      const file = pending?.file || snap.file;
+      const file = pending?.file || snap.st.lastFile || (listDiaryFiles(snap.charDir)[0]?.file ?? '');
       const sent = await sendDiaryEntry(entry, file, snap.cfgDiary);
       snap.st.lastSendAt = Date.now();
       snap.st.lastSendError = '';
@@ -4751,6 +5064,204 @@ async function main() {
     }
   }
 
+  /** 公开日记的快照：目录、配置、状态都在这里算一次，别在别处重复推导。 */
+  function diaryPublicSnapshot() {
+    const ch = lifeCharacter();
+    const live = liveSocialConfig();
+    const diaryCfg = normalizeDiaryConfig(live.diary ?? cfg.socialV2?.diary);
+    const root = readDiaryState(diaryStateFile(DSH_HOME));
+    const st = characterDiaryState(root, ch.id);
+    const baseDir = diaryPublicBaseDir(DSH_HOME, diaryCfg.public.dir);
+    const charDir = diaryPublicCharDir({ dshHome: DSH_HOME, dir: diaryCfg.public.dir, characterId: ch.id });
+    return { ch, diaryCfg, pub: diaryCfg.public, root, st, fileState: diaryStateFile(DSH_HOME), baseDir, charDir };
+  }
+
+  /**
+   * 写一篇公开日记并发到 QQ 空间。
+   *
+   * 顺序很讲究：先落盘、再发布。因为发空间可能失败（QQ 掉线/被限制），
+   * 但「今天写过什么」这条记录不能丢——落盘之后即使没发出去，也能在界面上看到、
+   * 等连接恢复再补发（st.publicPending）。
+   *
+   * 另外 blocked（正文里出现钱/账号/证件）时不发布，只落盘并留一句原因：
+   * 这种稿子让主人自己看一眼，比自动删掉或自动发出去都安全。
+   */
+  async function runDiaryPublic({ force = false } = {}) {
+    if (lifeBusy.has('diary:public')) return { ok: false, error: '正在生成公开日记' };
+    lifeBusy.add('diary:public');
+    const snap = diaryPublicSnapshot();
+    try {
+      if (!snap.pub.enabled && !force) return { ok: true, skipped: true, reason: 'disabled' };
+      const lastAttempt = Number(snap.st.publicAttemptAt) || 0;
+      if (!force && lastAttempt && Date.now() - lastAttempt < LIFE_RETRY_MS) {
+        return { ok: true, skipped: true, reason: 'retry-wait' };
+      }
+      const due = isDiaryDue({
+        lastWriteAt: snap.st.publicWriteAt,
+        everyDays: snap.pub.everyDays,
+        hour: snap.pub.hour,
+        now: Date.now(),
+      });
+      if (!due.due && !force) return { ok: true, skipped: true, reason: due.reason };
+      const prompt = buildDiaryPrompt({
+        characterName: snap.ch.name,
+        persona: snap.ch.persona,
+        context: lifeContext(),
+        maxChars: snap.pub.maxChars,
+        now: Date.now(),
+        audience: 'public',
+        allowNames: snap.pub.allowNames,
+      });
+      const output = await runLifePrompt(prompt);
+      const cleaned = cleanDiaryText(output, snap.pub.maxChars);
+      const scrub = scrubPublicText(cleaned);
+      const text = scrub.text;
+      if (text.length < 60) {
+        throw new Error(scrub.blocked
+          ? `公开日记清洗后只剩 ${text.length} 字（原稿里有不能公开的内容，已拦下）`
+          : `公开日记正文过短（${text.length} 字）`);
+      }
+      const entry = formatDiaryEntry(Date.now(), text);
+      const written = appendDiaryEntryGrouped({
+        dir: snap.charDir,
+        now: Date.now(),
+        entry,
+        perFile: snap.pub.perFile,
+      });
+      const now = Date.now();
+      snap.st.publicWriteAt = now;
+      snap.st.publicAttemptAt = now;
+      snap.st.publicLastFile = written.file;
+      snap.st.publicLastText = text;
+      snap.st.publicLastChars = text.length;
+      snap.st.publicLastRemoved = scrub.removed.map((r) => r.kind);
+      snap.st.publicLastError = '';
+
+      if (scrub.blocked) {
+        snap.st.publicBlockedReason = `正文里有不能公开的内容（${Array.from(new Set(scrub.removed.map((r) => r.kind))).join('、')}），已只存档不发空间`;
+        writeDiaryState(snap.fileState, snap.root);
+        log(`公开日记：已写 ${written.bytes} 字节，但有敏感内容，未发空间 → ${written.file}`);
+        return { ok: true, blocked: true, bytes: written.bytes, file: written.file, removed: scrub.removed, status: lifeStatus() };
+      }
+      snap.st.publicBlockedReason = '';
+
+      // 每天额度：按本地日期记账，跨天归零。
+      const day = localDayKey(now);
+      if (snap.st.publicDay !== day) {
+        snap.st.publicDay = day;
+        snap.st.publicDayCount = 0;
+      }
+      const quota = publicPublishQuota({
+        maxPerDay: snap.pub.maxPerDay,
+        published: Number(snap.st.publicDayCount) || 0,
+        now,
+      });
+      if (!quota.ok) {
+        snap.st.publicPending = { text, file: written.file, at: now, error: quota.reason };
+        writeDiaryState(snap.fileState, snap.root);
+        log(`公开日记：${quota.reason}，先存着不发 → ${written.file}`);
+        return { ok: true, queued: true, bytes: written.bytes, file: written.file, removed: scrub.removed, reason: quota.reason, status: lifeStatus() };
+      }
+
+      if (snowlumaHealth.connected !== true) {
+        snap.st.publicPending = { text, file: written.file, at: now, error: 'QQ 未连接' };
+        writeDiaryState(snap.fileState, snap.root);
+        log(`公开日记：已写 ${written.bytes} 字节，QQ 未连接，等上线再发 → ${written.file}`);
+        return { ok: true, queued: true, bytes: written.bytes, file: written.file, removed: scrub.removed, status: lifeStatus() };
+      }
+
+      try {
+        const sent = await onebotAction('send_qzone_msg', { content: text, ugc_right: snap.pub.visibility });
+        snap.st.publicPublishAt = Date.now();
+        snap.st.publicLastTid = String(sent?.tid ?? '');
+        snap.st.publicDayCount = (Number(snap.st.publicDayCount) || 0) + 1;
+        snap.st.publicPending = null;
+        snap.st.publicLastError = '';
+        writeDiaryState(snap.fileState, snap.root);
+        log(`公开日记：已发空间（${text.length} 字，tid=${snap.st.publicLastTid || '-'}）`);
+        return { ok: true, bytes: written.bytes, file: written.file, tid: snap.st.publicLastTid, removed: scrub.removed, status: lifeStatus() };
+      } catch (error) {
+        const message = error?.message ?? String(error);
+        snap.st.publicPending = { text, file: written.file, at: Date.now(), lastAttemptAt: Date.now(), error: message };
+        snap.st.publicLastError = message;
+        writeDiaryState(snap.fileState, snap.root);
+        log(`公开日记：发空间失败（${message}），等补发 → ${written.file}`);
+        return { ok: false, error: message, file: written.file, status: lifeStatus() };
+      }
+    } catch (error) {
+      const message = error?.message ?? String(error);
+      try {
+        snap.st.publicAttemptAt = Date.now();
+        snap.st.publicLastError = message;
+        writeDiaryState(snap.fileState, snap.root);
+      } catch {}
+      log(`公开日记生成失败：${message}`);
+      return { ok: false, error: message, status: (() => { try { return lifeStatus(); } catch { return null; } })() };
+    } finally {
+      lifeBusy.delete('diary:public');
+    }
+  }
+
+  /** 补发公开日记：QQ 掉线/额度满之后，条件恢复了把存着的那篇发出去。 */
+  async function sendPendingDiaryPublicNow({ force = false } = {}) {
+    if (lifeBusy.has('diary:public:send')) return { ok: false, error: '正在发送中' };
+    lifeBusy.add('diary:public:send');
+    const snap = diaryPublicSnapshot();
+    try {
+      const pending = snap.st.publicPending;
+      if (!pending && !force) return { ok: true, skipped: true, reason: 'no-pending' };
+      const text = String(pending?.text ?? snap.st.publicLastText ?? '').trim();
+      if (!text) return { ok: false, error: '还没有可发送的公开日记' };
+      const lastAttempt = Number(pending?.lastAttemptAt) || 0;
+      if (!force && lastAttempt && Date.now() - lastAttempt < LIFE_SEND_RETRY_MS) {
+        return { ok: true, skipped: true, reason: 'retry-wait' };
+      }
+      if (snowlumaHealth.connected !== true) {
+        snap.st.publicLastError = 'QQ 未连接，等上线后自动补发';
+        writeDiaryState(snap.fileState, snap.root);
+        return { ok: false, error: 'QQ 未连接，等上线后自动补发' };
+      }
+      const now = Date.now();
+      const day = localDayKey(now);
+      if (snap.st.publicDay !== day) {
+        snap.st.publicDay = day;
+        snap.st.publicDayCount = 0;
+      }
+      const quota = publicPublishQuota({
+        maxPerDay: snap.pub.maxPerDay,
+        published: Number(snap.st.publicDayCount) || 0,
+        now,
+      });
+      if (!quota.ok) {
+        snap.st.publicLastError = quota.reason;
+        writeDiaryState(snap.fileState, snap.root);
+        return { ok: false, error: quota.reason };
+      }
+      const sent = await onebotAction('send_qzone_msg', { content: text, ugc_right: snap.pub.visibility });
+      snap.st.publicPublishAt = Date.now();
+      snap.st.publicLastTid = String(sent?.tid ?? '');
+      snap.st.publicDayCount = (Number(snap.st.publicDayCount) || 0) + 1;
+      snap.st.publicPending = null;
+      snap.st.publicLastError = '';
+      writeDiaryState(snap.fileState, snap.root);
+      log(`公开日记：补发成功（tid=${snap.st.publicLastTid || '-'}）`);
+      return { ok: true, tid: snap.st.publicLastTid, file: pending?.file ?? snap.st.publicLastFile ?? '' };
+    } catch (error) {
+      const message = error?.message ?? String(error);
+      try {
+        if (snap.st.publicPending) {
+          snap.st.publicPending.lastAttemptAt = Date.now();
+          snap.st.publicPending.error = message;
+        }
+        snap.st.publicLastError = message;
+        writeDiaryState(snap.fileState, snap.root);
+      } catch {}
+      return { ok: false, error: message };
+    } finally {
+      lifeBusy.delete('diary:public:send');
+    }
+  }
+
   function lifeStatus() {
     const live = liveSocialConfig();
     const expr = normalizeSelfExpressionConfig(live.selfExpression ?? cfg.socialV2?.selfExpression);
@@ -4760,7 +5271,10 @@ async function main() {
     const exprSt = characterExpressionState(exprRoot, ch.id);
     const diaryRoot = readDiaryState(diaryStateFile(DSH_HOME));
     const diarySt = characterDiaryState(diaryRoot, ch.id);
-    const file = diaryFileFor({ dshHome: DSH_HOME, dir: diary.dir, characterId: ch.id });
+    const charDir = diaryCharDir({ dshHome: DSH_HOME, dir: diary.dir, characterId: ch.id });
+    const files = listDiaryFiles(charDir);
+    const recent = listDiaryEntries({ dir: charDir, limit: 5 });
+    const file = String(diarySt.lastFile || '') || files[0]?.file || diaryFileFor({ dshHome: DSH_HOME, dir: diary.dir, characterId: ch.id });
     return {
       ok: true,
       character: { id: ch.id, name: ch.name },
@@ -4785,15 +5299,41 @@ async function main() {
       diary: {
         ...diary,
         file,
-        dir: path.dirname(file),
+        dir: charDir,
         lastWriteAt: Number(diarySt.lastWriteAt) || 0,
         lastSendAt: Number(diarySt.lastSendAt) || 0,
         lastError: String(diarySt.lastError || ''),
         lastSendError: String(diarySt.lastSendError || ''),
         pending: diarySt.pending ?? null,
         lastChars: Number(diarySt.lastChars) || 0,
+        lastFileEntries: Number(diarySt.lastFileEntries) || 0,
+        fileCount: files.length,
       },
-      preview: readDiaryTail(file, 1200),
+      recent,
+      preview: recent[0]?.text ? String(recent[0].text).slice(0, 1200) : '',
+      publicDiary: (() => {
+        const pubDir = diaryPublicCharDir({ dshHome: DSH_HOME, dir: diary.public.dir, characterId: ch.id });
+        const pubFiles = listDiaryFiles(pubDir);
+        const pubRecent = listDiaryEntries({ dir: pubDir, limit: 5 });
+        const pubFile = String(diarySt.publicLastFile || '') || pubFiles[0]?.file || '';
+        return {
+          ...diary.public,
+          file: pubFile,
+          dir: pubDir,
+          fileCount: pubFiles.length,
+          lastWriteAt: Number(diarySt.publicWriteAt) || 0,
+          lastPublishAt: Number(diarySt.publicPublishAt) || 0,
+          lastTid: String(diarySt.publicLastTid || ''),
+          lastChars: Number(diarySt.publicLastChars) || 0,
+          lastError: String(diarySt.publicLastError || ''),
+          blockedReason: String(diarySt.publicBlockedReason || ''),
+          pending: diarySt.publicPending ?? null,
+          publishedToday: String(diarySt.publicDay || '') === localDayKey(Date.now()) ? Number(diarySt.publicDayCount) || 0 : 0,
+          removedKinds: Array.isArray(diarySt.publicLastRemoved) ? diarySt.publicLastRemoved : [],
+          recent: pubRecent,
+          preview: pubRecent[0]?.text ? String(pubRecent[0].text).slice(0, 600) : '',
+        };
+      })(),
     };
   }
 
@@ -4825,6 +5365,19 @@ async function main() {
         } catch (error) {
           log(`日记补发异常：${error?.message ?? error}`);
         }
+      }
+      if (diary.public?.enabled) {
+        try {
+          await runDiaryPublic();
+        } catch (error) {
+          log(`公开日记 tick 异常：${error?.message ?? error}`);
+        }
+      }
+      // 公开日记的补发不看开关：开关关掉只是不再新写，已经排队的稿子还是要试着发出去。
+      try {
+        await sendPendingDiaryPublicNow();
+      } catch (error) {
+        log(`公开日记补发异常：${error?.message ?? error}`);
       }
     } finally {
       lifeTickRunning = false;
@@ -5225,7 +5778,7 @@ async function main() {
         // 管理端专用 v2 接口：带 agent token 的请求一律拒绝，防止 MCP 工具越权访问控制台功能
         // /api/socialV2/initial-prompt 也在这里：它是操作者写给 AI 的"环境背景"，
         // 让 AI 自己读/改等于把控制台的管理输入（以及未来可能写入的其它群信息）交给会话主体。
-        const adminOnlyV2Paths = ['/api/socialV2/config', '/api/socialV2/activity', '/api/socialV2/reset', '/api/socialV2/states', '/api/socialV2/wake', '/api/socialV2/initial-prompt', '/api/socialV2/history-catchup'];
+        const adminOnlyV2Paths = ['/api/socialV2/config', '/api/socialV2/activity', '/api/socialV2/reset', '/api/socialV2/states', '/api/socialV2/wake', '/api/socialV2/initial-prompt', '/api/socialV2/history-catchup', '/api/socialV2/session'];
         if (req.headers['x-agent-token'] && (adminOnlyV2Paths.includes(url.pathname) || (url.pathname === '/api/socialV2/feedback' && req.method === 'GET') || (url.pathname === '/api/socialV2/tool-log' && req.method === 'GET'))) {
           sendJson({ ok: false, error: '该接口仅控制台可用' }, 403);
           return;
@@ -6476,10 +7029,13 @@ async function main() {
             const curBackup = current.memoryCardBackup && typeof current.memoryCardBackup === 'object' ? current.memoryCardBackup : {};
             const curSend = curBackup.send && typeof curBackup.send === 'object' ? curBackup.send : {};
             const nextSend = body.memoryCardBackup.send && typeof body.memoryCardBackup.send === 'object' ? body.memoryCardBackup.send : {};
+            const curArchive = curBackup.archive && typeof curBackup.archive === 'object' ? curBackup.archive : {};
+            const nextArchive = body.memoryCardBackup.archive && typeof body.memoryCardBackup.archive === 'object' ? body.memoryCardBackup.archive : {};
             merged.memoryCardBackup = normalizeMemoryCardBackupConfig({
               ...curBackup,
               ...body.memoryCardBackup,
               send: { ...curSend, ...nextSend },
+              archive: { ...curArchive, ...nextArchive },
             });
           } else if (merged.memoryCardBackup !== undefined) {
             merged.memoryCardBackup = normalizeMemoryCardBackupConfig(merged.memoryCardBackup);
@@ -6500,22 +7056,25 @@ async function main() {
           } else if (merged.selfExpression !== undefined) {
             merged.selfExpression = normalizeSelfExpressionConfig(merged.selfExpression);
           }
-          // diary：send 子对象保留未提交字段。
+          // diary：send / public 两个子对象都保留未提交字段（界面可能只改其中一项）。
           if (body.diary && typeof body.diary === 'object' && !Array.isArray(body.diary)) {
             const curDiary = current.diary && typeof current.diary === 'object' ? current.diary : {};
             const curSend = curDiary.send && typeof curDiary.send === 'object' ? curDiary.send : {};
             const nextSend = body.diary.send && typeof body.diary.send === 'object' ? body.diary.send : {};
+            const curPub = curDiary.public && typeof curDiary.public === 'object' ? curDiary.public : {};
+            const nextPub = body.diary.public && typeof body.diary.public === 'object' ? body.diary.public : {};
             merged.diary = normalizeDiaryConfig({
               ...curDiary,
               ...body.diary,
               send: { ...curSend, ...nextSend },
+              public: { ...curPub, ...nextPub },
             });
           } else if (merged.diary !== undefined) {
             merged.diary = normalizeDiaryConfig(merged.diary);
           }
           if (merged.autoReplyCheckMs !== undefined) {
             const n = Number(merged.autoReplyCheckMs);
-            merged.autoReplyCheckMs = Number.isFinite(n) ? Math.max(1000, Math.round(n)) : (current.autoReplyCheckMs ?? 30000);
+            merged.autoReplyCheckMs = Number.isFinite(n) ? Math.max(1000, Math.round(n)) : (current.autoReplyCheckMs ?? 10000);
           }
           // tools：只接受布尔开关
           const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'setReasoningEffort', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendMedia', 'sendVoice'];
@@ -6658,6 +7217,10 @@ async function main() {
           file.socialV2 = merged;
           atomicWriteJson(configFile, file);
           cfg.socialV2 = { ...(cfg.socialV2 ?? {}), ...merged };
+          // 换会话开关被关掉时，把还在换出来的会话搬回原会话（不用等重启）。
+          if (body.reply && typeof body.reply === 'object') {
+            void reconcileReplyModeV2('config-save').catch((error) => log('[reserved2] 保存配置后回退会话失败：', error?.message ?? error));
+          }
           // 仅当“会影响默认唤醒配置”的字段变化时，才同步到仍使用默认配置的现有会话。
           // 避免只改发送/等待/工具开关时，意外重置正在等待的潜水/唤醒计划。
           const WAKE_DEFAULT_KEYS = [
@@ -7027,6 +7590,84 @@ async function main() {
           } catch (error) {
             sendJson({ ok: false, ...info, applied: false, error: `已记住，但热应用失败：${error?.message ?? error}（下一条消息会重试）` });
           }
+          return;
+        }
+
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/latency') {
+          const params = replyParamsV2();
+          const byMode = {};
+          for (const item of turnLatencyV2) {
+            const bucket = byMode[item.mode] || (byMode[item.mode] = { turns: 0, totalMs: 0 });
+            bucket.turns += 1;
+            bucket.totalMs += item.durMs;
+          }
+          for (const bucket of Object.values(byMode)) {
+            bucket.avgMs = bucket.turns ? Math.round(bucket.totalMs / bucket.turns) : 0;
+          }
+          const conversations = {};
+          for (const [key, st] of socialV2.conversations) {
+            conversations[key] = {
+              turnsSinceRotate: Number(st.turnsSinceRotate) || 0,
+              turnsTotal: Number(st.turnsTotal) || 0,
+              turnsSeeded: st.turnsSeeded === true,
+          originalSessionId: st.originalSessionId || '',
+              sessionId: state.sessions[key] || '',
+              originalSessionId: st.originalSessionId || '',
+              rotated: !!st.originalSessionId && (state.sessions[key] || '') !== st.originalSessionId,
+              unbound: !state.sessions[key],
+              tasksToInherit: Array.isArray(st.tasksToInherit) ? st.tasksToInherit.length : 0,
+              pending: Array.isArray(st.pendingWakeReasons) ? st.pendingWakeReasons.length : 0,
+              takeoverPending: st.takeoverPending === true
+            };
+          }
+          sendJson({ ok: true, mode: params.mode, params, conversations, byMode, sample: turnLatencyV2.slice(-50) });
+          return;
+        }
+
+
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/rotate') {
+          const body = await readBody();
+          const key = canonicalV2Key(String(body.key ?? '').trim());
+          if (!key) { sendJson({ ok: false, error: 'key 必须形如 private:123 或 group:456' }, 400); return; }
+          const had = state.sessions[key] || '';
+          const rotated = await rotateSessionV2(key, 'manual');
+          const st = getSocialV2State(key);
+          sendJson({
+            ok: true,
+            rotated,
+            oldSessionId: had,
+            sessionId: state.sessions[key] || '',
+            turnsSinceRotate: Number(st.turnsSinceRotate) || 0,
+            turnsTotal: Number(st.turnsTotal) || 0
+          });
+          return;
+        }
+
+        // 换会话 / 回原会话：{ action: 'rotate' | 'restore', key? }（restore 不带 key = 全部）
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/session') {
+          const body = await readBody();
+          const action = String(body.action ?? 'rotate').trim();
+          const rawKey = String(body.key ?? '').trim();
+          if (action === 'restore') {
+            const keys = rawKey ? [canonicalV2Key(rawKey)] : Object.keys(state.sessions || {});
+            if (rawKey && !keys[0]) { sendJson({ ok: false, error: 'key 必须形如 private:123 或 group:456' }, 400); return; }
+            const results = [];
+            for (const key of keys) {
+              try {
+                results.push(await restoreSessionV2(key, 'manual'));
+              } catch (error) {
+                results.push({ key, from: state.sessions[key] || '', to: state.sessions[key] || '', changed: false, error: error?.message ?? String(error) });
+              }
+            }
+            sendJson({ ok: true, action, results });
+            return;
+          }
+          if (action !== 'rotate') { sendJson({ ok: false, error: 'action 只能是 rotate 或 restore' }, 400); return; }
+          const key = canonicalV2Key(rawKey);
+          if (!key) { sendJson({ ok: false, error: 'key 必须形如 private:123 或 group:456' }, 400); return; }
+          const from = state.sessions[key] || '';
+          const ok = await rotateSessionV2(key, 'manual');
+          sendJson({ ok: true, action, rotated: ok, results: [{ key, from, to: state.sessions[key] || '', changed: ok }] });
           return;
         }
 
@@ -8699,6 +9340,64 @@ async function main() {
           return;
         }
 
+        // ── 好友申请（2026-11-01）──────────────────────────────────────
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/friend-requests') {
+          const doc = readFriendState();
+          const counters = friendCountersNow(doc);
+          sendJson({
+            ok: true,
+            config: friendCfgNow(),
+            pending: doc.pending,
+            counters: { dayCount: counters.dayCount, hourCount: counters.hourCount },
+            denied: Object.keys(doc.denied || {}).length
+          });
+          return;
+        }
+
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/friend-config') {
+          const body = await readBody();
+          const cfgFile = path.join(ROOT, 'config.json');
+          try {
+            const next = normalizeFriendConfig(body.config ?? body.friend ?? body);
+            const file = readConfigObject(cfgFile);
+            file.socialV2 = file.socialV2 || {};
+            file.socialV2.friend = next;
+            atomicWriteJson(cfgFile, file);
+            cfg.socialV2 = { ...(cfg.socialV2 || {}), friend: next };
+            sendJson({ ok: true, config: next });
+          } catch (error) {
+            sendJson({ ok: false, error: String(error?.message ?? error) }, 500);
+          }
+          return;
+        }
+
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/friend-decide') {
+          const body = await readBody();
+          const agentToken = String(req.headers['x-agent-token'] ?? body.token ?? '').trim();
+          const approve = body.approve === true || body.approve === 'true' || body.approve === 1;
+          const flag = String(body.flag ?? '').trim();
+          const qq = String(body.qq ?? body.user_id ?? '').trim();
+          // agent 通道（AI 拍板）必须校验 token；控制台通道在更外层已经校验过 console token。
+          if (agentToken && !agentTokenOk(`private:${String(cfg.ownerQQ ?? '')}`, agentToken)) {
+            sendJson({ ok: false, error: 'agent token 无效' }, 403);
+            return;
+          }
+          if (!flag && !qq) { sendJson({ ok: false, error: '需要 flag 或 qq' }, 400); return; }
+          try {
+            const result = await applyFriendDecision({
+              flag,
+              approve,
+              qq,
+              reason: String(body.reason ?? '').slice(0, 200),
+              remark: String(body.remark ?? '').slice(0, 24)
+            });
+            sendJson({ ok: true, ...result });
+          } catch (error) {
+            sendJson({ ok: false, error: String(error?.message ?? error) }, 500);
+          }
+          return;
+        }
+
         if (req.method === 'POST' && url.pathname === '/api/socialV2/pic-pause') {
           const body = await readBody();
           const key = String(body.key ?? '').trim() || `private:${String(cfg.ownerQQ ?? '')}`;
@@ -10044,6 +10743,17 @@ async function main() {
             sendJson({ ...result, status: lifeStatus() }, result.ok ? 200 : 400);
             return;
           }
+          // 公开日记：写一篇（write-public）/ 把存着的发出去（send-public）
+          if (action === 'write-public') {
+            const result = await runDiaryPublic({ force: body.force === true });
+            sendJson({ ...result, status: lifeStatus() }, result.ok ? 200 : 400);
+            return;
+          }
+          if (action === 'send-public') {
+            const result = await sendPendingDiaryPublicNow({ force: body.force === true });
+            sendJson({ ...result, status: lifeStatus() }, result.ok ? 200 : 400);
+            return;
+          }
           sendJson({ ok: false, error: `未知 action：${action}` }, 400);
           return;
         }
@@ -11351,7 +12061,17 @@ async function main() {
         err.sent = sent.slice();
         throw err;
       }
-      if (sent.length) recordSelfMemoryEvent(key, sent.join('\n'));
+      if (sent.length) {
+        recordSelfMemoryEvent(key, sent.join('\n'));
+        const outKind = String(key).startsWith('group:') ? 'group' : 'private';
+        for (const text of sent) {
+          try {
+            chatArchive.appendOutgoing({ key, kind: outKind, text, at: Date.now() });
+          } catch (error) {
+            log('[聊天存档] 记录发出消息失败:', error?.message ?? error);
+          }
+        }
+      }
       // 文字已经出去了，再按情境决定要不要补一张图。不 await：发图慢不能拖住回复。
       // 这一轮已经合并发过图就不再补 —— 一次唤醒最多一张，otherwise 会连甩两张。
       if (sent.length && !combinedRecord) void maybeAutoPicV2(key, { selfText: sent.join('\n') });
@@ -11397,7 +12117,14 @@ async function main() {
       return false;
     }
     await sendToQQ(key, text);
-    if (lastSendSucceeded(key)) recordSelfMemoryEvent(key, text);
+    if (lastSendSucceeded(key)) {
+      recordSelfMemoryEvent(key, text);
+      try {
+        chatArchive.appendOutgoing({ key, kind: String(key).startsWith('group:') ? 'group' : 'private', text, at: Date.now() });
+      } catch (error) {
+        log('[聊天存档] 记录发出消息失败:', error?.message || error);
+      }
+    }
     return true;
   }
 
@@ -11891,6 +12618,10 @@ async function main() {
             lastActionAt: Number(val.lastActionAt) || 0,
             agentToken,
             bootstrapSent: !!val.bootstrapSent,
+            turnsSinceRotate: Number(val.turnsSinceRotate) || 0,
+            turnsTotal: Number(val.turnsTotal) || 0,
+            turnsSeeded: val.turnsSeeded === true,
+            originalSessionId: typeof val.originalSessionId === 'string' ? val.originalSessionId : '',
             wakeTimes: Array.isArray(val.wakeTimes) ? val.wakeTimes : [],
             sendTimes: Array.isArray(val.sendTimes) ? val.sendTimes : [],
             stickerCollectTimes: Array.isArray(val.stickerCollectTimes) ? val.stickerCollectTimes : [],
@@ -12016,6 +12747,9 @@ async function main() {
           lastActionAt: st.lastActionAt,
           agentToken: st.agentToken,
           bootstrapSent: st.bootstrapSent,
+          turnsSinceRotate: Number(st.turnsSinceRotate) || 0,
+          turnsTotal: Number(st.turnsTotal) || 0,
+          turnsSeeded: st.turnsSeeded === true,
           wakeTimes: st.wakeTimes.slice(-200),
           sendTimes: st.sendTimes.slice(-500),
           stickerCollectTimes: Array.isArray(st.stickerCollectTimes) ? st.stickerCollectTimes.slice(-500) : [],
@@ -12809,6 +13543,25 @@ async function main() {
   loadSocialV2State();
   // 操作者预写的会话初始提示词（与控制台入口同样在 main() 里；损坏时只读降级，不阻塞启动）。
   loadInitialPrompts();
+  // 启动后把「每几轮换一次」的计数对齐到**会话真实轮次**（老会话已经聊了几百轮时，
+  // 从 0 数起会白等几百轮）。后台跑，扫不到日志就保持原计数，不阻塞启动。
+  setTimeout(() => {
+    try {
+      // 换会话关掉时先把还在换出来的会话搬回原会话，再对齐轮次。
+      void reconcileReplyModeV2('startup')
+        .catch((error) => log('[reserved2] 启动时回退会话失败:', error?.message ?? error))
+        .finally(() => {
+          for (const [key, st] of socialV2.conversations) {
+            if (st.turnsSeeded === true) continue;
+            if (!state.sessions[key]) continue;
+            seedTurnsV2(key);
+          }
+        });
+    } catch (error) {
+      log('[reserved2] 对齐会话轮次失败:', error?.message ?? error);
+    }
+  }, 3000);
+  startReplyConfigWatch();
 
   function isSocialEnabled() {
     return currentMode === 'reserved' && cfg.social?.enabled !== false;
@@ -15295,6 +16048,10 @@ async function main() {
       : null;
     const picText = buildPicPromptLine(picCfgNow(), { pending: pendingPic });
     const picLine = picText ? `${picText}\n\n` : '';
+    // 好友申请：有待处理时把「谁在申请 + 规则 + 怎么拍板」写进提示，没有就不占位。
+    const friendPending = readFriendState().pending;
+    const friendText = buildFriendPromptLine(cfg, friendPending);
+    const friendLine = friendText ? `${friendText}\n\n` : '';
     // 收藏（偷图）开关：开着才把「看到喜欢的就收一张」写进提示，额度由桥接路由兜底。
     const collectText = buildCollectPromptLine(cfg.socialV2?.sticker?.collect ?? {});
     const collectLine = collectText ? `${collectText}\n\n` : '';
@@ -15414,7 +16171,7 @@ async function main() {
     const memoryLine = sessionKeep ? `${sessionKeep}\n\n` : '';
     const crossMemLine = sharedKeep ? `${sharedKeep}\n\n` : '';
     const worldTreeLine = treeKeep ? `${treeKeep}\n\n` : '';
-    const base = roleLine + voiceLine + identityLine + provenanceLine + adminLine + biliLine + memoryCardLine + crossMemLine + voiceAnchorLine + worldTreeLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + closureLine + stickerLine + collectLine + stickerMatchLine + picLine + singLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + fishGuardLine + tokenGuardLine + preSleepLine;
+    const base = roleLine + voiceLine + identityLine + provenanceLine + adminLine + biliLine + memoryCardLine + crossMemLine + voiceAnchorLine + worldTreeLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + closureLine + stickerLine + collectLine + stickerMatchLine + picLine + friendLine + singLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + fishGuardLine + tokenGuardLine + preSleepLine;
     if (reason === 'bootstrap') {
       return `${base}【引导唤醒】你已接入 QQ 会话 ${key}。\n当前是二代仿真模式：你的文本输出不会自动发送到 QQ，所有发言必须通过工具完成。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先按首回复节奏处理，最后才用 qq_set_wake_config 设置你希望如何被唤醒。`;
     }
@@ -15440,8 +16197,11 @@ async function main() {
   // 所以声线 gate 放在整段 prompt 的最末尾，三行短语才真的起作用。
   function buildWakePromptV2(key, reason) {
     const text = buildWakePromptV2Core(key, reason);
+    const st = getSocialV2State(key);
+    const migrate = taskInheritPromptBlockV2(st);
     const vp = voiceLinesFor(key, { quiet: true });
-    return vp.tail ? `${text}\n${vp.tail}` : text;
+    const body = migrate ? `${text}\n${migrate}` : text;
+    return vp.tail ? `${body}\n${vp.tail}` : body;
   }
 
   // 主动冒泡 / 收尾这类「自己开口」的路径也要带声线，否则最容易露 AI 味。
@@ -15506,7 +16266,9 @@ async function main() {
         // 有界队列：最多保留 20 条，防止消息洪峰下无限增长。
         if (st.pendingWakeReasons.length > 20) st.pendingWakeReasons.splice(0, st.pendingWakeReasons.length - 20);
       }
-      log(`[reserved2] 会话繁忙，暂存唤醒原因 ${key}（${reason}@seq${seq}，原因=${busyReasonV2(key, st)}）`);
+      const busyParams = replyParamsV2();
+      if (busyParams.takeover && !isTimerWakeReason(reason)) st.takeoverPending = true;
+      log(`[reserved2] 会话繁忙，暂存唤醒原因 ${key}（${reason}@seq${seq}，原因=${busyReasonV2(key, st)}${busyParams.takeover ? '，接管=on' : ''}）`);
       return;
     }
     // 唤醒频率硬限制：超限则**延后重试**，不能直接丢弃。直接 return 的后果：
@@ -15573,6 +16335,7 @@ async function main() {
     st.wakeConfig.wakeCount = (st.wakeConfig.wakeCount || 0) + 1;
     st.lastWakeReason = reason;
     saveSocialV2State();
+    await ensureInheritTasksV2(key);
     const promptText = buildWakePromptV2(key, reason);
     log(`[reserved2] 唤醒 ${key}（${reason}）`);
     const rollbackWakeTime = () => {
@@ -15635,7 +16398,7 @@ async function main() {
     }
     // 已有真实唤醒/有限睡眠/回复检查在排队时不再重复安排，避免 AI 被连环唤醒。
     if (st.pendingWakeTimer || st.sleepTimer || st.replyCheckTimer) return;
-    let delay = Math.max(1000, Number(cfg.socialV2?.autoReplyCheckMs) || 30000);
+    let delay = Math.max(1000, Number(cfg.socialV2?.autoReplyCheckMs) || 10000);
     const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
     const recentSelf = recent.filter((m) => m && m.isSelf && Date.now() - Number(m.time || 0) < 15000);
     const askedQuestion = recentSelf.some((m) => /[?？吗呢怎么有没有能不能]/.test(String(m.text || m.plain || '')));
@@ -15694,6 +16457,8 @@ async function main() {
     speaker: 75,
     nameMention: 70,
     keyword: 60,
+    // 好友申请：比普通聊天低（有人在等答复，但不是对话本身），比定时器高。
+    friendRequest: 55,
     anyMessage: 50,
     replyCheck: 40,
     timeout: 30,
@@ -15714,9 +16479,558 @@ async function main() {
   // 与「未读消息」无关的唤醒原因（定时器/引导/上线补历史）。这些原因在会话繁忙时被暂存后，
   // 不能用「unread 里还有没有对应 seq」来判断是否还要补发 —— 那一轮很可能已经把
   // 未读全部标读了，结果就是 timeout 定时器被静默丢掉、会话停在无定时器的静默态。
-  const TIMER_WAKE_REASONS = new Set(['timeout', 'replyCheck', 'proactiveCheck', 'bootstrap', 'admin', 'history', 'pic']);
+  const TIMER_WAKE_REASONS = new Set(['timeout', 'replyCheck', 'proactiveCheck', 'bootstrap', 'admin', 'history', 'pic', 'friendRequest']);
   function isTimerWakeReason(reason) {
     return TIMER_WAKE_REASONS.has(String(reason ?? '').split(':')[0]);
+  }
+
+  /**
+   * 取当前生效的一组「回复链路参数」。
+   *
+   * 两套键（socialV2.reply.legacy / socialV2.reply.fast）完全独立、互不回退：
+   * mode=legacy 只用 legacy 组，mode=fast 只用 fast 组。于是「快回复关掉 + 原版换会话关掉」
+   * 就与引入这个开关之前的行为逐项相等（scripts/test-reply-mode.mjs 盯着这条）。
+   */
+  function replyParamsV2() {
+    const reply = cfg.socialV2?.reply ?? {};
+    const mode = reply.mode === 'fast' ? 'fast' : 'legacy';
+    const raw = reply[mode];
+    const group = raw && typeof raw === "object" ? raw : {};
+    const num = (value, dflt, lo, hi) => {
+      const v = Number(value);
+      if (!Number.isFinite(v)) return dflt;
+      return Math.min(hi, Math.max(lo, Math.round(v)));
+    };
+    const rotate = group.sessionRotate && typeof group.sessionRotate === "object" ? group.sessionRotate : {};
+    const cleanup = group.cleanup && typeof group.cleanup === "object" ? group.cleanup : {};
+    return {
+      mode,
+      batchWindowMs: num(group.batchWindowMs, mode === 'fast' ? 800 : 8000, 100, 60000),
+      typingMinMs: num(group.typingMinMs, mode === 'fast' ? 150 : 2000, 0, 60000),
+      typingMaxMs: num(group.typingMaxMs, mode === 'fast' ? 500 : 8000, 0, 120000),
+      takeover: group.takeover === true,
+      rotate: {
+        enabled: rotate.enabled === true,
+        everyTurns: num(rotate.everyTurns, 8, 1, 500),
+        idleOnly: rotate.idleOnly !== false,
+        // 换会话时把旧会话挂着的「自动化任务」迁到新会话；换完是否删掉旧会话由 deleteOld 决定。
+        inheritTasks: rotate.inheritTasks !== false,
+        deleteOld: rotate.deleteOld === true
+      },
+      cleanup: {
+        enabled: cleanup.enabled === true,
+        keep: num(cleanup.keep, 50, 1, 500),
+        days: num(cleanup.days, 7, 1, 365)
+      }
+    };
+  }
+
+  /** 原版模式的自然回复延迟就在 social.activeReplyDelay* 上：跟着 legacy 组走。 */
+  function syncReplyDelayV2(params) {
+    const legacy = cfg.socialV2?.reply?.legacy;
+    if (!legacy || typeof legacy !== "object") return;
+    if (!("typingMinMs" in legacy) && !("typingMaxMs" in legacy)) return;
+    if (!cfg.social) cfg.social = {};
+    const min = Number(params.typingMinMs);
+    const max = Number(params.typingMaxMs);
+    if (Number.isFinite(min)) cfg.social.activeReplyDelayMinMs = Math.max(0, Math.round(min));
+    if (Number.isFinite(max)) cfg.social.activeReplyDelayMaxMs = Math.max(0, Math.round(max));
+  }
+
+  /** 两个整数之间的随机毫秒：给「像在打字」的起手停顿用。 */
+  function randBetweenMsV2(min, max) {
+    const lo = Math.max(0, Math.round(Number(min) || 0));
+    const hi = Math.max(lo, Math.round(Number(max) || 0));
+    if (hi <= lo) return lo;
+    return lo + Math.floor(Math.random() * (hi - lo));
+  }
+
+  // 回合耗时采样（只给 /api/socialV2/latency 与日志看，不参与决策）。
+  const turnLatencyV2 = [];
+
+  // 换会话的「每几轮」必须以**会话本身的回合数**为起点。2026-11-02 的现场：QQ 会话
+  // 已经有 340 个回合，而计数器是从功能上线那一刻从 0 数起的（当时 = 2），于是
+  // everyTurns=300 要先再攒 300 轮——用户眼里就是「设了 300 轮怎么都不换」。
+  // 做法：读 DSH 的会话日志数 turn/start，只对齐一次（turnsSeeded 之后不再扫）。
+  const SESSION_TURN_SCAN_MAX_BYTES = 96 * 1024 * 1024;
+  const SESSION_TURN_FRAME_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
+
+  /** 找到某个 DSH 会话的日志文件（不依赖 cwd 编码目录名，按 sessionId 反查）。 */
+  function sessionLogPath(sessionId) {
+    if (!sessionId) return '';
+    const root = path.join(os.homedir(), '.dsh', 'sessions');
+    let dirs = [];
+    try {
+      dirs = fs.readdirSync(root, { withFileTypes: true });
+    } catch {
+      return '';
+    }
+    for (const dir of dirs) {
+      if (!dir.isDirectory()) continue;
+      const file = path.join(root, dir.name, sessionId, 'session.v4.jsonl.zstd');
+      try {
+        if (fs.statSync(file).isFile()) return file;
+      } catch {
+        // 不是这个目录，接着找
+      }
+    }
+    return '';
+  }
+
+  /**
+   * 数一个会话跑过多少个回合。日志是「多帧 zstd 拼接」的 jsonl，按 magic 切帧后数
+   * "type":"turn/start"。返回 -1 表示不知道（文件不存在/太大/解不开/Node 没有 zstd），
+   * 调用方保持原计数，绝不因此打断回合收尾。
+   */
+  async function countSessionTurns(sessionId) {
+    if (!sessionId) return -1;
+    let zlib = null;
+    try {
+      zlib = (await import('node:zlib')).default;
+    } catch {
+      return -1;
+    }
+    if (typeof zlib?.zstdDecompressSync !== 'function') return -1;
+    const file = sessionLogPath(sessionId);
+    if (!file) return -1;
+    let buf;
+    try {
+      const st = fs.statSync(file);
+      if (!st.size || st.size > SESSION_TURN_SCAN_MAX_BYTES) return -1;
+      buf = await fs.promises.readFile(file);
+    } catch {
+      return -1;
+    }
+    const parts = [];
+    let start = 0;
+    let at = 0;
+    for (;;) {
+      at = buf.indexOf(SESSION_TURN_FRAME_MAGIC, at);
+      if (at < 0) break;
+      if (at > start) parts.push([start, at]);
+      start = at;
+      at += SESSION_TURN_FRAME_MAGIC.length;
+    }
+    parts.push([start, buf.length]);
+    let turns = 0;
+    let seen = 0;
+    for (const [a, b] of parts) {
+      try {
+        const text = zlib.zstdDecompressSync(buf.subarray(a, b)).toString('utf8');
+        const hits = text.match(/"type":"turn\/start"/g);
+        if (hits) turns += hits.length;
+      } catch {
+        // 单帧坏了就跳过：宁可少数几轮，也不要整段失败
+      }
+      seen += 1;
+      // 16MB 的会话解一遍约 0.6s：分批让出事件循环，别卡住回复链路。
+      if (seen % 200 === 0) await new Promise((resolve) => setImmediate(resolve));
+    }
+    return turns;
+  }
+
+  /** 后台把计数对齐一次（不阻塞回合收尾）。 */
+  function seedTurnsV2(key) {
+    const st = getSocialV2State(key);
+    if (st.turnsSeeded === true) return;
+    const sessionId = state.sessions[key];
+    if (!sessionId) return;
+    if (st.turnsSeeding === sessionId) return;
+    st.turnsSeeding = sessionId;
+    void (async () => {
+      const turns = await countSessionTurns(sessionId);
+      if (st.turnsSeeding === sessionId) st.turnsSeeding = '';
+      if (turns < 0) return;
+      if (state.sessions[key] !== sessionId) return; // 扫的过程中换了会话，结果作废
+      st.turnsSinceRotate = Math.max(Number(st.turnsSinceRotate) || 0, turns);
+      st.turnsSeeded = true;
+      saveSocialV2State();
+      log(`[reserved2] 会话 ${key} 历史 ${turns} 轮，换会话计数已对齐`);
+    })();
+  }
+
+  function bumpTurnCountV2(key) {
+    const st = getSocialV2State(key);
+    st.turnsSinceRotate = (Number(st.turnsSinceRotate) || 0) + 1;
+    st.turnsTotal = (Number(st.turnsTotal) || 0) + 1;
+    saveSocialV2State();
+    return st.turnsSinceRotate;
+  }
+
+  /**
+   * 换一个干净会话：只换 LLM 上下文，保留未读水位、引导标记、seenId 这些会话级状态。
+   * 这是 QQ-agent「每轮新开会话」的落地方式——历史不再随回合数线性变长。
+   */
+  /* ---------------- 自动化任务（schedule）迁移 ----------------
+   * DSH 的定时任务严格绑在「原会话」上，网关也没有 schedule.create（只有 list/delete/update/history），
+   * 所以「继承」只能拆成两步：桥接把旧任务读出来塞进下一次唤醒的提示词，让新会话里的她
+   * 用 schedule_create 逐个重建；这一回合收尾时桥接再核对，确认建好了才删旧任务、再处置旧会话。
+   */
+  async function listSessionTasksV2(sessionId) {
+    if (!sessionId) return [];
+    try {
+      const res = await withTimeout(api.callUnary('schedule.list', { request: { sessionId } }), DSH_CONTROL_TIMEOUT_MS, 'schedule.list');
+      const value = res && res.result ? res.result.value : (res && res.value);
+      return Array.isArray(value) ? value : [];
+    } catch (error) {
+      log(`[reserved2] 读定时任务失败 ${sessionId}：${error?.message ?? error}`);
+      return [];
+    }
+  }
+
+  async function deleteSessionTaskV2(sessionId, id) {
+    if (!sessionId || !id) return false;
+    try {
+      const res = await withTimeout(api.callUnary('schedule.delete', { request: { sessionId, id } }), DSH_CONTROL_TIMEOUT_MS, 'schedule.delete');
+      const value = res && res.result ? res.result.value : (res && res.value);
+      return Boolean(value && value.deleted);
+    } catch (error) {
+      log(`[reserved2] 删旧定时任务失败 ${id}：${error?.message ?? error}`);
+      return false;
+    }
+  }
+
+  /** 旧会话怎么处置：deleteOld=开就删，否则归档（归档被拒时保留，下次再说）。 */
+  async function disposeSessionV2(sessionId, why = 'dispose') {
+    if (!sessionId) return 'skip';
+    const params = replyParamsV2();
+    try {
+      if (params.rotate.deleteOld) {
+        await withTimeout(api.sessions.delete({ sessionId }), DSH_CONTROL_TIMEOUT_MS, 'sessions.delete');
+        log(`[reserved2] 已删除旧会话 ${sessionId}（${why}）`);
+        return 'deleted';
+      }
+      await withTimeout(api.workspace.archiveSession({ sessionId }), DSH_CONTROL_TIMEOUT_MS, 'workspace.archiveSession');
+      log(`[reserved2] 已归档旧会话 ${sessionId}（${why}）`);
+      return 'archived';
+    } catch (error) {
+      log(`[reserved2] 处置旧会话失败 ${sessionId}（${why}，先留着）：${error?.message ?? error}`);
+      return 'kept';
+    }
+  }
+
+  function taskBriefV2(task) {
+    const view = task && typeof task === 'object' ? task : {};
+    const brief = {
+      title: String(view.title ?? '').slice(0, 120),
+      kind: String(view.kind ?? ''),
+      prompt: String(view.prompt ?? '').slice(0, 1500)
+    };
+    for (const key of ['scheduledAt', 'time', 'timeZone', 'weekdays', 'expression', 'everySeconds', 'afterSeconds']) {
+      if (view[key] !== undefined && view[key] !== null && view[key] !== '') brief[key] = view[key];
+    }
+    return brief;
+  }
+
+  function taskInheritPromptBlockV2(st) {
+    const list = Array.isArray(st && st.tasksToInherit) ? st.tasksToInherit : [];
+    if (!list.length) return '';
+    const lines = list.map((item, index) => `${index + 1}. ${JSON.stringify(item && item.brief ? item.brief : item)}`);
+    return [
+      '',
+      '【换会话：把旧会话的定时任务接过来】',
+      '你刚被换到了新会话，下面这些自动化任务原来挂在旧会话上。请先调用 schedule_create 逐个重建（title / prompt / 时间规则照抄，别改文案、别合并），全部建好以后再处理上面的消息：',
+      ...lines,
+      '重建完在回复里简单说一句「任务已接过来了」就行；旧任务桥接会在这一轮结束后核对并删掉，你不用管。'
+    ].join('\n');
+  }
+
+  /** 当前会话 + 换下来的会话上还挂着的任务（按 key 过滤），用于继承。 */
+  async function collectInheritTasksV2(key) {
+    const seen = new Set();
+    const out = [];
+    const sources = [];
+    const current = state.sessions[key] || '';
+    if (current) sources.push(current);
+    for (const item of Array.isArray(state.retiredSessions) ? state.retiredSessions : []) {
+      if (item && item.key === key && item.sessionId && !sources.includes(item.sessionId)) sources.push(item.sessionId);
+    }
+    for (const sessionId of sources) {
+      const tasks = await listSessionTasksV2(sessionId);
+      for (const task of tasks) {
+        const id = String(task?.id ?? '');
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        out.push({ sessionId, taskId: id, brief: taskBriefV2(task) });
+      }
+    }
+    return out;
+  }
+
+  /** 唤醒前兜底：发现还有没迁的任务就挂到 st 上（老状态 / 上次没迁完都能补上）。 */
+  async function ensureInheritTasksV2(key) {
+    const st = getSocialV2State(key);
+    const params = replyParamsV2();
+    if (!params.rotate.inheritTasks) return;
+    if (Array.isArray(st.tasksToInherit) && st.tasksToInherit.length) return;
+    const found = await collectInheritTasksV2(key);
+    if (!found.length) return;
+    st.tasksToInherit = found;
+    saveSocialV2State();
+    log(`[reserved2] ${key} 有 ${found.length} 条定时任务要迁到新会话`);
+  }
+
+  /** 回合收尾核对：新会话里出现同名任务就算迁好，删掉旧任务并把旧会话处置掉。 */
+  async function verifyInheritTasksV2(key) {
+    const st = getSocialV2State(key);
+    const pending = Array.isArray(st.tasksToInherit) ? st.tasksToInherit.slice() : [];
+    if (!pending.length) return;
+    const current = state.sessions[key] || '';
+    if (!current) return;
+    const now = await listSessionTasksV2(current);
+    const titles = new Set(now.map((task) => String(task?.title ?? '').trim()).filter(Boolean));
+    const remain = [];
+    const migratedSources = new Set();
+    for (const item of pending) {
+      const title = String(item?.brief?.title ?? '').trim();
+      if (title && titles.has(title)) {
+        await deleteSessionTaskV2(item.sessionId, item.taskId);
+        migratedSources.add(item.sessionId);
+      } else {
+        remain.push(item);
+      }
+    }
+    st.tasksToInherit = remain;
+    saveSocialV2State();
+    if (!remain.length) {
+      log(`[reserved2] ${key} 的定时任务已经全部继承到新会话`);
+      for (const sessionId of migratedSources) {
+        if (sessionId && sessionId !== current) await disposeSessionV2(sessionId, 'inherit-done');
+      }
+    }
+  }
+
+  /**
+   * 换一个干净会话：只换 LLM 上下文，保留未读水位、引导标记、seenId 这些会话级状态。
+   * 关键：当场就把新会话建出来（复用 ensureSession 的 workspace/preset 流程），
+   * 失败就回滚到旧会话——只删映射不建会话等于把人晾在没有会话的状态里。
+   */
+  async function rotateSessionV2(key, why = 'rotate') {
+    const old = state.sessions[key] || '';
+    const st = getSocialV2State(key);
+    const rotateParams = replyParamsV2().rotate;
+    // 旧会话挂着的自动化任务：DSH 不能改绑，只能让新会话重建，所以先把清单抓下来。
+    const inherited = rotateParams.inheritTasks ? await collectInheritTasksV2(key) : [];
+    if (!st.originalSessionId && old) st.originalSessionId = old; // 记住「原本那条」，方便关掉后回退
+    if (!st.originalSessionId) backfillOriginalV2(key); // 上一版只删映射留下的历史，也把原会话找回来
+    st.turnsSinceRotate = 0;
+    st.turnsSeeded = false;
+    st.turnsSeeding = '';
+    saveSocialV2State();
+    if (!old) {
+      try {
+        const created = await ensureSession(key);
+        st.turnsSeeded = true;
+        st.turnsSinceRotate = 0;
+        saveSocialV2State();
+        log(`[reserved2] 换会话 ${key}：之前没有会话，已新建 ${created}（${why}）`);
+        return true;
+      } catch (error) {
+        log(`[reserved2] 换会话 ${key} 失败（${why}）：${error?.message ?? error}`);
+        return false;
+      }
+    }
+    delete state.sessions[key];
+    delete state.sessionPolicies[key];
+    modelAppliedSessions.delete(old);
+    reverse.delete(old);
+    collectors.delete(old);
+    sendToolSucceededSessions.delete(old);
+    pendingSendToolCalls.delete(old);
+    v2TurnStartAt.delete(old);
+    turnLeaseNoted.delete(old);
+    toolCallNames.delete(old);
+    social.silentTurns.delete(old);
+    social.exitingSessions.delete(old);
+    sessionPromises.delete(key);
+    forgetConversationCaches(key);
+    // 新会话没见过任何 seq：让下一次唤醒照常补历史，而不是以为「都看过了」。
+    st.modelSeenSeqs = new Set();
+    saveState();
+    try {
+      const created = await ensureSession(key);
+      if (!created) throw new Error('ensureSession 没有返回 sessionId');
+      st.turnsSinceRotate = 0;
+      st.turnsSeeded = false; // 新会话是空的，轮次就是 0；不用扫日志
+      saveSocialV2State();
+      if (!Array.isArray(state.retiredSessions)) state.retiredSessions = [];
+      state.retiredSessions.push({ sessionId: old, at: Date.now(), key });
+      if (state.retiredSessions.length > 300) state.retiredSessions.splice(0, state.retiredSessions.length - 300);
+      saveState();
+      stopRetiredSessionWork(old, key);
+      if (inherited.length && rotateParams.inheritTasks) {
+        st.tasksToInherit = inherited;
+        saveSocialV2State();
+        log(`[reserved2] 换会话 ${key}：${inherited.length} 条定时任务要迁到新会话`);
+      } else if (rotateParams.inheritTasks) {
+        // 没有任务要迁：旧会话可以按配置处置了（默认归档，开了 deleteOld 才删）。
+        await disposeSessionV2(old, 'rotate');
+      }
+      log(`[reserved2] 换会话 ${key}：${old} -> ${created}（${why}，新会话已创建）`);
+      return true;
+    } catch (error) {
+      // 建不出来就把旧会话放回去，别让人处于「没有会话」的状态。
+      state.sessions[key] = old;
+      reverse.set(old, key);
+      st.turnsSeeded = true;
+      saveState();
+      log(`[reserved2] 换会话 ${key} 失败，已回滚到旧会话 ${old}（${why}）：${error?.message ?? error}`);
+      return false;
+    }
+  }
+
+  /** 「原本那条会话」：老状态没有 originalSessionId 时，从换下来的记录里取最早的一条。 */
+  function backfillOriginalV2(key) {
+    const st = getSocialV2State(key);
+    if (st.originalSessionId) return st.originalSessionId;
+    const list = Array.isArray(state.retiredSessions) ? state.retiredSessions : [];
+    const mine = list
+      .filter((item) => item && item.key === key && item.sessionId)
+      .sort((a, b) => Number(a.at || 0) - Number(b.at || 0));
+    if (!mine.length) return '';
+    st.originalSessionId = mine[0].sessionId;
+    saveSocialV2State();
+    return st.originalSessionId;
+  }
+
+  /** 回到「原来那条会话」：关掉换会话后，应该继续在老会话里聊，而不是留在换出来的会话里。 */
+  async function restoreSessionV2(key, why = 'restore') {
+    const st = getSocialV2State(key);
+    const current = state.sessions[key] || '';
+    const target = st.originalSessionId || backfillOriginalV2(key);
+    if (!target) return { key, from: current, to: current, changed: false };
+    st.originalSessionId = target;
+    if (target === current) {
+      saveSocialV2State();
+      return { key, from: current, to: current, changed: false };
+    }
+    if (current) {
+      modelAppliedSessions.delete(current);
+      reverse.delete(current);
+      collectors.delete(current);
+      sendToolSucceededSessions.delete(current);
+      pendingSendToolCalls.delete(current);
+      v2TurnStartAt.delete(current);
+      turnLeaseNoted.delete(current);
+      toolCallNames.delete(current);
+      social.silentTurns.delete(current);
+      social.exitingSessions.delete(current);
+      if (!Array.isArray(state.retiredSessions)) state.retiredSessions = [];
+      state.retiredSessions.push({ sessionId: current, at: Date.now(), key });
+      stopRetiredSessionWork(current, key);
+    }
+    sessionPromises.delete(key);
+    forgetConversationCaches(key);
+    state.sessions[key] = target;
+    st.modelSeenSeqs = new Set();
+    st.turnsSinceRotate = 0;
+    st.turnsSeeded = false; // 老会话有自己的历史，重新按日志对齐
+    saveState();
+    saveSocialV2State();
+    log(`[reserved2] 回退会话 ${key}：${current || '（无）'} -> ${target}（${why}）`);
+    seedTurnsV2(key);
+    return { key, from: current, to: target, changed: true };
+  }
+
+  /** 换会话关掉时，把还在换出来的会话上聊的对话搬回原会话。 */
+  async function reconcileReplyModeV2(reason = '') {
+    if (replyParamsV2().rotate.enabled === true) return [];
+    const keys = Object.keys(state.sessions || {});
+    const results = [];
+    for (const key of keys) {
+      try {
+        const result = await restoreSessionV2(key, `关掉换会话后回退（${reason || 'reconcile'}）`);
+        if (result.changed) results.push(result);
+      } catch (error) {
+        log(`[reserved2] 回退会话 ${key} 失败：${error?.message ?? error}`);
+      }
+    }
+    if (results.length) log(`[reserved2] 已回退 ${results.length} 个会话到原会话（${reason || 'reconcile'}）`);
+    return results;
+  }
+
+  /** config.json 是设置页直接写的：桥接不侦测就只能重启。这里 3 秒看一次，只热加载 reply 子树。 */
+  function startReplyConfigWatch() {
+    const configPath = path.join(ROOT, 'config.json');
+    let last = '';
+    try {
+      const st = fs.statSync(configPath);
+      last = `${st.mtimeMs}:${st.size}`;
+    } catch {}
+    const timer = setInterval(() => {
+      let sig = '';
+      try {
+        const st = fs.statSync(configPath);
+        sig = `${st.mtimeMs}:${st.size}`;
+      } catch {
+        return;
+      }
+      if (!sig || sig === last) return;
+      last = sig;
+      try {
+        const file = readConfigObject(configPath);
+        const next = file?.socialV2?.reply;
+        if (!next || typeof next !== 'object' || Array.isArray(next)) return;
+        const before = JSON.stringify(cfg.socialV2?.reply ?? null);
+        if (before === JSON.stringify(next)) return;
+        cfg.socialV2.reply = next;
+        const params = replyParamsV2();
+        syncReplyDelayV2(params);
+        log(`[reserved2] 回复参数已重载 mode=${params.mode} batch=${params.batchWindowMs} 打字=${params.typingMinMs}~${params.typingMaxMs}ms 接管=${params.takeover ? 'on' : 'off'} 换会话=${params.rotate.enabled ? `每${params.rotate.everyTurns}轮` : 'off'}`);
+        void reconcileReplyModeV2('config-watch').catch((error) => log(`[reserved2] 配置重载后回退会话失败：${error?.message ?? error}`));
+      } catch (error) {
+        log(`[reserved2] 读取回复参数失败：${error?.message ?? error}`);
+      }
+    }, 3000);
+    if (typeof timer.unref === 'function') timer.unref();
+  }
+
+
+  /**
+   * 清理「自己换下来的」旧会话：只动 state.retiredSessions 里记过的 sessionId，
+   * 绝不按列表瞎删（DSH 里还有生活会话、俚语会话等别人的会话）。
+   */
+  async function cleanupRetiredSessionsV2(keep, days) {
+    const list = Array.isArray(state.retiredSessions) ? state.retiredSessions.slice() : [];
+    if (!list.length) return 0;
+    const cutoff = Date.now() - Math.max(1, days) * 86400000;
+    const sorted = list.slice().sort((a, b) => Number(b.at || 0) - Number(a.at || 0));
+    const drop = sorted.filter((item, index) => item && item.sessionId && (index >= Math.max(1, keep) || Number(item.at || 0) < cutoff));
+    if (!drop.length) return 0;
+    let removed = 0;
+    for (const item of drop) {
+      // 「是否删除会话」是开关：默认只归档，删掉就再也回不到原会话了。
+      const outcome = await disposeSessionV2(item.sessionId, 'cleanup');
+      if (outcome === 'deleted' || outcome === 'archived') removed += 1;
+    }
+    const dropSet = new Set(drop.map((item) => item.sessionId));
+    state.retiredSessions = list.filter((item) => !dropSet.has(item?.sessionId));
+    saveState();
+    if (removed) log(`[reserved2] 清理旧会话 ${removed} 个（保留最近 ${keep} 个 / ${days} 天）`);
+    return removed;
+  }
+
+  /** 回合收尾：计数 → 按组配置换会话 → 按组配置清理。 */
+  function onTurnEndedV2(key, durMs = 0) {
+    const params = replyParamsV2();
+    syncReplyDelayV2(params);
+    seedTurnsV2(key);
+    const turns = bumpTurnCountV2(key);
+    const st = getSocialV2State(key);
+    const idle = !(Array.isArray(st.unread) && st.unread.length)
+      && !(Array.isArray(st.pendingWakeReasons) && st.pendingWakeReasons.length)
+      && !st.pendingWakeTimer;
+    turnLatencyV2.push({ at: Date.now(), key, mode: params.mode, durMs: Math.max(0, Math.round(Number(durMs) || 0)), turns });
+    if (turnLatencyV2.length > 200) turnLatencyV2.splice(0, turnLatencyV2.length - 200);
+    const shouldRotate = params.rotate.enabled && turns >= params.rotate.everyTurns && (!params.rotate.idleOnly || idle);
+    log(`[reserved2] 回合结束 key=${key} mode=${params.mode} 第 ${turns} 轮 用时=${Math.round((Number(durMs) || 0) / 1000)}s 轮换=${shouldRotate ? 'yes' : 'no'}`);
+    if (shouldRotate) {
+      void rotateSessionV2(key, `第 ${turns} 轮`)
+        .then((ok) => { if (!ok) log(`[reserved2] 第 ${turns} 轮换会话没成功，继续用旧会话`); })
+        .catch((error) => log(`[reserved2] 换会话异常：${error?.message ?? error}`));
+    }
+    void verifyInheritTasksV2(key).catch((error) => log(`[reserved2] 核对定时任务继承失败 ${key}: ${error?.message ?? error}`));
+    if (params.cleanup.enabled) void cleanupRetiredSessionsV2(params.cleanup.keep, params.cleanup.days);
   }
 
   function scheduleWakeV2(key, reason) {
@@ -15744,7 +17058,9 @@ async function main() {
         // 有界队列：最多保留 20 条，防止消息洪峰下无限增长。
         if (st.pendingWakeReasons.length > 20) st.pendingWakeReasons.splice(0, st.pendingWakeReasons.length - 20);
       }
-      log(`[reserved2] 会话繁忙，暂存唤醒原因 ${key}（${reason}@seq${seq}，原因=${busyReasonV2(key, st)}）`);
+      const busyParams = replyParamsV2();
+      if (busyParams.takeover && !isTimerWakeReason(reason)) st.takeoverPending = true;
+      log(`[reserved2] 会话繁忙，暂存唤醒原因 ${key}（${reason}@seq${seq}，原因=${busyReasonV2(key, st)}${busyParams.takeover ? '，接管=on' : ''}）`);
       return;
     }
     cancelReplyCheckV2(key); // 真实唤醒已接管，取消普通回复检查，避免 30s 后再补一刀
@@ -15753,7 +17069,13 @@ async function main() {
       st.sleepTimer = null;
     }
     st.pendingWakeReason = reason;
-    const batchMs = Math.max(1000, Number(st.wakeConfig?.batchWindowMs) || 8000);
+    // 批量窗：取「这一组」的配置；per-conversation 的 wakeConfig 更小时以它为准
+    //（模型可以说「这条急，0.5 秒就走」）。快回复再叠一点起手停顿，别秒回得太假。
+    const wakeParams = replyParamsV2();
+    syncReplyDelayV2(wakeParams);
+    const cfgBatch = Number(st.wakeConfig?.batchWindowMs) || wakeParams.batchWindowMs;
+    const typingMs = wakeParams.mode === 'fast' ? randBetweenMsV2(wakeParams.typingMinMs, wakeParams.typingMaxMs) : 0;
+    const batchMs = Math.max(200, Math.min(cfgBatch, wakeParams.batchWindowMs)) + typingMs;
     st.pendingWakeTimer = setTimeout(() => {
       st.pendingWakeTimer = null;
       const finalReason = st.pendingWakeReason || reason;
@@ -15780,6 +17102,14 @@ async function main() {
     if (!Array.isArray(st.pendingWakeReasons) || !st.pendingWakeReasons.length) return null;
     const item = st.pendingWakeReasons.shift();
     if (!item || typeof item !== 'object') return null;
+    if (st.takeoverPending) {
+      st.takeoverPending = false;
+      if (!isTimerWakeReason(item.reason)) {
+        log(`[reserved2] ${key} 忙时接管：立刻投递积压的 ${item.reason}`);
+        void sendWakePromptV2(key, item.reason).catch((error) => log(`[reserved2] 接管唤醒异常 ${key}: ${error?.message ?? error}`));
+        return { reason: item.reason, action: 'takeover' };
+      }
+    }
     if (isTimerWakeReason(item.reason)) {
       if (item.reason === 'timeout') {
         log(`[reserved2] ${key} 补收繁忙期间到期的潜水定时器`);
@@ -16319,6 +17649,24 @@ async function main() {
     // 因此必须先解析 quoteTargetIsSelf 再做空文本过滤，避免“只引用不附文”被漏掉。
     const quoteTargetIsSelf = await isQuoteTargetSelf(event.message ?? [], kind, id, event.self_id);
     if (!isSessionAllowedInCurrentMode(key)) return;
+    const isOwner = String(event.user_id) === String(cfg.ownerQQ ?? '');
+    // 聊天全量存档：在空文本过滤之前落盘，纯图片/表情/引用也能留下元数据。
+    // 只归档白名单会话；黑名单在上面已经 return，命令由 writer 自己跳过。
+    try {
+      chatArchive.appendIncoming({
+        key,
+        kind,
+        id,
+        event,
+        plainContent,
+        textContent,
+        isOwner,
+        quoteTargetIsSelf,
+        media: mediaList,
+      });
+    } catch (error) {
+      log('[聊天存档] 写入失败:', error?.message ?? error);
+    }
     // 任何入站消息（含纯图片/表情/引用）都先记「谁在说话」，且必须在下面的空文本过滤之前：
     // 语音触发判定只认这条记录，漏记就等于给"换个人来喊"留了后门。
     {
@@ -16328,7 +17676,6 @@ async function main() {
       if (isOwnerMsg) voiceOwnerAt.set(String(key), now);
     }
     if (!plainContent && !quoteTargetIsSelf) return;
-    const isOwner = String(event.user_id) === String(cfg.ownerQQ ?? '');
     const displayName = kind === 'group'
       ? (event.sender?.card || event.sender?.nickname || String(event.user_id))
       : '私聊';
@@ -17178,6 +18525,7 @@ async function main() {
               // 繁忙期间被暂存的唤醒原因：当前 turn 结束后补一次（定时器类与消息类语义不同，
               // 详见 replayPendingWakeReasonsV2 的注释）。
               replayPendingWakeReasonsV2(key);
+              onTurnEndedV2(key, Date.now() - (Number(v2TurnStartAt.get(frame.sessionId)) || Date.now()));
               if (ended.reason.kind === 'completed' && ended.text.trim()) {
                 const plain = mdToPlain(ended.text);
                 // 纯 Markdown/空白输出按“无文本”处理，避免后续 planSocialTimeline 拿空串崩溃。
@@ -17491,6 +18839,21 @@ async function main() {
   bot.onNotice('notify', async (event) => {
     try { await handlePokeNotice(event); } catch (error) { log('处理拍一拍事件出错:', error?.message ?? error); }
   });
+  // 好友申请（2026-11-01）：网关没有「查询申请列表」的动作，只能靠这条事件推送。
+  // 离线期间的申请收不到，这就是这个功能已知的边界。
+  if (typeof bot.onRequest === 'function') {
+    bot.onRequest(async (event) => {
+      const type = String(event?.request_type ?? '');
+      if (type !== 'friend') return;
+      try {
+        await handleFriendRequestV2(event);
+      } catch (error) {
+        log(`[friend] 处理好友申请出错：${error?.message ?? error}`);
+      }
+    });
+  } else {
+    log('[friend] 当前 SDK 没有 onRequest，好友申请功能不可用');
+  }
 
   // ── 上游健康：任何事件包都算「SnowLuma 还活着」，心跳还额外带接收链路健康度 ──
   // 用 onEvent 挂一个**旁路**订阅（不影响主链路）：

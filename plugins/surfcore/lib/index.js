@@ -67,6 +67,7 @@ import { startScheduler } from './scheduler.js';
 import { createTokenBudgetService } from './token-budget.js';
 import { createPetService, detectElectronPath, installElectronRuntime, ELECTRON_VERSION, electronDownloadUrl } from './pet.js';
 import { createPetChatService } from './pet-chat.js';
+import { createDesktopArchive } from './desktop-archive.js';
 import { createPetPurposeService } from './pet-purpose.js';
 import { createPetApiService } from './pet-api.js';
 import { createOrbService, normalizeOrbConfig } from './orb.js';
@@ -219,8 +220,18 @@ export function apply(ctx) {
   });
   // ── 桌宠（独立栏目，默认不安装；用户自己安装才生效）────────────────────
   const petService = createPetService({ stateDir: STATE_DIR, pluginLog, getSubprocess: () => ctx.get('subprocess') });
+  // 桌宠/悬浮球/陪伴字幕的原文存档：写进和 QQ 同一个 chat-archive，用 channel 区分来源。
+  const desktopArchive = createDesktopArchive({
+    dshHome: DSH_HOME,
+    readConfig: () => {
+      try { return readUnified().config?.socialV2?.memoryCardBackup || {}; } catch { return {}; }
+    },
+    getCharacterId: () => {
+      try { return readCurrentCharacter()?.id || ''; } catch { return ''; }
+    },
+  });
   // 桌宠对话与「目的机制」的桌宠载体：和 QQ / B站 共用当前角色的人格卡、记忆卡、目的状态。
-  const petChat = createPetChatService({ ctx, stateDir: STATE_DIR, pluginLog, tokenBudget });
+  const petChat = createPetChatService({ ctx, stateDir: STATE_DIR, pluginLog, tokenBudget, archiveMessage: desktopArchive.record });
   const petPurpose = createPetPurposeService({ chat: petChat, tokenBudget, pluginLog, callBridge });
   const petApi = createPetApiService({
     chat: petChat,
@@ -275,9 +286,14 @@ export function apply(ctx) {
     };
   }
 
-  const orbService = createOrbService({ stateDir: STATE_DIR, pluginLog, getSubprocess: () => ctx.get('subprocess') });
+  const orbService = createOrbService({
+    stateDir: STATE_DIR,
+    pluginLog,
+    getSubprocess: () => ctx.get('subprocess'),
+    archiveMessage: desktopArchive.record,
+  });
   // 悬浮球对话：同一个人格卡 / 记忆卡 / 模型，历史单独放（profile='orb'）。
-  const orbChat = createPetChatService({ ctx, stateDir: STATE_DIR, pluginLog, tokenBudget, profile: 'orb' });
+  const orbChat = createPetChatService({ ctx, stateDir: STATE_DIR, pluginLog, tokenBudget, profile: 'orb', archiveMessage: desktopArchive.record });
   const orbApi = createOrbApiService({
     orb: orbService,
     chat: orbChat,
@@ -287,6 +303,7 @@ export function apply(ctx) {
     version: VERSION,
     identDefaults: deriveIdentDefaults,
     setScreenEnabled: setOrbScreenEnabled,
+    archiveMessage: desktopArchive.record,
     // 悬浮窗发图要能拿到 QQ 收藏表情和本地图库目录，这两样都在插件这边
     consoleCall,
     picLocalDirs: () => {
@@ -664,6 +681,7 @@ export function apply(ctx) {
           const restarted = await restartBridge({ dshWebUrl: currentDshUrl() });
           pluginLog('autoStartBridge 重启结果：', restarted.message || restarted.error || '');
         }
+        void maybeAutoStartSnowLuma();
         return;
       }
       pluginLog('autoStartBridge：桥接未运行，尝试启动');
@@ -1775,11 +1793,34 @@ export function apply(ctx) {
         // 2026-10-22 审计：旧写法把 basename 拼进 cmd 命令串，路径里带 `&` 可注入命令。
         // 现在整条路径作为「verbatim 参数」交给 cmd，并且拒绝含引号/换行的路径。
         if (/["\r\n]/.test(launcher)) return { ok: false, error: '启动脚本路径含引号或换行，拒绝执行' };
-        spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/c', 'start', '""', `"${launcher}"`], {
-          cwd, detached: true, stdio: 'ignore', windowsHide: false, windowsVerbatimArguments: true,
-        }).unref();
+        // 用 wscript 的 Run(..., 0, False) 启动，避免 start.bat/launcher.bat 的 pause
+        // 在桌面上留下一个常驻的 cmd 窗口；SnowLuma 自己仍然是后台进程。
+        if (process.platform === 'win32') {
+          const wscript = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'wscript.exe');
+          if (!fs.existsSync(wscript)) {
+            spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/c', 'start', '""', `"${launcher}"`], {
+              cwd, detached: true, stdio: 'ignore', windowsHide: true, windowsVerbatimArguments: true,
+            }).unref();
+          } else {
+            const esc = (s) => String(s).replace(/"/g, '""');
+            const vbs = [
+              'Set sh = CreateObject("WScript.Shell")',
+              `sh.CurrentDirectory = "${esc(cwd)}"`,
+              `sh.Run Chr(34) & "${esc(launcher)}" & Chr(34), 0, False`,
+              '',
+            ].join('\r\n');
+            const file = path.join(os.tmpdir(), `surfcore-snowluma-${process.pid}-${Date.now()}.vbs`);
+            fs.writeFileSync(file, vbs, 'utf8');
+            spawn(wscript, ['//nologo', file], { cwd, detached: true, stdio: 'ignore', windowsHide: true }).unref();
+            setTimeout(() => { try { fs.unlinkSync(file); } catch {} }, 120000).unref?.();
+          }
+        } else {
+          spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/c', 'start', '""', `"${launcher}"`], {
+            cwd, detached: true, stdio: 'ignore', windowsHide: true, windowsVerbatimArguments: true,
+          }).unref();
+        }
       } else {
-        spawn(launcher, [], { cwd, detached: true, stdio: 'ignore', windowsHide: false }).unref();
+        spawn(launcher, [], { cwd, detached: true, stdio: 'ignore', windowsHide: true }).unref();
       }
       // 等 WebUI 端口起来（最多 10 秒）：起来了就打开浏览器；没起来也给出地址让用户自己点。
       const until = Date.now() + 10_000;
@@ -1800,6 +1841,25 @@ export function apply(ctx) {
       return { ok: true, started: true, pending: true, webui: webui.url, launcher, message: `已启动 SnowLuma，控制台稍后可访问：${webui.url}` };
     } catch (error) {
       return { ok: false, error: `打开 SnowLuma 失败：${error?.message ?? error}` };
+    }
+  }
+
+  // 插件启动/端口自愈时顺便把 SnowLuma 拉起来，但只做后台进程，不开控制台。
+  // 5 分钟内失败过就不反复重试，避免每 2 分钟弹一次启动失败。
+  let lastSnowLumaAutoAt = 0;
+  async function maybeAutoStartSnowLuma() {
+    if (process.env.SURFCORE_SKIP_AUTOSTART === '1') return;
+    if (!platformStartEnabled('qq')) return;
+    if (Date.now() - lastSnowLumaAutoAt < 5 * 60_000) return;
+    lastSnowLumaAutoAt = Date.now();
+    try {
+      if (await portOpen(3000) || await portOpen(3001)) return;
+      const cfg = readQqConfig().config?.snowluma ?? {};
+      if (cfg.allowLaunch !== true) return;
+      const result = await launchSnowLuma();
+      if (result && result.ok === false) pluginLog('autoStartSnowLuma：', result.error || result.message || '启动失败');
+    } catch (error) {
+      pluginLog('autoStartSnowLuma 异常：', String(error?.message ?? error));
     }
   }
 
@@ -1988,8 +2048,8 @@ export function apply(ctx) {
   // 社交 V2 的通用转发（设置页要看「共享记忆预览」「世界树统计」「记忆系统状态」）。
   // 只放行白名单里的几条，避免变成一个任意代理。
   // 自动发图（设置页「发图」tab）用 pic-status / pic-config / pic-pause / send-pic 四条。
-  const SOCIAL_V2_PROXY_GET = new Set(['/api/socialV2/memory-tree', '/api/socialV2/cross-memory', '/api/socialV2/memory/status', '/api/socialV2/memory-card-backup', '/api/socialV2/self-expression', '/api/socialV2/diary', '/api/socialV2/voice', '/api/socialV2/voice/preview', '/api/socialV2/prompt-preview', '/api/socialV2/pic-status']);
-  const SOCIAL_V2_PROXY_POST = new Set(['/api/socialV2/memory-tree/grow', '/api/socialV2/memory-card-backup', '/api/socialV2/self-expression', '/api/socialV2/diary', '/api/socialV2/voice', '/api/socialV2/pic-config', '/api/socialV2/pic-pause', '/api/socialV2/send-pic']);
+  const SOCIAL_V2_PROXY_GET = new Set(['/api/socialV2/memory-tree', '/api/socialV2/cross-memory', '/api/socialV2/memory/status', '/api/socialV2/memory-card-backup', '/api/socialV2/self-expression', '/api/socialV2/diary', '/api/socialV2/voice', '/api/socialV2/voice/preview', '/api/socialV2/prompt-preview', '/api/socialV2/pic-status', '/api/socialV2/friend-requests', '/api/socialV2/latency']);
+  const SOCIAL_V2_PROXY_POST = new Set(['/api/socialV2/memory-tree/grow', '/api/socialV2/memory-card-backup', '/api/socialV2/self-expression', '/api/socialV2/diary', '/api/socialV2/voice', '/api/socialV2/pic-config', '/api/socialV2/pic-pause', '/api/socialV2/send-pic', '/api/socialV2/friend-config', '/api/socialV2/friend-decide', '/api/socialV2/session']);
   async function handleSocialV2Proxy(req, res, url) {
     const target = url.pathname.slice(API_PREFIX.length); // /socialV2/...
     // 白名单里两种写法都认：`/socialV2/x`（slice 之后的真实形态）和 `/api/socialV2/x`
@@ -2212,8 +2272,16 @@ if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output 
           screen: (() => {
             try { return orbApi.stateForOrb().screen; } catch { return {}; }
           })(),
+          companion: (() => {
+            try { return orbApi.companion.status(); } catch { return { active: false }; }
+          })(),
           events: { hostFile: orbApi.hostFile },
         });
+        return;
+      }
+      if (suffix === '/companion' && method === 'GET') {
+        try { json(res, 200, { ok: true, companion: orbApi.companion.status() }); }
+        catch (error) { json(res, 500, { ok: false, error: String(error?.message ?? error) }); }
         return;
       }
       if (method !== 'POST') { json(res, 405, { ok: false, error: '只支持 POST' }); return; }
@@ -2313,6 +2381,34 @@ if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output 
       }
       if (suffix === '/start') { json(res, 200, await orbService.start()); return; }
       if (suffix === '/stop') { json(res, 200, await orbService.stop()); return; }
+      if (suffix === '/companion') {
+        const action = String(body.action || 'status').trim().toLowerCase();
+        if (action === 'start') {
+          const st = orbService.status();
+          if (!st.installed) {
+            json(res, 400, { ok: false, error: '悬浮窗还没安装，先在「悬浮窗」里点安装' });
+            return;
+          }
+          if (!orbService.running()) {
+            const started = await orbService.start();
+            if (!started?.ok) {
+              json(res, 400, { ok: false, error: started?.error || '悬浮窗启动失败' });
+              return;
+            }
+          }
+          const result = await orbApi.companion.start({ sessionId: body.sessionId });
+          json(res, result.ok ? 200 : 400, result);
+          return;
+        }
+        if (action === 'stop') { json(res, 200, orbApi.companion.stop('ui')); return; }
+        if (action === 'reply') {
+          const result = await orbApi.companion.reply(body.text);
+          json(res, result.ok ? 200 : 400, result);
+          return;
+        }
+        json(res, 200, { ok: true, companion: orbApi.companion.status() });
+        return;
+      }
       if (suffix === '/say') {
         const message = orbService.addMessage({
           who: 'her',
@@ -3094,6 +3190,7 @@ if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output 
   // 启动后异步做的事（不阻塞插件激活）
   void activateExtensions();
   void maybeAutoStartBridge();
+  void maybeAutoStartSnowLuma();
   // 组件更新检查（2026-10-26）：DSH 起来后延迟 20 秒查一次，之后每 6 小时一次。
   // 结果缓存在 updates.json；设置页概览打开时若 showPrompt 就自动弹窗。
   try {

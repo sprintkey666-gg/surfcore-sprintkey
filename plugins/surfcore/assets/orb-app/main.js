@@ -10,7 +10,7 @@
 // 注意：这个文件是 **CommonJS**（package.json 没有 "type": "module"）。
 // 曾用 import 写过，Electron 会把它当 ES module 重新解析，于是 __dirname 未定义，
 // 窗口创建直接抛 ReferenceError、球根本不出现（2026-10-31 踩过）。别改回 import。
-const { app, BrowserWindow, ipcMain, screen, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, Menu, Tray, globalShortcut, nativeImage, dialog } = require('electron');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -45,10 +45,19 @@ let pendingExpand = null;
 let hostCache = { at: 0, data: null };
 // 收起状态下球的位置/大小。展开再收起必须回到这里，不然球会「跑位」。
 let ballRect = null;
-let prefs = { ballSize: COLLAPSED, x: null, y: null, panelWidth: EXPANDED.width, panelHeight: EXPANDED.height };
+let prefs = { ballSize: COLLAPSED, x: null, y: null, panelWidth: EXPANDED.width, panelHeight: EXPANDED.height, companion: null };
 // 头顶给气泡留多高：随气泡内容放大（0 = 用默认值），收起时复位。
 // 窗口向上长，她脚底不动，所以长高不会把她挪位置。
 let bubbleBand = 0;
+// 右键「隐藏到托盘」：窗口 hide，但进程继续跑；托盘/快捷键/二次启动都能叫回来。
+let tray = null;
+const WAKE_ACCELERATOR = 'CommandOrControl+Alt+Shift+H';
+// 陪伴模式：桌宠藏起来，底部单独开一条字幕窗；关掉后桌宠回来。
+let companionWin = null;
+let companionActive = false;
+let petHiddenByCompanion = false;
+let hiddenByUser = false;
+let companionDrag = null;
 
 function bandFor() {
   return Math.max(PET_BUBBLE_SPACE, Math.round(Number(bubbleBand) || 0));
@@ -165,14 +174,21 @@ function clampToDisplay(x, y, width, height) {
 const PET_KEEP = 60;
 
 function clampForMode(x, y, width, height) {
+  // 菜单必须整块留在屏内，不能像桌宠那样允许边缘出屏。
+  if (menuOpen) return clampToDisplay(x, y, width, height);
   const petSide = baseSize().pet && displayMode !== 'expanded' ? Math.round(PET_SIDE_SPACE / 2) : 0;
   if (!petSide) return clampToDisplay(x, y, width, height);
   const area = screen.getDisplayNearestPoint({ x, y }).workArea;
   const keepX = Math.max(petSide, Math.min(PET_KEEP, Math.round(width * 0.5)));
   const keepY = Math.min(PET_KEEP, Math.round(height * 0.5));
+  // 窗口上半截是「头顶气泡带」，宠物身体贴底。用整窗高去夹上边，等于气泡带先顶到屏幕边，
+  // 她就卡在半空拖不上去了（主人 2026-11-01 说的「明明上面还有那么大空间」）。
+  // 所以上边界只夹宠物实体，允许气泡带跑到屏幕外。
+  const bodyH = Math.min(height, Math.max(64, Math.round(width - PET_SIDE_SPACE)));
   const minX = area.x - keepX;
   const maxX = area.x + area.width - width + keepX;
-  const minY = area.y - keepY;
+  // 上边不额外留 keepY：头顶正好贴屏幕顶就停，再往上她会缺一块（主人要的是「能到最上面」，不是「能被屏幕吃掉」）
+  const minY = area.y - (height - bodyH);
   const maxY = area.y + area.height - height + keepY;
   return {
     x: Math.min(Math.max(x, minX), Math.max(minX, maxX)),
@@ -199,9 +215,21 @@ function readPrefs() {
       // 0 当作「没设过」：否则面板会跑到左上角（历史上 commit 过一次 0,0）
     panelX: Number.isFinite(Number(raw?.panelX)) && Number(raw.panelX) > 0 ? Math.round(Number(raw.panelX)) : null,
       panelY: Number.isFinite(Number(raw?.panelY)) && Number(raw.panelY) > 0 ? Math.round(Number(raw.panelY)) : null,
+      companion: (() => {
+        const c = raw?.companion && typeof raw.companion === 'object' ? raw.companion : null;
+        if (!c) return null;
+        const w = Math.round(Number(c.width));
+        const f = Math.round(Number(c.fontPx));
+        return {
+          x: Number.isFinite(Number(c.x)) ? Math.round(Number(c.x)) : null,
+          y: Number.isFinite(Number(c.y)) ? Math.round(Number(c.y)) : null,
+          width: Number.isFinite(w) && w >= 520 ? Math.min(w, 1400) : 900,
+          fontPx: Number.isFinite(f) && f >= 14 ? Math.min(f, 40) : 22,
+        };
+      })(),
     };
   } catch {
-    prefs = { ballSize: COLLAPSED, petSize: null, x: null, y: null, panelWidth: EXPANDED.width, panelHeight: EXPANDED.height, panelX: null, panelY: null };
+    prefs = { ballSize: COLLAPSED, petSize: null, x: null, y: null, panelWidth: EXPANDED.width, panelHeight: EXPANDED.height, panelX: null, panelY: null, companion: null };
   }
   return prefs;
 }
@@ -261,13 +289,16 @@ function safeBounds(target) {
  *   menu      菜单态 —— 窗口保持收起尺寸，菜单画在窗口内部，不撑大窗口
  */
 let displayMode = 'collapsed';
-// 菜单态要用的额外尺寸（宽/高），由 orb:menurect 按菜单实际大小写进来
+// 菜单是独立覆盖层：临时改窗口尺寸，但不改变 displayMode，
+// 这样点菜单外只收菜单，不会把已展开的面板打回桌宠。
+let menuOpen = false;
 let menuNeed = null;
+let menuRestore = 'collapsed';
 
 function expectedBounds() {
   const cur = win && !win.isDestroyed() ? win.getBounds() : null;
   const base = baseSize();
-  if (displayMode === 'menu' && menuNeed) {
+  if (menuOpen && menuNeed) {
     const anchor = cur || { x: 0, y: 0, width: menuNeed.width, height: menuNeed.height };
     return { x: anchor.x, y: anchor.y, width: menuNeed.width, height: menuNeed.height };
   }
@@ -298,8 +329,12 @@ function applyBounds(target, reason = '') {
     width: reason === 'panel-move' ? lock.width : want.width,
     height: reason === 'panel-move' ? lock.height : want.height,
   };
-  if (displayMode !== 'expanded') {
-    // 收起态 / 菜单态：尺寸只有一个合法值（宠物或小球），任何路径都改不动它。
+  if (menuOpen) {
+    // 菜单覆盖层：尺寸只能等于菜单需要的大小。
+    next.width = lock.width;
+    next.height = lock.height;
+  } else if (displayMode !== 'expanded') {
+    // 收起态：尺寸只有一个合法值（宠物或小球），任何路径都改不动它。
     next.width = lock.width;
     next.height = lock.height;
   } else {
@@ -307,7 +342,9 @@ function applyBounds(target, reason = '') {
     next.width = Math.min(PANEL_MAX_W, Math.max(PANEL_MIN_W, next.width));
     next.height = Math.min(PANEL_MAX_H, Math.max(PANEL_MIN_H, next.height));
   }
-  const pos = clampToDisplay(next.x, next.y, next.width, next.height);
+  // 位置统一走 clampForMode：收起态要允许「气泡带」出屏，宠物才拖得到最上面；
+  // 之前这里直接调 clampToDisplay（整窗夹屏），桌上宠物永远卡在离屏顶 110px 的地方（2026-11-01）。
+  const pos = clampForMode(next.x, next.y, next.width, next.height);
   const final = { ...pos, width: next.width, height: next.height };
   const before = win.getBounds();
   if (
@@ -445,6 +482,79 @@ async function flushPendingExpand() {
   await setExpanded(want);
 }
 
+// ---- 隐藏到托盘：隐藏不是关闭，进程/轮询都留着，随时能叫回来 ----------------
+function trayImage() {
+  try {
+    const image = nativeImage.createFromPath(path.join(__dirname, 'avatar.png'));
+    if (image.isEmpty()) return nativeImage.createEmpty();
+    return image.resize({ width: 16, height: 16 });
+  } catch {
+    return nativeImage.createEmpty();
+  }
+}
+
+function updateTrayMenu() {
+  if (!tray) return;
+  const visible = Boolean(win && !win.isDestroyed() && win.isVisible());
+  tray.setContextMenu(Menu.buildFromTemplate([
+    {
+      label: visible ? '隐藏到托盘' : '显示桌宠',
+      click: () => { void toggleWindow(); },
+    },
+    {
+      label: companionActive ? '关闭陪伴（恢复桌宠）' : '开启陪伴（字幕模式）',
+      click: () => { void toggleCompanionFromTray(!companionActive); },
+    },
+    { type: 'separator' },
+    { label: '退出桌宠', click: () => app.quit() },
+  ]));
+  tray.setToolTip(visible ? '小鲸鱼桌宠 · 单击隐藏' : '小鲸鱼桌宠 · 单击唤醒');
+}
+
+async function hideWindow() {
+  if (!win || win.isDestroyed()) return false;
+  if (expanded) await setExpanded(false);
+  try { win.hide(); } catch (error) { log('[orb] 隐藏窗口失败', String(error?.message ?? error)); return false; }
+  hiddenByUser = true;
+  stopClickWatch();
+  updateTrayMenu();
+  try { win.webContents.send('orb:hidden'); } catch {}
+  log('[orb] 已隐藏到托盘');
+  return true;
+}
+
+function showWindow() {
+  if (!win || win.isDestroyed()) return false;
+  hiddenByUser = false;
+  try { win.showInactive(); } catch { try { win.show(); } catch {} }
+  try { win.setAlwaysOnTop(true, 'screen-saver'); win.moveTop(); } catch {}
+  try { win.setIgnoreMouseEvents(false); } catch {}
+  startClickWatch();
+  updateTrayMenu();
+  try { win.webContents.send('orb:shown'); } catch {}
+  log('[orb] 已从托盘唤醒');
+  return true;
+}
+
+function toggleWindow() {
+  if (!win || win.isDestroyed()) return false;
+  return win.isVisible() ? hideWindow() : showWindow();
+}
+
+function createTray() {
+  if (tray) return tray;
+  try {
+    tray = new Tray(trayImage());
+    tray.on('click', () => { void toggleWindow(); });
+    updateTrayMenu();
+    log('[orb] 托盘已创建');
+  } catch (error) {
+    tray = null;
+    log('[orb] 托盘创建失败', String(error?.message ?? error));
+  }
+  return tray;
+}
+
 
 function createWindow() {
   readPrefs();
@@ -523,7 +633,143 @@ function createWindow() {
     })()`).then((info) => log('[orb] dom', JSON.stringify(info))).catch((e) => log('[orb] dom check failed', String(e?.message ?? e)));
   });
   win.on('closed', () => { win = null; });
+  win.on('show', () => updateTrayMenu());
+  win.on('hide', () => updateTrayMenu());
   log('[orb] 窗口已创建');
+}
+
+/** 陪伴字幕窗：宽度/字号跟着插件状态走，位置存在本机 prefs。 */
+function companionLayout(state = {}) {
+  const area = screen.getPrimaryDisplay().workArea;
+  const saved = prefs.companion || {};
+  // 用户拖过宽度就以本机 prefs 为准，避免服务端旧 state 每次轮询把宽度打回去。
+  const width = Math.min(Math.max(Number(saved.width) || Number(state.width) || 900, 520), Math.min(1400, area.width - 24));
+  const font = Math.min(Math.max(Number(saved.fontPx) || Number(state.fontPx) || 22, 14), 40);
+  const height = Math.round(Math.min(180, Math.max(72, font * 2.3 + 44)));
+  const wantX = Number.isFinite(saved.x) ? saved.x : area.x + Math.round((area.width - width) / 2);
+  const wantY = Number.isFinite(saved.y) ? saved.y : area.y + area.height - height - 18;
+  const pos = clampToDisplay(wantX, wantY, width, height);
+  return { ...pos, width, height, fontPx: font };
+}
+
+function forceCompanionTopmost(win) {
+  try {
+    if (!win || win.isDestroyed()) return;
+    const handle = win.getNativeWindowHandle();
+    const hwnd = handle.length >= 8 ? handle.readBigUInt64LE(0).toString() : String(handle.readUInt32LE(0));
+    const ps = [
+      "Add-Type -Namespace Native -Name Win -MemberDefinition '[DllImport(\"user32.dll\")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int cx, int cy, uint f);';",
+      `[Native.Win]::SetWindowPos([IntPtr]${hwnd},[IntPtr](-1),0,0,0,0,0x0043) | Out-Null`,
+    ].join(' ');
+    require('node:child_process').spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', ps], { windowsHide: true, stdio: 'ignore' });
+  } catch {}
+}
+
+function ensureCompanionWindow(state = {}) {
+  const layout = companionLayout(state);
+  if (companionWin && !companionWin.isDestroyed()) {
+    try {
+      const b = companionWin.getBounds();
+      // 高度由字幕窗自己按模式量出来（单条/上下文/历史/输入），主进程不跟它抢。
+      if (b.width !== layout.width) {
+        companionWin.setBounds({ x: b.x, y: b.y, width: layout.width, height: b.height });
+      }
+      if (!companionWin.isVisible()) companionWin.showInactive();
+      try { companionWin.setAlwaysOnTop(false); } catch {}
+      companionWin.setAlwaysOnTop(true, 'screen-saver', 1);
+      companionWin.moveTop();
+      companionWin.webContents.send('companion:state', state);
+    } catch {}
+    return companionWin;
+  }
+  const { x: companionX, y: companionY, width: companionW, height: companionH } = layout;
+  companionWin = new BrowserWindow({
+    x: companionX, y: companionY, width: companionW, height: companionH,
+    frame: false,
+    transparent: true,
+    resizable: false,
+    movable: true,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    hasShadow: false,
+    focusable: true,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  companionWin.setAlwaysOnTop(true, 'screen-saver', 1);
+  try { companionWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true }); } catch {}
+  companionWin.loadFile(path.join(__dirname, 'companion.html'));
+  companionWin.once('ready-to-show', () => {
+    if (!companionWin || companionWin.isDestroyed()) return;
+    companionWin.show();
+    try { companionWin.setAlwaysOnTop(false); } catch {}
+    try { companionWin.setAlwaysOnTop(true, 'screen-saver', 1); companionWin.moveTop(); } catch {}
+    forceCompanionTopmost(companionWin);
+    setTimeout(() => forceCompanionTopmost(companionWin), 800);
+    companionWin.webContents.send('companion:state', state);
+  });
+  companionWin.on('closed', () => { companionWin = null; });
+  log('[companion] 字幕窗已创建');
+  return companionWin;
+}
+
+function closeCompanionWindow() {
+  if (companionDrag) { clearInterval(companionDrag.timer); companionDrag = null; }
+  if (!companionWin || companionWin.isDestroyed()) { companionWin = null; return; }
+  try { companionWin.destroy(); } catch {}
+  companionWin = null;
+}
+
+function syncCompanion(state) {
+  const active = state?.active === true;
+  if (active) {
+    if (!companionActive) {
+      companionActive = true;
+      if (win && !win.isDestroyed() && win.isVisible()) {
+        win.hide();
+        petHiddenByCompanion = true;
+        stopClickWatch();
+        updateTrayMenu();
+      }
+    }
+    ensureCompanionWindow(state);
+    updateTrayMenu();
+    return;
+  }
+  if (companionActive) {
+    companionActive = false;
+    closeCompanionWindow();
+    if (petHiddenByCompanion) {
+      petHiddenByCompanion = false;
+      if (!hiddenByUser) showWindow();
+    }
+    updateTrayMenu();
+  }
+}
+
+async function toggleCompanionFromTray(active) {
+  const result = await call('/companion', {
+    method: 'POST',
+    body: active ? { action: 'start', sessionId: '' } : { action: 'stop' },
+    timeoutMs: 20000,
+  });
+  if (result?.ok === false) {
+    dialog.showErrorBox('陪伴模式', String(result.error || '开启失败'));
+    return;
+  }
+  const state = result?.data?.status || result?.data?.companion || null;
+  if (state) {
+    syncCompanion(state);
+    if (companionWin && !companionWin.isDestroyed()) companionWin.webContents.send('companion:state', state);
+  }
+  updateTrayMenu();
 }
 
 function startPolling() {
@@ -554,6 +800,7 @@ function startPolling() {
     }
     win.webContents.send('orb:conn', { ok: true });
     win.webContents.send('orb:state', res.data || null);
+    try { syncCompanion(res.data?.companion || null); } catch (error) { log('[companion] 同步失败', String(error?.message ?? error)); }
     // 有些窗口（全屏播放器、别的 Electron 应用）会把自己提到最前，球要定期抢回来。
     try { if (!win.isAlwaysOnTop()) win.setAlwaysOnTop(true, 'screen-saver'); win.moveTop(); } catch {}
   };
@@ -580,12 +827,76 @@ ipcMain.handle('orb:petconfig', () => {
   };
 });
 
-// 鼠标穿透：Windows 上 setIgnoreMouseEvents(true,{forward:true}) 并不能稳定把 move 事件转给渲染进程，
-// 一旦「穿透」了，渲染端就再也收不到 mousemove，命中判定永远翻不回来，她也就点不动了。
-// 所以这里保持窗口可点（不穿透），「只有身体能抓」交给渲染端 petBodyHit 判定。
+// 鼠标穿透：桌宠窗口是个「宠物 + 头顶气泡带」的矩形，透明的地方照样吃点击，
+// 主人的最小化按钮被她挡着点不到（2026-11-01）。
+// 渲染端收不到穿透后的 mousemove（Windows 上 forward:true 不可靠），所以改由主进程轮询光标：
+// 只有光标真的落在宠物实体（或显示中的气泡带）上时才把点击权收回来，其余时刻一律穿透。
+let clickThrough = false;
+let clickThroughTimer = null;
+let bubbleShown = false;
+let uiHold = false;
+
+function setClickThrough(flag) {
+  if (!win || win.isDestroyed()) return;
+  if (clickThrough === flag) return;
+  clickThrough = flag;
+  try { win.setIgnoreMouseEvents(flag, { forward: true }); }
+  catch (error) { log('[orb] 鼠标穿透切换失败', String(error?.message ?? error)); }
+}
+
+/** 宠物实体在窗口坐标里的矩形：video 贴底、身体占底部 size 高、水平居中、约 0.86 宽。 */
+function bodyRectInWindow(bounds) {
+  const pet = readPet();
+  const wanted = Number(prefs.petSize) || Number(pet && pet.size) || 200;
+  const size = Math.min(Math.max(Math.round(wanted), PET_MIN), PET_MAX);
+  const w = Math.max(48, Math.round(size * 0.86));
+  const h = Math.min(bounds.height, Math.max(48, Math.round(size * 0.98)));
+  return { x: Math.round((bounds.width - w) / 2), y: bounds.height - h, width: w, height: h };
+}
+
+function startClickWatch() {
+  if (clickThroughTimer) return;
+  clickThroughTimer = setInterval(() => {
+    if (!win || win.isDestroyed()) return;
+    if (!win.isVisible()) { setClickThrough(false); return; }
+    if (!baseSize().pet || displayMode === 'expanded') { setClickThrough(false); return; }
+    if (uiHold) { setClickThrough(false); return; }
+    let bounds;
+    let point;
+    try { bounds = win.getBounds(); point = screen.getCursorScreenPoint(); } catch { return; }
+    const lx = point.x - bounds.x;
+    const ly = point.y - bounds.y;
+    const body = bodyRectInWindow(bounds);
+    const inBody = lx >= body.x && lx <= body.x + body.width && ly >= body.y && ly <= body.y + body.height;
+    // 气泡只在真的显示时才把头顶那一条也算成可点（点气泡＝开面板/收气泡），否则整条让给下面。
+    const inBubbleBand = bubbleShown && ly >= 0 && ly < body.y;
+    setClickThrough(!(inBody || inBubbleBand));
+  }, 90);
+}
+
+function stopClickWatch() {
+  if (clickThroughTimer) {
+    clearInterval(clickThroughTimer);
+    clickThroughTimer = null;
+  }
+  setClickThrough(false);
+}
+
 ipcMain.handle('orb:hit', (_event, _hit) => {
   if (!win || win.isDestroyed()) return false;
   try { win.setIgnoreMouseEvents(false); } catch (error) { log('[orb] 设置鼠标穿透失败', String(error?.message ?? error)); }
+  return true;
+});
+
+// 头顶气泡显示/隐藏：只在显示时把那一截留成可点
+ipcMain.handle('orb:bubble-shown', (_event, flag) => {
+  bubbleShown = flag === true;
+  return true;
+});
+
+// 渲染端的 HTML 覆盖层（右键菜单 / 看图 / 提示条）打开时，整窗都要能点
+ipcMain.handle('orb:ui-hold', (_event, flag) => {
+  uiHold = flag === true;
   return true;
 });
 
@@ -605,6 +916,28 @@ ipcMain.handle('orb:http', async (_event, payload = {}) => {  const apiPath = St
     body: payload.body ?? null,
     timeoutMs: Number(payload.timeoutMs) > 0 ? Number(payload.timeoutMs) : 60000,
   });
+});
+
+ipcMain.handle('orb:pick-files', async () => {
+  try {
+    const result = await dialog.showOpenDialog(win, {
+      title: '选择要发给她的图片或文件',
+      properties: ['openFile', 'multiSelections'],
+      filters: [{ name: '所有文件', extensions: ['*'] }],
+    });
+    if (result.canceled || !Array.isArray(result.filePaths)) return { ok: true, files: [] };
+    const files = [];
+    for (const file of result.filePaths.slice(0, 6)) {
+      try {
+        const stat = fs.statSync(file);
+        if (!stat.isFile()) continue;
+        files.push({ path: file, name: path.basename(file), size: stat.size });
+      } catch {}
+    }
+    return { ok: true, files };
+  } catch (error) {
+    return { ok: false, error: String(error?.message ?? error) };
+  }
 });
 
 ipcMain.handle('orb:expand', async (_event, on) => {
@@ -734,21 +1067,40 @@ ipcMain.handle('orb:menurect', (_event, size = {}) => {
   const needH = Math.max(0, Math.round(Number(size.height) || 0));
   const base = baseSize();
   if (!needW && !needH) {
-    displayMode = 'collapsed';
+    menuOpen = false;
     menuNeed = null;
+    const restore = size.restore === 'expanded' || (!size.restore && expanded);
+    if (restore) {
+      displayMode = 'expanded';
+      expanded = true;
+      const back = applyBounds(expandTarget(), 'menu-close-expanded');
+      return { ok: true, dx: 0, dy: 0, restore: 'expanded', ...(back || {}) };
+    }
+    displayMode = 'collapsed';
+    expanded = false;
     const back = applyBounds({ ...(ballRect || win.getBounds()), width: base.width, height: base.height }, 'menu-close');
-    return { ok: true, dx: 0, dy: 0, ...(back || {}) };
+    return { ok: true, dx: 0, dy: 0, restore: 'collapsed', ...(back || {}) };
   }
   const cur = win.getBounds();
-  const width = Math.max(base.width, needW + 8);
-  const height = Math.max(base.height, needH + 8);
+  const area = screen.getDisplayMatching(cur).workArea;
+  const width = Math.min(Math.max(base.width, needW + 8), Math.max(base.width, area.width - 8));
+  const height = Math.min(Math.max(base.height, needH + 8), Math.max(base.height, area.height - 8));
   menuNeed = { width, height };
-  displayMode = 'menu';
-  const next = applyBounds({ x: cur.x, y: cur.y, width, height }, 'menu-open');
+  menuOpen = true;
+  menuRestore = expanded ? 'expanded' : 'collapsed';
+  // 先按新尺寸把窗口夹进工作区；窗口可能因此左移/上移，dx/dy 用来把宠物和菜单的视觉位置补回来。
+  const x = Math.max(area.x, Math.min(cur.x, area.x + area.width - width - 8));
+  const y = Math.max(area.y, Math.min(cur.y, area.y + area.height - height - 8));
+  const next = applyBounds({ x, y, width, height }, 'menu-open');
+  const nx = next?.x ?? x;
+  const ny = next?.y ?? y;
+  const growX = (next?.width ?? width) - cur.width;
+  const growY = (next?.height ?? height) - cur.height;
   return {
     ok: true,
-    dx: next ? (next.width - base.width) : 0,
-    dy: next ? (next.height - base.height) : 0,
+    dx: Math.round((cur.x - nx) - growX / 2),
+    dy: Math.round((cur.y - ny) - growY),
+    restore: menuRestore,
     ...(next || {}),
   };
 });
@@ -779,12 +1131,16 @@ ipcMain.handle('orb:dock', () => {
   }
   const near = distances[0];
   // 球模式停靠 = 只留 6px 露在屏幕边（鼠标靠近再展开）；
-  // 桌宠模式必须整个留在屏幕里，否则缩进去就再也点不到了（主人踩过）。
+  // 桌宠模式必须整个留在屏幕里（贴左边就贴齐左缘），否则缩进去就再也点不到了。
+  // 老公式 `area.x - width + visible` 在 visible=0 时等于 -width，左边一贴就被吸出屏幕外
+  // ——主人 2026-11-01 报的「在左边贴近边界就直接吸过去」。
   const petMode = baseSize().pet;
-  const visible = petMode ? 0 : 6;
-  const x = near.side === 'left' ? area.x - bounds.width + visible : area.x + area.width - bounds.width + visible;
-  const y = Math.min(Math.max(bounds.y, area.y), area.y + area.height - bounds.height);
-  applyBounds({ x, y, width: bounds.width, height: bounds.height }, 'dock');
+  const x = petMode
+    ? (near.side === 'left' ? area.x : area.x + area.width - bounds.width)
+    : (near.side === 'left' ? area.x - bounds.width + 6 : area.x + area.width - bounds.width + 6);
+  // y 不要在这里按工作区上沿夹：桌宠允许头顶气泡带出屏，交给 applyBounds → clampForMode 统一夹
+  // （以前这里 Math.max(bounds.y, area.y) 把拖到上面的她一把拽回 y=0，主人 2026-11-01 报的「拖不上去」）。
+  applyBounds({ x, y: bounds.y, width: bounds.width, height: bounds.height }, 'dock');
   if (!expanded) rememberBall();
   return { ok: true, side: near.side };
 });
@@ -819,6 +1175,138 @@ ipcMain.handle('orb:sizepanel', () => {
   return { ok: true, open: false, deprecated: true, size: baseSize().pet ? prefs.petSize : null };
 });
 
+ipcMain.handle('orb:hide', () => hideWindow());
+ipcMain.handle('orb:show', () => showWindow());
+ipcMain.handle('orb:toggle-hidden', () => toggleWindow());
+ipcMain.handle('orb:is-hidden', () => Boolean(!win || win.isDestroyed() || !win.isVisible()));
+
+// ── 陪伴字幕窗 ─────────────────────────────────────────────────────────────
+ipcMain.handle('companion:reply', async (_event, payload = {}) => {
+  const result = await call('/companion', { method: 'POST', body: { action: 'reply', text: String(payload.text || '') } });
+  if (companionWin && !companionWin.isDestroyed()) {
+    const state = result?.data?.status || null;
+    if (state) companionWin.webContents.send('companion:state', { ...state, active: true });
+  }
+  return result;
+});
+
+ipcMain.handle('companion:status', async () => {
+  const result = await call('/companion', { timeoutMs: 8000 });
+  return result?.data || result;
+});
+
+ipcMain.handle('companion:toggle', async (_event, payload = {}) => {
+  const active = payload.active === true;
+  const result = await call('/companion', {
+    method: 'POST',
+    body: active ? { action: 'stop' } : { action: 'start', sessionId: String(payload.sessionId || '') },
+    timeoutMs: 20000,
+  });
+  const state = result?.data?.companion || result?.data?.status || null;
+  if (state && companionWin && !companionWin.isDestroyed()) {
+    companionWin.webContents.send('companion:state', state);
+  }
+  return result;
+});
+
+ipcMain.handle('companion:config', async (_event, patch = {}) => {
+  const result = await call('/companion', { method: 'POST', body: { action: 'config', patch }, timeoutMs: 10000 });
+  const data = result?.data || result;
+  const state = data?.companion || data?.status || null;
+  if (state && companionWin && !companionWin.isDestroyed()) {
+    companionWin.webContents.send('companion:state', state);
+  }
+  return data;
+});
+
+// 拖动交给主进程按鼠标真实坐标算，渲染端只负责按下/松开；这样没有 DPI 漂移，
+// 也不会出现「拖一下又弹回原位」。
+ipcMain.handle('companion:drag-start', () => {
+  if (!companionWin || companionWin.isDestroyed()) return null;
+  if (companionDrag) clearInterval(companionDrag.timer);
+  const bounds = companionWin.getBounds();
+  companionDrag = {
+    cursor: screen.getCursorScreenPoint(),
+    bounds,
+    timer: setInterval(() => {
+      if (!companionWin || companionWin.isDestroyed()) return;
+      const p = screen.getCursorScreenPoint();
+      const area = screen.getDisplayNearestPoint(p).workArea;
+      const x = Math.min(Math.max(companionDrag.bounds.x + (p.x - companionDrag.cursor.x), area.x - companionDrag.bounds.width + 80), area.x + area.width - 80);
+      const y = Math.min(Math.max(companionDrag.bounds.y + (p.y - companionDrag.cursor.y), area.y), area.y + area.height - 40);
+      companionWin.setBounds({ x, y, width: companionDrag.bounds.width, height: companionDrag.bounds.height });
+    }, 16),
+  };
+  return bounds;
+});
+
+ipcMain.handle('companion:drag-end', () => {
+  if (companionDrag) {
+    clearInterval(companionDrag.timer);
+    companionDrag = null;
+  }
+  if (!companionWin || companionWin.isDestroyed()) return null;
+  const b = companionWin.getBounds();
+  writePrefs({ companion: { ...(prefs.companion || {}), x: b.x, y: b.y, width: b.width, fontPx: (prefs.companion || {}).fontPx || 22 } });
+  return b;
+});
+
+// 字号只存 pref，由渲染端量完内容再调 height；避免每滚一格都改窗口高度。
+ipcMain.handle('companion:font', (_event, payload = {}) => {
+  const fontPx = Math.min(Math.max(Math.round(Number(payload.fontPx) || 22), 14), 40);
+  writePrefs({ companion: { ...(prefs.companion || {}), fontPx } });
+  return { ok: true, fontPx };
+});
+
+function saveCompanionRect() {
+  if (!companionWin || companionWin.isDestroyed()) return;
+  const b = companionWin.getBounds();
+  writePrefs({ companion: { ...(prefs.companion || {}), x: b.x, y: b.y, width: b.width, fontPx: (prefs.companion || {}).fontPx || 22 } });
+}
+
+// 高度以底边为锚点，但只在越界时向上让位，绝不下移。
+// 旧实现把 y 往下夹到 area.bottom-40，内容变矮时会一路往下沉，这是漂移的根因。
+ipcMain.handle('companion:height', (_event, payload = {}) => {
+  if (!companionWin || companionWin.isDestroyed()) return null;
+  const b = companionWin.getBounds();
+  const area = screen.getDisplayNearestPoint({ x: b.x + Math.round(b.width / 2), y: b.y + Math.round(b.height / 2) }).workArea;
+  const bottom = b.y + b.height;
+  let height = Math.round(Math.min(Math.max(Number(payload.height) || b.height, 56), Math.min(560, area.height - 16)));
+  let y = bottom - height;
+  if (y < area.y + 4) {
+    y = area.y + 4;
+    height = Math.min(height, Math.max(56, area.y + area.height - 8 - y));
+  }
+  if (y + height > area.y + area.height - 8) y = area.y + area.height - 8 - height;
+  companionWin.setBounds({ x: b.x, y, width: b.width, height });
+  return companionWin.getBounds();
+});
+
+// 宽度只向右长；到屏幕右边就整体左移，保持右边缘可见。
+ipcMain.handle('companion:width', (_event, payload = {}) => {
+  if (!companionWin || companionWin.isDestroyed()) return null;
+  const b = companionWin.getBounds();
+  const area = screen.getDisplayNearestPoint({ x: b.x, y: b.y }).workArea;
+  const width = Math.min(Math.max(Math.round(Number(payload.width) || b.width), 520), Math.min(1400, area.width - 16));
+  let x = b.x;
+  if (x + width > area.x + area.width - 8) x = Math.max(area.x + 8, area.x + area.width - 8 - width);
+  companionWin.setBounds({ x, y: b.y, width, height: b.height });
+  // 拖动过程中先更新内存，避免下一次 state 同步把宽度打回旧值；落盘在 pointerup。
+  prefs = { ...prefs, companion: { ...(prefs.companion || {}), x, y: b.y, width } };
+  return companionWin.getBounds();
+});
+
+// 拖拽/拖宽结束时统一落盘，并同步服务端宽度，避免下次轮询被旧 state 打回去。
+ipcMain.handle('companion:save', async () => {
+  if (!companionWin || companionWin.isDestroyed()) return null;
+  const b = companionWin.getBounds();
+  saveCompanionRect();
+  try {
+    await call('/companion', { method: 'POST', body: { action: 'config', patch: { width: b.width } }, timeoutMs: 8000 });
+  } catch {}
+  return b;
+});
+
 ipcMain.handle('orb:quit', () => {
   log('[orb] 用户从菜单退出');
   app.quit();
@@ -830,7 +1318,13 @@ ipcMain.handle('orb:log', (_event, text) => {
 });
 
 app.on('window-all-closed', () => app.quit());
-app.on('before-quit', () => { if (pollTimer) clearInterval(pollTimer); });
+app.on('before-quit', () => {
+  if (pollTimer) clearInterval(pollTimer);
+  stopClickWatch();
+  try { globalShortcut.unregisterAll(); } catch {}
+  try { tray?.destroy(); } catch {}
+  tray = null;
+});
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
@@ -838,11 +1332,18 @@ if (!gotLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
-    if (win && !win.isDestroyed()) win.showInactive();
+    showWindow();
   });
   app.whenReady().then(() => {
     log('[orb] 启动', app.getVersion(), `pid=${process.pid}`, `dir=${ORB_DIR}`);
     createWindow();
+    createTray();
+    try {
+      const ok = globalShortcut.register(WAKE_ACCELERATOR, () => { void toggleWindow(); });
+      log(ok ? `[orb] 唤醒快捷键已注册 ${WAKE_ACCELERATOR}` : `[orb] 唤醒快捷键注册失败 ${WAKE_ACCELERATOR}`);
+    } catch (error) {
+      log('[orb] 唤醒快捷键注册异常', String(error?.message ?? error));
+    }
     // 桌宠模式下窗口大部分是透明的，默认把鼠标事件让给下面：只有渲染端报告
     // 「鼠标在宠物身上」时才收回点击权（否则会挡住桌面上其它窗口的点击）。
     // 桌宠模式的窗口是「宠物 + 头顶气泡带」的矩形，保持可点击：
@@ -851,6 +1352,7 @@ if (!gotLock) {
     // 先保证「点得到」，透明带的穿透留到以后用更精细的区域方案再说。
     if (win) {
       try { win.setIgnoreMouseEvents(false); } catch (error) { log('[orb] 鼠标穿透设置失败', String(error?.message ?? error)); }
+      startClickWatch();
     }
     startPolling();
   });

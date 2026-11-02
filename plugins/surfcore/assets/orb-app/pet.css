@@ -138,7 +138,13 @@
 .ctxmenu {
   position: absolute;
   z-index: 40;
-  min-width: 156px;
+  min-width: 170px;
+  width: fit-content;
+  max-width: min(320px, calc(100vw - 8px));
+  max-height: calc(100vh - 8px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  box-sizing: border-box;
   padding: 6px;
   border-radius: 12px;
   border: 1px solid rgba(140, 175, 235, 0.28);
@@ -155,6 +161,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+  white-space: nowrap;
   padding: 7px 10px;
   border: 0;
   border-radius: 8px;
@@ -177,6 +184,53 @@
 .ctxsize.hidden { display: none; }
 .szrange { flex: 1; accent-color: #5b9cff; }
 .szvalue { width: 34px; text-align: right; font-variant-numeric: tabular-nums; color: #9fc2ff; font-size: 12px; }
+
+/* 右键 → 陪伴：开关 / 上下文字幕 / 背景透明度 */
+.ctxcompanion {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+  padding: 6px 8px 7px;
+  margin-top: 2px;
+  border-top: 1px solid rgba(140, 175, 235, 0.18);
+}
+.ctxcompanion.hidden { display: none; }
+.ctxitem.sub {
+  justify-content: center;
+  padding: 6px 10px;
+  border: 1px solid rgba(91, 156, 255, 0.4);
+  background: rgba(91, 156, 255, 0.12);
+  color: #cfe3ff;
+  font-size: 12.5px;
+}
+.ctxitem.sub:hover { background: rgba(91, 156, 255, 0.26); }
+.ctxitem.sub.on { background: rgba(240, 90, 90, 0.18); border-color: rgba(240, 120, 120, 0.46); color: #ffd6d6; }
+.ctxcheck {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 2px;
+  font-size: 12.5px;
+  color: #cfd9ea;
+  cursor: pointer;
+}
+.ctxcheck input { accent-color: #5b9cff; }
+.ctxrange {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 2px;
+  font-size: 12px;
+  color: #aebbd0;
+}
+.ctxrange input { flex: 0 0 90px; width: 90px; min-width: 0; accent-color: #5b9cff; }
+.ctxcheck { white-space: normal; overflow-wrap: anywhere; width: 100%; box-sizing: border-box; }
+.ctxmenu { max-width: min(300px, calc(100vw - 8px)); box-sizing: border-box; }
+.ctxrange b { width: 34px; text-align: right; color: #9fc2ff; font-weight: 500; font-variant-numeric: tabular-nums; }
+.ctxnote { margin: 2px 2px 0; font-size: 11px; line-height: 1.45; color: #8794aa; }
 
 /* 菜单里出现滑条时，宠物淡一点，免得挡住 */
 #root.ctxopen #pet { opacity: 0.85; }

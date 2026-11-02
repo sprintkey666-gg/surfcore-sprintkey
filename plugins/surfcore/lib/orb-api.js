@@ -13,13 +13,18 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { createOrbCompanionService } from './orb-companion.js';
 import { execFile, spawn } from 'node:child_process';
 import { isLoopbackReq, json, readBody, sameOrigin, safeEqual } from './http-guard.js';
 import { QQ_STATE_DIR } from './paths.js';
+import {
+  attachmentContents, buildAttachmentPrompt, displayFiles, normalizeAttachments, sweepInbox,
+} from './orb-files.js';
 
 export const ORB_API_PREFIX = '/dsh-surfcore/orb-api';
 const HOST_FILE_VERSION = 1;
 const ORB_BODY_LIMIT = 256 * 1024;
+const CHAT_BODY_LIMIT = 24 * 1024 * 1024;
 const SCREEN_KEEP = 20;
 
 /**
@@ -122,6 +127,7 @@ export function createOrbApiService({
   orb, chat, stateDir, currentDshUrl, pluginLog = () => {}, version = '',
   identDefaults = () => ({}), setScreenEnabled = null,
   consoleCall = null, picLocalDirs = () => [], adminQQ = () => '',
+  companion: injectedCompanion = null, archiveMessage = null,
 }) {
   const root = path.join(stateDir, 'orb');
   const hostFile = path.join(root, 'host.json');
@@ -390,7 +396,7 @@ export function createOrbApiService({
    * 跑一轮聊天（不含「我」那条消息、不含响应）：
    * 自动档两段式看屏幕 → 问 chat.chat() → 剥掉 [[配图:]] 标记 → 按开关挑一张图。
    */
-  async function runChatTurn({ text, cfg }) {
+  async function runChatTurn({ text, cfg, files = [] }) {
     const desktop = await desktopContext();
     const mode = cfg.screen.mode || (cfg.screen.enabled === true ? 'manual' : 'off');
     // 她刚发过的图，气泡里没有文字，得单独告诉模型，否则她以为自己没发过。
@@ -398,18 +404,34 @@ export function createOrbApiService({
     // 聊天里能不能带图：开关在，才让她在回复里写 [[配图: …]]
     const allowPic = cfg.pic?.enabled === true && cfg.pic?.attachToChat === true;
 
+    // 主人随消息附的文件：图片走视觉输入，文本拼进提示词，二进制只报元信息。
+    const contents = attachmentContents(files);
+    let canSeeImages = true;
+    if (contents.images.length) {
+      try {
+        const support = await chat.visionSupport?.();
+        if (support) {
+          visionOk = support.ok === true;
+          if (support.ok === false) canSeeImages = false;
+        }
+      } catch {}
+    }
+    const attachmentBlock = buildAttachmentPrompt(files, { visionOk: canSeeImages });
+    const say = [String(text ?? '').trim(), attachmentBlock].filter(Boolean).join('\n').trim() || '（主人发来了附件）';
+    const userImages = canSeeImages ? contents.images : [];
+
     let image = null;
     let result;
     if (mode === 'auto' && cfg.screen.enabled === true) {
       // 自动档两段式：先让她自己决定要不要看（只在回复里出一句 [[看一眼]]），
       // 真要看才拍一张、拍完再问一遍，用第二次的回复当正式回答。
       // 额度由 look() 把关（每小时 maxPerHour），且一轮最多一次。
-      const first = await chat.chat({ text, modality: 'text', desktop, pics, screenMode: 'auto', allowPic });
+      const first = await chat.chat({ text: say, modality: 'text', desktop, images: userImages, pics, screenMode: 'auto', allowPic });
       const firstText = String(first.reply?.text || '');
       if (first.ok && /\[\[看一眼\]\]/.test(firstText)) {
         image = await shotForChat('auto', cfg);
         if (image) {
-          result = await chat.chat({ text, modality: 'text', desktop, image, pics, screenMode: 'auto', allowPic });
+          result = await chat.chat({ text: say, modality: 'text', desktop, image, images: userImages, pics, screenMode: 'auto', allowPic });
           if (!result.ok) result = { ...first, reply: { ...(first.reply || {}), text: firstText.replace(/\[\[看一眼\]\]/g, '').trim() } };
         } else {
           result = { ...first, reply: { ...(first.reply || {}), text: firstText.replace(/\[\[看一眼\]\]/g, '').trim() } };
@@ -420,7 +442,7 @@ export function createOrbApiService({
     } else {
       // 手动档 / 老配置（attachToChat）：每条消息都顺手拍一张给她看。
       if (cfg.screen.enabled === true && cfg.screen.attachToChat !== false) image = await shotForChat('chat', cfg);
-      result = await chat.chat({ text, modality: 'text', desktop, image, pics, allowPic });
+      result = await chat.chat({ text: say, modality: 'text', desktop, image, images: userImages, pics, allowPic });
     }
     if (!result.ok) return { ok: false, result };
 
@@ -456,7 +478,7 @@ export function createOrbApiService({
       while (chatQueue.length) {
         const job = chatQueue.shift();
         try {
-          const turn = await runChatTurn({ text: job.text, cfg: job.cfg });
+          const turn = await runChatTurn({ text: job.text, cfg: job.cfg, files: job.files || [] });
           if (!turn.ok) {
             const why = String(turn.result?.error || '未知原因').slice(0, 120);
             orb.addMessage({ who: 'her', kind: 'system', text: `（这条没回上来：${why}）` });
@@ -491,6 +513,7 @@ export function createOrbApiService({
 
   fs.mkdirSync(root, { recursive: true });
   fs.mkdirSync(shotDir, { recursive: true });
+  try { sweepInbox(path.join(picDir, 'inbox')); } catch {}
 
   function token() {
     try {
@@ -666,28 +689,114 @@ export function createOrbApiService({
     };
   }
 
-  function resolveIdent(cfg) {
-    const ident = (cfg.chat && cfg.chat.ident) || {};
+  const avatarDir = path.join(root, 'avatars');
+  const AVATAR_TTL_MS = 7 * 24 * 3600 * 1000;
+
+  /** 去掉首尾引号/空白：从资源管理器「复制文件地址」贴进来的是 "C:\\…\\a.jpg"。 */
+  function stripPath(value) {
+    return String(value ?? '').trim().replace(/^["']+/, '').replace(/["']+$/, '').trim();
+  }
+
+  /** 设置里填的身份 + 默认身份（昵称 / QQ 号 / 自定义头像文件）归一成一份。 */
+  function identOf(cfg) {
+    const raw = (cfg.chat && cfg.chat.ident) || {};
     let defs = {};
     try { defs = identDefaults() || {}; } catch {}
-    const herName = String(ident.herName || defs.herName || '').trim();
-    const meName = String(ident.meName || defs.meName || '').trim();
-    const herQQ = String(ident.herQQ || defs.herQQ || '').replace(/[^0-9]/g, '');
-    const meQQ = String(ident.meQQ || defs.meQQ || '').replace(/[^0-9]/g, '');
-    // 头像 URL 带一个版本号：设置一改，渲染端的 <img> 缓存自然失效。
-    const rev = `${herName}|${herQQ}|${ident.herPath || ''}|${meName}|${meQQ}|${ident.mePath || ''}`.length;
     return {
-      showAvatar: ident.showAvatar !== false,
-      showName: ident.showName !== false,
+      showAvatar: raw.showAvatar !== false,
+      showName: raw.showName !== false,
+      herName: String(raw.herName || defs.herName || '').trim(),
+      meName: String(raw.meName || defs.meName || '').trim(),
+      herQQ: String(raw.herQQ || defs.herQQ || '').replace(/[^0-9]/g, ''),
+      meQQ: String(raw.meQQ || defs.meQQ || '').replace(/[^0-9]/g, ''),
+      herPath: stripPath(raw.herPath),
+      mePath: stripPath(raw.mePath),
+    };
+  }
+
+  /**
+   * 本地文件 → file:/// URL。
+   * 悬浮窗页面是 `loadFile(index.html)`（file:// 源）打开的，所以 `/avatar?who=her` 这种
+   * 站内相对路径会被解析成 `file:///avatar?...`，永远 404——头像就只剩一个字母点。
+   */
+  function fileUrl(file) {
+    return `file:///${encodeURI(String(file).replace(/\\/g, '/'))}`;
+  }
+
+  /** 一个头像是谁：自定义文件优先，其次 QQ 号；两者一变，缓存的文件名就跟着变。 */
+  function avatarIdent(who, id) {
+    return who === 'me' ? { file: id.mePath, qq: id.meQQ } : { file: id.herPath, qq: id.herQQ };
+  }
+
+  function avatarCacheFor(who, mine) {
+    const hash = crypto.createHash('sha1').update(`${mine.file}\u0000${mine.qq}`).digest('hex').slice(0, 10);
+    return path.join(avatarDir, `${who}-${hash}.png`);
+  }
+
+  function avatarAge(file) {
+    try { return Date.now() - fs.statSync(file).mtimeMs; } catch { return Infinity; }
+  }
+
+  /** 同步拿一个能直接塞给 <img> 的 URL：自定义文件 > 本地缓存 > 兜底形象；都没有给空串。 */
+  function avatarUrlSync(who, id) {
+    const mine = avatarIdent(who, id);
+    if (mine.file && fs.existsSync(mine.file)) return fileUrl(mine.file);
+    const cached = avatarCacheFor(who, mine);
+    if (fs.existsSync(cached)) return fileUrl(cached);
+    if (!mine.qq && !mine.file) {
+      const fallback = fallbackAvatar();
+      if (fallback) return fileUrl(fallback);
+    }
+    return '';
+  }
+
+  const avatarPatching = new Set();
+
+  /** 后台把 QQ 头像拉下来（不卡 /state）；拉不下来就下一轮再试。 */
+  function ensureAvatar(who, id) {
+    const mine = avatarIdent(who, id);
+    if (mine.file && fs.existsSync(mine.file)) return;
+    if (!mine.qq) return;
+    const cached = avatarCacheFor(who, mine);
+    if (avatarAge(cached) < AVATAR_TTL_MS) return;
+    const lock = `${who}:${path.basename(cached)}`;
+    if (avatarPatching.has(lock)) return;
+    avatarPatching.add(lock);
+    void (async () => {
+      try {
+        const ok = await downloadAvatar(`https://q1.qlogo.cn/g?b=qq&nk=${mine.qq}&s=640`, cached);
+        if (ok) sweepAvatarCache(who, cached);
+      } finally {
+        avatarPatching.delete(lock);
+      }
+    })();
+  }
+
+  /** 同一个人的旧缓存（换过 QQ 号 / 清过缓存）顺手删掉，别越攒越多。 */
+  function sweepAvatarCache(who, keep) {
+    try {
+      for (const name of fs.readdirSync(avatarDir)) {
+        if (!name.startsWith(`${who}-`) || name === path.basename(keep)) continue;
+        if (!/\.(png|jpg|jpeg|webp|gif)$/i.test(name)) continue;
+        fs.rmSync(path.join(avatarDir, name), { force: true });
+      }
+    } catch {}
+  }
+
+  function resolveIdent(cfg) {
+    const id = identOf(cfg);
+    return {
+      showAvatar: id.showAvatar,
+      showName: id.showName,
       her: {
-        name: herName || '她',
-        qq: herQQ,
-        avatarUrl: ident.showAvatar === false ? '' : `/avatar?who=her&v=${rev}`,
+        name: id.herName || '她',
+        qq: id.herQQ,
+        avatarUrl: id.showAvatar ? avatarUrlSync('her', id) : '',
       },
       me: {
-        name: meName || '主人',
-        qq: meQQ,
-        avatarUrl: ident.showAvatar === false ? '' : `/avatar?who=me&v=${rev}`,
+        name: id.meName || '主人',
+        qq: id.meQQ,
+        avatarUrl: id.showAvatar ? avatarUrlSync('me', id) : '',
       },
     };
   }
@@ -722,32 +831,45 @@ export function createOrbApiService({
   }
 
   /**
-   * 头像落地成文件：自定义路径 → 本地缓存（7 天）→ QQ 头像（qlogo）→ 兜底形象。
+   * 头像落地成文件：自定义路径 → 本地缓存（按身份分文件名，7 天）→ QQ 头像（qlogo）→ 兜底形象。
    * 返回 { file, type }；都不行就 file:null，渲染端画个字母。
    */
   async function avatarResolve(who, cfg) {
-    const ident = (cfg.chat && cfg.chat.ident) || {};
-    const custom = String((who === 'me' ? ident.mePath : ident.herPath) || '').trim();
-    if (custom && fs.existsSync(custom)) return { file: custom, type: guessType(custom) };
+    const id = identOf(cfg);
+    const mine = avatarIdent(who, id);
+    if (mine.file && fs.existsSync(mine.file)) return { file: mine.file, type: guessType(mine.file) };
 
-    const cacheFile = path.join(root, 'avatars', `${who}.png`);
-    const ttl = 7 * 24 * 3600 * 1000;
-    try {
-      const st = fs.statSync(cacheFile);
-      if (Date.now() - st.mtimeMs < ttl) return { file: cacheFile, type: 'image/png' };
-    } catch {}
+    const cacheFile = avatarCacheFor(who, mine);
+    if (fs.existsSync(cacheFile) && avatarAge(cacheFile) < AVATAR_TTL_MS) return { file: cacheFile, type: 'image/png' };
 
-    const qq = String((who === 'me' ? ident.meQQ : ident.herQQ) || '').replace(/[^0-9]/g, '');
-    if (qq) {
-      const url = `https://q1.qlogo.cn/g?b=qq&nk=${qq}&s=640`;
-      if (await downloadAvatar(url, cacheFile)) return { file: cacheFile, type: 'image/png' };
+    if (mine.qq) {
+      const url = `https://q1.qlogo.cn/g?b=qq&nk=${mine.qq}&s=640`;
+      if (await downloadAvatar(url, cacheFile)) {
+        sweepAvatarCache(who, cacheFile);
+        return { file: cacheFile, type: 'image/png' };
+      }
     }
     const fallback = fallbackAvatar();
     return { file: fallback, type: 'image/png' };
   }
 
+  const companion = injectedCompanion || createOrbCompanionService({
+    orb,
+    chat,
+    look,
+    getConfig: () => orb.readConfig(),
+    log: (...args) => pluginLog('[companion]', ...args),
+    onMessage: typeof archiveMessage === 'function' ? archiveMessage : null,
+  });
+
   function stateForOrb() {
     const cfg = orb.readConfig();
+    // 头像在后台补：这里只做「已经把文件放好了没」的同步判断，拉 QQ 头像不卡 /state。
+    try {
+      const id = identOf(cfg);
+      ensureAvatar('her', id);
+      ensureAvatar('me', id);
+    } catch {}
     const msgs = orb.listMessages(60);
     const status = orb.status();
     let focus = false;
@@ -769,10 +891,12 @@ export function createOrbApiService({
       chat: {
         enabled: cfg.chat.enabled,
         llm: chat?.status?.().llm ?? null,
+        visionOk: visionOk !== false,
         // 排队状态：球上的「在想」和输入框的空闲收起都看这个。
         queue: { pending: chatQueue.length, busy: chatBusy },
       },
       purpose: { focus },
+      companion: companion.status(),
       // 已读水位：面板里看到第几条，收起后就不用再弹气泡了（跨重启记住）。
       read: { seenId: orb.readSeenId() },
       theme: (() => {
@@ -966,8 +1090,8 @@ export function createOrbApiService({
 
     if (req.method === 'POST' && suffix === '/chat') {
       let body = {};
-      try { body = JSON.parse((await readBody(req, ORB_BODY_LIMIT)) || '{}'); } catch {
-        json(res, 400, { ok: false, error: '请求体不是合法 JSON' });
+      try { body = JSON.parse((await readBody(req, CHAT_BODY_LIMIT)) || '{}'); } catch {
+        json(res, 400, { ok: false, error: '请求体不是合法 JSON（附件太大也会这样）' });
         return;
       }
       const cfg = orb.readConfig();
@@ -976,7 +1100,18 @@ export function createOrbApiService({
         return;
       }
       const text = String(body.text ?? '').trim();
-      if (!text) { json(res, 400, { ok: false, error: '说点什么吧' }); return; }
+      const rawFiles = Array.isArray(body.files) ? body.files : [];
+      if (!text && !rawFiles.length) { json(res, 400, { ok: false, error: '说点什么吧' }); return; }
+
+      // 附件先统一落盘/校验：任何一条不合格都整条拒绝，避免悄悄少附件。
+      const normalized = normalizeAttachments(rawFiles, {
+        mediaDir: picDir,
+        inboxDir: path.join(picDir, 'inbox'),
+      });
+      if (!normalized.ok) { json(res, 400, { ok: false, error: normalized.error }); return; }
+      const files = normalized.files;
+      const display = displayFiles(files, { mediaDir: picDir });
+      const say = text || '（只发了附件，没配文字）';
 
       // 排队模式：先把「我」这条写进去、立刻回 200，让她在后台一条条回。
       // 客户端把非 2xx 当失败，所以这里必须 200，不能 202。
@@ -985,16 +1120,16 @@ export function createOrbApiService({
           json(res, 429, { ok: false, error: `排队太多条了（最多 ${CHAT_QUEUE_MAX} 条），等前面几条回完再说` });
           return;
         }
-        orb.addMessage({ who: 'me', text, kind: 'chat' });
-        chatQueue.push({ text, cfg });
+        orb.addMessage({ who: 'me', text: say, kind: 'chat', files: display });
+        chatQueue.push({ text, cfg, files });
         const position = chatQueue.length + (chatBusy ? 1 : 0);
         void pumpChatQueue();
         json(res, 200, { ok: true, queued: true, position, state: stateForOrb() });
         return;
       }
 
-      orb.addMessage({ who: 'me', text, kind: 'chat' });
-      const turn = await runChatTurn({ text, cfg });
+      orb.addMessage({ who: 'me', text: say, kind: 'chat', files: display });
+      const turn = await runChatTurn({ text, cfg, files });
       if (!turn.ok) {
         json(res, 400, { ...turn.result, state: stateForOrb() });
         return;
@@ -1128,6 +1263,40 @@ export function createOrbApiService({
       json(res, result.ok ? 200 : 403, result);
       return;
     }
+    if (suffix === '/companion') {
+      if (req.method === 'GET') {
+        json(res, 200, { ok: true, companion: companion.status() });
+        return;
+      }
+      if (req.method === 'POST') {
+        let body = {};
+        try { body = JSON.parse((await readBody(req, ORB_BODY_LIMIT)) || '{}'); } catch {}
+        const action = String(body.action || 'status').trim().toLowerCase();
+        if (action === 'start') {
+          const result = await companion.start({ sessionId: body.sessionId });
+          json(res, result.ok ? 200 : 400, result);
+          return;
+        }
+        if (action === 'stop') {
+          json(res, 200, companion.stop('api'));
+          return;
+        }
+        if (action === 'reply') {
+          const result = await companion.reply(body.text);
+          json(res, result.ok ? 200 : 400, result);
+          return;
+        }
+        if (action === 'config') {
+          const patch = body.patch && typeof body.patch === 'object' && !Array.isArray(body.patch) ? body.patch : {};
+          const cur = orb.readConfig();
+          const next = orb.writeConfig({ ...cur, companion: { ...(cur.companion || {}), ...patch } });
+          json(res, 200, { ok: true, companion: companion.status(), config: next.companion });
+          return;
+        }
+        json(res, 200, { ok: true, companion: companion.status() });
+        return;
+      }
+    }
 
     json(res, 404, { ok: false, error: `未知悬浮窗接口：${suffix}` });
   }
@@ -1143,5 +1312,6 @@ export function createOrbApiService({
     look,
     stateForOrb,
     desktopContext,
+    companion,
   };
 }

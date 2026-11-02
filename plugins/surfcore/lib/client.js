@@ -1009,6 +1009,42 @@ F("sessionCwd", "会话工作目录", "留空用 surfcore 根目录", "text", { 
       ]},
     ];
 
+    // 「回复速度」独立成组：原版 / 快回复两套参数，互不读取。
+    const REPLY_FIELDS = [
+      { group: "回复速度（总开关）", note: "原版 = 现在的多步 agent 回合（上下文连续，但越聊越慢）；快回复 = 仿 QQ-agent：短合并窗 + 定期换会话，把上下文压在固定长度。两套参数各自独立，互不共用。保存后重启 QQ 桥接生效。", fields: [
+        F("socialV2.reply.mode", "用哪套", "legacy = 原版；fast = 快回复", "select", { options: [["legacy", "原版（现在这样）"], ["fast", "快回复"]] }),
+      ]},
+      { group: "原版回复（只在「用哪套 = 原版」时生效）", note: "默认值就是现在正在跑的行为；改这里不会影响快回复那套。", fields: [
+        F("socialV2.reply.legacy.batchWindowMs", "合并窗口（ms）", "默认 8000；这段时间内的连续消息会攒成一次唤醒", "number", { min: 100, max: 60000 }),
+        F("socialV2.reply.legacy.typingMinMs", "自然回复延迟 · 最小（ms）", "默认 2000；只影响原版旧社交模式的自然回复", "number", { min: 0, max: 60000 }),
+        F("socialV2.reply.legacy.typingMaxMs", "自然回复延迟 · 最大（ms）", "默认 8000", "number", { min: 0, max: 120000 }),
+        F("socialV2.reply.legacy.takeover", "忙时接管", "默认关：回合中来了新消息就等这一轮结束再补发（现在这样）", "switch"),
+        F("socialV2.reply.legacy.sessionRotate.enabled", "定期换会话", "默认关 = 原版行为：只有会话在 DSH 侧失效（重启/归档）才会换。开着则按下面的轮次定期换一个新的", "switch"),
+        F("socialV2.reply.legacy.sessionRotate.everyTurns", "每几轮换一次", "默认 8；按会话真实回合数算，老会话的历史轮次会在开桥接后第一次回合收尾时自动对齐", "number", { min: 1, max: 500 }),
+        F("socialV2.reply.legacy.sessionRotate.idleOnly", "只在空闲时换", "默认开：有未读/有待办就先不换，避免丢消息", "switch"),
+        F("socialV2.reply.legacy.sessionRotate.inheritTasks", "换会话时继承定时任务", "默认开：旧会话上挂的自动化任务会带到新会话（下一轮让她用 schedule_create 重建，桥接核对后删旧的）", "switch"),
+        F("socialV2.reply.legacy.sessionRotate.deleteOld", "换会话后删除旧会话", "默认关 = 只归档（还能「回到原会话」）；开 = 直接删掉，删了就回不去了", "switch"),
+        F("socialV2.reply.legacy.cleanup.enabled", "清理旧会话", "默认关：关掉就会话列表只增不减", "switch"),
+        F("socialV2.reply.legacy.cleanup.keep", "保留最近几个", "默认 50", "number", { min: 1, max: 500 }),
+        F("socialV2.reply.legacy.cleanup.days", "超过几天就删", "默认 7 天", "number", { min: 1, max: 365 }),
+      ]},
+      { group: "快回复（只在「用哪套 = 快回复」时生效）", note: "默认值：0.8 秒合并窗、每 8 轮换一次会话、忙时接管。换会话会留下旧会话，所以顺带开着清理。", fields: [
+        F("socialV2.reply.fast.batchWindowMs", "合并窗口（ms）", "默认 800；越小越像真人秒回，但连发的话会被拆成多次唤醒", "number", { min: 100, max: 60000 }),
+        F("socialV2.reply.fast.typingMinMs", "起手停顿 · 最小（ms）", "默认 150；唤醒后先停一下再开始这一轮", "number", { min: 0, max: 60000 }),
+        F("socialV2.reply.fast.typingMaxMs", "起手停顿 · 最大（ms）", "默认 500", "number", { min: 0, max: 120000 }),
+        F("socialV2.reply.fast.takeover", "忙时接管", "默认开：回合进行中来了新消息，这一轮结束后立刻补，而不是等合并窗再叠一次", "switch"),
+        F("socialV2.reply.fast.sessionRotate.enabled", "定期换会话", "默认开：每 N 轮换一个干净会话（上下文清零，但未读水位/引导标记保留）", "switch"),
+        F("socialV2.reply.fast.sessionRotate.everyTurns", "每几轮换一次", "默认 8；按会话真实回合数算（不是从开功能那天算），太小会频繁丢上下文，太大会重新变慢", "number", { min: 1, max: 500 }),
+        F("socialV2.reply.fast.sessionRotate.idleOnly", "只在空闲时换", "默认开", "switch"),
+        F("socialV2.reply.fast.sessionRotate.inheritTasks", "换会话时继承定时任务", "默认开：旧会话上挂的自动化任务会带到新会话（下一轮让她用 schedule_create 重建，桥接核对后删旧的）", "switch"),
+        F("socialV2.reply.fast.sessionRotate.deleteOld", "换会话后删除旧会话", "默认关 = 只归档（还能「回到原会话」）；开 = 直接删掉，删了就回不去了", "switch"),
+        F("socialV2.reply.fast.cleanup.enabled", "清理旧会话", "默认开：换会话会留下旧会话，不清就会会话列表爆炸", "switch"),
+        F("socialV2.reply.fast.cleanup.keep", "保留最近几个", "默认 50", "number", { min: 1, max: 500 }),
+        F("socialV2.reply.fast.cleanup.days", "超过几天就删", "默认 7 天", "number", { min: 1, max: 365 }),
+      ]},
+    ];
+
+
     const TOOL_LABELS = {
       getPrompt: "读取提示词", getUnread: "读未读", getRecent: "读最近", socialState: "社交状态",
       sendGroup: "发群消息", sendPrivate: "发私聊", reply: "引用回复", sendBurst: "分条发送",
@@ -2050,6 +2086,7 @@ F("toolsPath", "bili.mjs 路径", "留空 = 用合体插件自带的 tools/", "t
     function DiaryTab({ qq, set, busy, setBusy, toast, reload }) {
       const [status, setStatus] = useState({ loading: true, data: null, error: "" });
       const [dirOpen, setDirOpen] = useState(false);
+      const [dirOpen2, setDirOpen2] = useState(false);
       const load = async () => {
         setStatus((s) => ({ ...s, loading: true }));
         try {
@@ -2063,13 +2100,21 @@ F("toolsPath", "bili.mjs 路径", "留空 = 用合体插件自带的 tools/", "t
       const base = ["socialV2", "diary"];
       const d = qq?.socialV2?.diary ?? {};
       const send = d.send ?? {};
+      const pub = d.public ?? {};
       const fmt = (ts) => ts ? new Date(ts).toLocaleString("zh-CN", { hour12: false }) : "还没";
       const st = status.data?.diary ?? {};
+      const pubSt = status.data?.publicDiary ?? {};
       const run = async (action) => {
         setBusy(`diary-${action}`);
         try {
           const r = await api("/socialV2/diary", { method: "POST", body: { action, force: true } });
-          toast(r.ok ? `✓ ${action === "write" ? "日记已写入" : "已发送给主人"}${r.file ? "：" + r.file : ""}` : `✗ ${r.error ?? "失败"}`);
+          const label = action === "write" ? "私密日记已写入"
+            : action === "send" ? "已发送给主人"
+            : action === "write-public" ? "公开日记已写入"
+            : action === "send-public" ? "已发到 QQ 空间" : action;
+          const extra = r.blocked ? "（有敏感内容，只存档没发空间）"
+            : r.queued ? `（先存着：${r.reason ?? "等下次补发"}）` : "";
+          toast(r.ok ? `✓ ${label}${extra}${r.file ? "：" + r.file : ""}` : `✗ ${r.error ?? "失败"}`);
           await load();
           if (r.ok && reload) await reload();
         } catch (e) { toast(`✗ ${e.message}`); } finally { setBusy(""); }
@@ -2084,19 +2129,21 @@ F("toolsPath", "bili.mjs 路径", "留空 = 用合体插件自带的 tools/", "t
       ].filter(Boolean).join(" · ");
       return h("div", null,
         h("div", { className: "qbw-infobox", style: { marginBottom: "10px" } },
-          "日记保存在本地；勾选发送后只私聊 config.json 里的主人 QQ（admin.qq / ownerQQ），没有第二个收件人，也不会发群。",
+          "两本日记分开存、分开发：私密日记只私聊 config.json 里的主人 QQ（admin.qq / ownerQQ）；公开日记会发到你的 QQ 空间，发之前会过一遍清洗。",
           "关机错过的写作/发送会在下次启动后补一次；改完点底部「保存」，约 1 分钟生效。"),
         h(Section, {
-          title: "日记",
-          note: "默认每 1 天写一篇；可自定义目录；可只发主人。",
+          title: "私密日记 · 只发主人",
+          note: "写给主人看的，可以写真实的人和事（密码/转账仍不写）。",
           collapsible: false,
         },
           h(Row, { label: "启用日记", hint: "关 = 不自动写；手动「立即写日记」仍然可用" },
             h("input", { type: "checkbox", className: "qbw-switch", checked: d.enabled === true, onChange: (e) => set([...base, "enabled"], e.target.checked) })),
-          h(Row, { label: "保存目录", hint: "留空 = <DSH_HOME>\\surfcore\\diary\\<角色ID>.md；选目录后存 <角色ID>.md" },
+          h(Row, { label: "保存目录", hint: "存放所有日记的文件夹；里面按人物分子文件夹，文件名是时间" },
             h("div", { style: { display: "flex", gap: "6px", alignItems: "center", flexWrap: "wrap" } },
               h("input", { className: "qbw-input", type: "text", value: d.dir ?? "", placeholder: "留空用默认目录", style: { minWidth: "240px" }, onChange: (e) => set([...base, "dir"], e.target.value) }),
               h(Btn, { kind: "qbw-btn2", onClick: () => setDirOpen(true) }, "浏览…"))),
+          h(Row, { label: "每几篇一个文件", hint: "1 = 一篇一个文件（文件名是那篇的时间）；5 = 五篇一个文件（文件名是起止时间），第 6 篇另起新文件" },
+            h("input", { className: "qbw-input", type: "number", min: 1, max: 50, value: d.perFile ?? 1, onChange: (e) => set([...base, "perFile"], Number(e.target.value)) })),
           h(Row, { label: "写作间隔（天）", hint: "默认 1 天；关机错过的下次启动补一次" },
             h("input", { className: "qbw-input", type: "number", min: 1, max: 30, value: d.everyDays ?? 1, onChange: (e) => set([...base, "everyDays"], Number(e.target.value)) })),
           h(Row, { label: "写作时间（0-23）", hint: "每天几点后写" },
@@ -2113,9 +2160,70 @@ F("toolsPath", "bili.mjs 路径", "留空 = 用合体插件自带的 tools/", "t
             h(Btn, { kind: "qbw-btn2", disabled: !!busy, onClick: () => run("write") }, busy === "diary-write" ? "生成中…" : "立即写日记"),
             h(Btn, { kind: "qbw-btn2", disabled: !!busy, onClick: () => run("send") }, "立即发送给主人"),
             h(Btn, { kind: "qbw-btn2", onClick: load }, "刷新")),
-          h(Row, { label: "最近日记", hint: "只读预览" },
-            h("pre", { style: { whiteSpace: "pre-wrap", maxHeight: "220px", overflow: "auto", margin: 0, fontSize: "12px" } },
-              status.data?.preview || (status.loading ? "读取中…" : "（还没有日记）")))),
+          h(Row, { label: "最近日记", hint: "最近 5 篇（只读）" },
+            h("div", { style: { display: "flex", flexDirection: "column", gap: "8px", width: "100%" } },
+              (status.data?.recent ?? []).length === 0
+                ? h("div", { className: "qbw-hint" }, status.loading ? "读取中…" : "（还没有日记）")
+                : (status.data?.recent ?? []).map((e, i) => h("div", {
+                    key: `${e.file}#${i}`,
+                    style: { border: "1px solid rgba(128,128,128,0.25)", borderRadius: "6px", padding: "8px" },
+                  },
+                    h("div", { className: "qbw-hint", style: { marginBottom: "4px" } },
+                      `第 ${i + 1} 篇 · ${e.label} · ${e.name} · ${e.chars} 字`),
+                    h("pre", { style: { whiteSpace: "pre-wrap", maxHeight: "180px", overflow: "auto", margin: 0, fontSize: "12px" } }, e.text)))))),
+        h(Section, {
+          title: "公开日记 · 发到 QQ 空间",
+          note: "给外人看的：人名可以留，钱、账号、证件、联系方式一律不写。",
+          collapsible: false,
+        },
+          h(Row, { label: "启用公开日记", hint: "关 = 不自动写公开日记；手动「立即写公开日记」仍可用" },
+            h("input", { type: "checkbox", className: "qbw-switch", checked: pub.enabled === true, onChange: (e) => set([...base, "public", "enabled"], e.target.checked) })),
+          h(Row, { label: "保存目录", hint: "公开日记单独存放，留空用 <DSH_HOME>\\surfcore\\diary-public" },
+            h("div", { style: { display: "flex", gap: "6px", alignItems: "center", flexWrap: "wrap" } },
+              h("input", { className: "qbw-input", type: "text", value: pub.dir ?? "", placeholder: "留空用默认目录", style: { minWidth: "240px" }, onChange: (e) => set([...base, "public", "dir"], e.target.value) }),
+              h(Btn, { kind: "qbw-btn2", onClick: () => setDirOpen2(true) }, "浏览…"))),
+          h(Row, { label: "每几篇一个文件", hint: "规则同私密日记：1 = 一篇一文件；5 = 五篇一文件，第 6 篇新建" },
+            h("input", { className: "qbw-input", type: "number", min: 1, max: 50, value: pub.perFile ?? 1, onChange: (e) => set([...base, "public", "perFile"], Number(e.target.value)) })),
+          h(Row, { label: "写作间隔（天）", hint: "默认 1 天" },
+            h("input", { className: "qbw-input", type: "number", min: 1, max: 30, value: pub.everyDays ?? 1, onChange: (e) => set([...base, "public", "everyDays"], Number(e.target.value)) })),
+          h(Row, { label: "写作时间（0-23）", hint: "每天几点后写" },
+            h("input", { className: "qbw-input", type: "number", min: 0, max: 23, value: pub.hour ?? 22, onChange: (e) => set([...base, "public", "hour"], Number(e.target.value)) })),
+          h(Row, { label: "单篇字数上限", hint: "200~2000，空间动态别太长" },
+            h("input", { className: "qbw-input", type: "number", min: 200, max: 2000, step: 100, value: pub.maxChars ?? 600, onChange: (e) => set([...base, "public", "maxChars"], Number(e.target.value)) })),
+          h(Row, { label: "可见范围", hint: "发到空间时谁能看到" },
+            h("select", { className: "qbw-input", value: String(pub.visibility ?? 4), onChange: (e) => set([...base, "public", "visibility"], Number(e.target.value)) },
+              h("option", { value: "1" }, "所有人可见"),
+              h("option", { value: "4" }, "好友可见"),
+              h("option", { value: "64" }, "仅自己可见"))),
+          h(Row, { label: "每天最多发几条", hint: "0 = 不限；超了先存档，第二天补发" },
+            h("input", { className: "qbw-input", type: "number", min: 0, max: 10, value: pub.maxPerDay ?? 1, onChange: (e) => set([...base, "public", "maxPerDay"], Number(e.target.value)) })),
+          h(Row, { label: "允许写别人名字", hint: "关 = 一律用「有人」指代；开 = 可以写群里谁说了什么" },
+            h("input", { type: "checkbox", className: "qbw-switch", checked: pub.allowNames !== false, onChange: (e) => set([...base, "public", "allowNames"], e.target.checked) })),
+          h(Row, { label: "状态", hint: pubSt.file || "" },
+            h("div", { className: "qbw-hint" }, [
+              `上次写作：${fmt(pubSt.lastWriteAt)}`,
+              `上次发空间：${fmt(pubSt.lastPublishAt)}`,
+              pubSt.lastTid ? `tid ${pubSt.lastTid}` : "",
+              `今天已发 ${pubSt.publishedToday ?? 0} 条`,
+              pubSt.pending ? "有 1 篇待补发（QQ 上线 / 额度恢复后自动发）" : "",
+              pubSt.blockedReason ? `上次被拦：${pubSt.blockedReason}` : "",
+              pubSt.lastError ? `错误：${pubSt.lastError}` : "",
+            ].filter(Boolean).join(" · ") || "读取中…")),
+          h("div", { className: "qbw-actions", style: { borderTop: "none", marginTop: "6px", paddingTop: "0" } },
+            h(Btn, { kind: "qbw-btn2", disabled: !!busy, onClick: () => run("write-public") }, busy === "diary-write-public" ? "生成中…" : "立即写公开日记"),
+            h(Btn, { kind: "qbw-btn2", disabled: !!busy, onClick: () => run("send-public") }, "立即发到空间"),
+            h(Btn, { kind: "qbw-btn2", onClick: load }, "刷新")),
+          h(Row, { label: "最近公开日记", hint: "最近 5 篇（只读）" },
+            h("div", { style: { display: "flex", flexDirection: "column", gap: "8px", width: "100%" } },
+              (pubSt.recent ?? []).length === 0
+                ? h("div", { className: "qbw-hint" }, status.loading ? "读取中…" : "（还没有公开日记）")
+                : (pubSt.recent ?? []).map((e, i) => h("div", {
+                    key: `${e.file}#${i}`,
+                    style: { border: "1px solid rgba(128,128,128,0.25)", borderRadius: "6px", padding: "8px" },
+                  },
+                    h("div", { className: "qbw-hint", style: { marginBottom: "4px" } },
+                      `第 ${i + 1} 篇 · ${e.label} · ${e.name} · ${e.chars} 字`),
+                    h("pre", { style: { whiteSpace: "pre-wrap", maxHeight: "180px", overflow: "auto", margin: 0, fontSize: "12px" } }, e.text)))))),
         h(DirPicker, {
           open: dirOpen,
           value: d.dir ?? "",
@@ -2126,10 +2234,123 @@ F("toolsPath", "bili.mjs 路径", "留空 = 用合体插件自带的 tools/", "t
             setDirOpen(false);
             toast(`✓ 已选择目录：${picked}（点底部「保存」生效）`);
           },
-        }));
+        }),
+        h(DirPicker, {
+          open: dirOpen2,
+          value: pub.dir ?? "",
+          title: "选择公开日记保存目录",
+          onClose: () => setDirOpen2(false),
+          onPick: (picked) => {
+            set([...base, "public", "dir"], picked);
+            setDirOpen2(false);
+            toast(`✓ 已选择公开日记目录：${picked}（点底部「保存」生效）`);
+          },        }));
     }
 
     // ── QQ 标签页 ───────────────────────────────────────────────────────────
+    // 好友申请（2026-11-01）：两个开关 + 待处理列表。
+    // 网关没有「主动加好友」的动作，所以这里做的是「别人来加我们」这一侧：
+    // 第一个开关管「AI 能不能拍板通过」，第二个管「要不要自动通过（白名单 + 配额内）」。
+    function FriendCard({ toast }) {
+      const [state, setState] = useState(null);
+      const [busy, setBusy] = useState("");
+      const load = useCallback(async () => {
+        try {
+          const r = await api("/socialV2/friend-requests", { method: "GET" });
+          if (r && r.ok !== false) setState(r);
+        } catch (e) { /* 桥接没起时静默，别在页面上刷红字 */ }
+      }, []);
+      useEffect(() => {
+        load();
+        // 申请是异步来的（靠事件推送），20 秒刷一次够用，不折腾。
+        const timer = setInterval(load, 20000);
+        return () => clearInterval(timer);
+      }, [load]);
+
+      const conf = state?.config ?? {};
+      const pending = Array.isArray(state?.pending) ? state.pending : [];
+
+      const save = async (patch) => {
+        setBusy("save");
+        try {
+          const next = { ...conf, ...patch };
+          const r = await api("/socialV2/friend-config", { method: "POST", body: { config: next } });
+          if (r?.ok === false) throw new Error(r.error ?? "保存失败");
+          toast("✓ 好友申请设置已保存");
+          await load();
+        } catch (e) { toast(`✗ ${e.message}`); } finally { setBusy(""); }
+      };
+
+      const decide = async (item, approve) => {
+        setBusy(`decide-${item.qq}`);
+        try {
+          const r = await api("/socialV2/friend-decide", {
+            method: "POST",
+            body: { flag: item.flag, qq: item.qq, approve, reason: approve ? "页面手动通过" : "页面手动拒绝" }
+          });
+          if (r?.ok === false) throw new Error(r.error ?? "处理失败");
+          toast(approve ? `✓ 已通过 ${item.qq}` : `✓ 已拒绝 ${item.qq}`);
+          await load();
+        } catch (e) { toast(`✗ ${e.message}`); } finally { setBusy(""); }
+      };
+
+      const row = (label, hint, control) => h("div", { className: "qbw-row" },
+        h("div", { className: "qbw-row-label" }, label, hint ? h("div", { className: "qbw-hint" }, hint) : null),
+        h("div", { className: "qbw-row-control" }, control));
+
+      return h("div", { className: "qbw-card", style: { marginBottom: "10px" } },
+        h("h4", null, "好友申请"),
+        h("p", { className: "qbw-hint" },
+          "只处理「别人来加我们」的申请：网关卡没有主动加好友的动作（add_friend 一律 unknown action）。",
+          "只有白名单私聊对象、或白名单群里的人可以通过；范围外的自动拒绝。"),
+        row("允许 AI 拍板加好友", "关 = 申请只通知你、不出现在 AI 的工具面", h("input", {
+          type: "checkbox", checked: conf.enabled === true,
+          onChange: (e) => save({ enabled: e.target.checked })
+        })),
+        row("自动通过", "开 = 白名单范围内且没超配额就直接通过，不等 AI；关 = 叫醒 AI 让它自己决定", h("input", {
+          type: "checkbox", checked: conf.autoApprove === true, disabled: conf.enabled !== true,
+          onChange: (e) => save({ autoApprove: e.target.checked })
+        })),
+        row("只允许白名单范围内的人", "关掉会变成「谁都能加」，不建议", h("input", {
+          type: "checkbox", checked: conf.requireWhitelisted !== false, disabled: conf.enabled !== true,
+          onChange: (e) => save({ requireWhitelisted: e.target.checked })
+        })),
+        row("通过后自动改备注", "把备注设成对方昵称，方便在好友列表里认人", h("input", {
+          type: "checkbox", checked: conf.autoRemark !== false, disabled: conf.enabled !== true,
+          onChange: (e) => save({ autoRemark: e.target.checked })
+        })),
+        row("每小时最多通过", "0 = 不限", h("input", {
+          className: "qbw-input", type: "number", min: 0, value: conf.maxPerHour ?? 3,
+          onChange: (e) => save({ maxPerHour: Number(e.target.value) })
+        })),
+        row("每天最多通过", "0 = 不限", h("input", {
+          className: "qbw-input", type: "number", min: 0, value: conf.maxPerDay ?? 5,
+          onChange: (e) => save({ maxPerDay: Number(e.target.value) })
+        })),
+        row("拒绝后冷却（天）", "拒绝过的人这段时间内再申请也直接拒", h("input", {
+          className: "qbw-input", type: "number", min: 0, value: conf.rejectCooldownDays ?? 7,
+          onChange: (e) => save({ rejectCooldownDays: Number(e.target.value) })
+        })),
+        h("div", { style: { marginTop: "10px" } },
+          h("div", { className: "qbw-hint" },
+            `待处理 ${pending.length} 个 · 今天已通过 ${state?.counters?.dayCount ?? 0} 个 · 这一小时 ${state?.counters?.hourCount ?? 0} 个`),
+          pending.length ? pending.slice(0, 10).map((item) => h("div", {
+            key: item.id || item.qq,
+            style: { display: "flex", gap: "8px", alignItems: "center", padding: "6px 0", borderTop: "1px solid rgba(255,255,255,0.06)" }
+          },
+            h("div", { style: { flex: "1 1 auto", minWidth: 0 } },
+              h("div", null, `${item.nickname || item.qq}（${item.qq}）`),
+              h("div", { className: "qbw-hint" },
+                [item.comment ? `留言：${item.comment}` : "",
+                 item.scope?.reason ? `范围：${item.scope.reason}` : "",
+                 item.verdict?.allow ? "结论：可加" : `结论：${item.verdict?.reason ?? "拒绝"}`].filter(Boolean).join(" · "))),
+            h(Btn, { kind: "qbw-btn", disabled: busy === `decide-${item.qq}` || item.verdict?.allow === false, onClick: () => decide(item, true) }, "通过"),
+            h(Btn, { kind: "qbw-btn2", disabled: busy === `decide-${item.qq}`, onClick: () => decide(item, false) }, "拒绝")
+          )) : h("p", { className: "qbw-hint" }, "暂时没有待处理的好友申请。")
+        )
+      );
+    }
+
     function QQTab({ cfg, set, admin, setAdmin, unified, setUnified, overview, busy, setBusy, toast, reload, goTab }) {
       const [query, setQuery] = useState("");
       const tools = Object.keys(cfg?.socialV2?.tools ?? {});
@@ -2190,6 +2411,7 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
           onAllowChange: (key, list) => set(["allow", key], list),
           onAllowAllChange: (value) => set(["allowAllWhenEmpty"], value),
         }),
+        h(FriendCard, { toast }),
         h(BlacklistCard, {
           deny: cfg?.deny ?? {},
           ownerQQ: admin?.qq || cfg?.ownerQQ || overview?.mode?.ownerQQ || "",
@@ -3188,7 +3410,9 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
           h(Row, { label: "容量告警私聊管理员", hint: "80/90/100% 时私聊 ownerQQ；同一档 12 小时只发一次" },
             h("input", { className: "qbw-switch", type: "checkbox", checked: config.notifyOwner !== false, onChange: (e) => setConfig("notifyOwner", e.target.checked) })),
           h(Row, { label: "B站 提示词带 QQ 记忆", hint: "默认关：QQ 的私事不跨平台（隐私红线）" },
-            h("input", { className: "qbw-switch", type: "checkbox", checked: config.includeQqInBili === true, onChange: (e) => setConfig("includeQqInBili", e.target.checked) }))),
+            h("input", { className: "qbw-switch", type: "checkbox", checked: config.includeQqInBili === true, onChange: (e) => setConfig("includeQqInBili", e.target.checked) })),
+          h(Row, { label: "B站 提示词带桌宠 / 悬浮窗记忆", hint: "默认开（三项互通）：B站 只带「她自己主动说的、跟看屏幕无关的」经历，最多 3 条。你和她的私聊记录、她看屏幕时说的话，一条都不会进 B站；记录里沾到联系方式、住址、单位学校、钱、健康、感情也整条筛掉。关掉则 B站 只看 B站 和共享记忆。", badge: config.includePetInBili !== false ? "开" : "关" },
+            h("input", { className: "qbw-switch", type: "checkbox", checked: config.includePetInBili !== false, onChange: (e) => setConfig("includePetInBili", e.target.checked) }))),
         h(Section, { title: "最近记忆", note: `${data.records?.length ?? 0} 条（按重要度）`, collapsible: false },
           h("div", { className: "qbw-infobox" },
             h("b", null, "初次相遇："),
@@ -4530,13 +4754,17 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
       // 开关/目录是草稿，随底部「保存」写入 config.json；状态与手动执行走桥接接口。
       const backupRaw = cfg.socialV2?.memoryCardBackup ?? {};
       const backupSendRaw = backupRaw.send ?? {};
+      const backupArchiveRaw = backupRaw.archive ?? {};
       const backupCfg = {
         enabled: backupRaw.enabled === true,
         dir: String(backupRaw.dir ?? ""),
         syncEveryDays: Number(backupRaw.syncEveryDays) > 0 ? Math.min(365, Math.max(1, Math.round(Number(backupRaw.syncEveryDays)))) : 1,
         sendEnabled: backupSendRaw.enabled === true,
+        fullArchive: backupSendRaw.fullArchive !== false,
         sendEveryDays: Number(backupSendRaw.everyDays) > 0 ? Math.min(365, Math.max(1, Math.round(Number(backupSendRaw.everyDays)))) : 7,
         maxSendMB: Number(backupSendRaw.maxSendMB) > 0 ? Math.min(100, Math.max(1, Math.round(Number(backupSendRaw.maxSendMB)))) : 90,
+        archiveEnabled: backupArchiveRaw.enabled !== false,
+        archiveMaxFileMB: Number(backupArchiveRaw.maxFileMB) > 0 ? Math.min(512, Math.max(1, Math.round(Number(backupArchiveRaw.maxFileMB)))) : 16,
       };
       const [backupStatus, setBackupStatus] = useState({ loading: true, data: null, error: "" });
       const [backupBusy, setBackupBusy] = useState("");
@@ -4564,6 +4792,12 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
         : backupStatus.error
           ? `不可用：${backupStatus.error}`
           : `上次备份：${backupTime(backupState.lastBackupAt)} · 上次发送：${backupTime(backupState.lastSendAt)} · QQ：${backupData?.qqReady ? "在线" : "未连接"}`;
+      const archiveData = backupData?.archive ?? {};
+      const archiveLine = backupStatus.loading
+        ? "聊天存档：读取中…"
+        : backupStatus.error
+          ? "聊天存档：不可用"
+          : `聊天存档：私聊 ${archiveData.private?.files ?? 0} 个（含桌宠/字幕）/ 群聊 ${archiveData.group?.files ?? 0} 个 · 共 ${backupSize(archiveData.totalBytes)} · 单文件上限 ${archiveData.maxFileMB ?? backupCfg.archiveMaxFileMB} MB · 发送模式：${backupCfg.fullArchive ? '全部' : '仅新增'}`;
       const runBackupAction = async (action) => {
         if (backupBusy) return;
         setBackupBusy(action);
@@ -4663,7 +4897,7 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
             h("button", { className: "qbw-btn", type: "button", onClick: loadMemStatus }, "刷新")),
           h("div", { className: "qbw-hint" }, memStatusText),
           h("div", { className: "qbw-hint" }, "记忆卡固定整卡注入；改完点底部「保存」写入 config.json，再点「保存并重启 QQ 桥接」才生效。")),
-        h(Section, { title: "全量记忆卡备份（本地 + QQ）", collapsible: false, hidden: activePage !== "memory", note: "把当前角色的全量卡镜像到指定目录；按间隔同步，也可以私聊发给自己。发送只认 config.json 里的主人 QQ，不发群" },
+        h(Section, { title: "全量记忆卡 + 聊天存档（本地 + QQ）", collapsible: false, hidden: activePage !== "memory", note: "全量卡镜像 + 每条聊天原文（QQ 私聊/群聊 + 桌宠/字幕，按 channel 区分、同目录分文件）。存档不压缩、不删除，单文件满上限自动换新文件；发送只认 config.json 里的主人 QQ，不发群" },
           h(Row, { label: "启用备份", hint: "开 = 按间隔自动把全量卡镜像到备份目录；关 = 只保留手动备份" },
             h("input", { className: "qbw-switch", type: "checkbox", checked: backupCfg.enabled, onChange: (e) => set(p("socialV2.memoryCardBackup.enabled"), e.target.checked) })),
           h(Row, { label: "备份目录", hint: backupCfg.dir ? "当前草稿路径；留空 = 用默认目录" : "留空 = 用默认目录（路径由桥接按当前角色算）" },
@@ -4685,16 +4919,23 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
             h("input", { className: "qbw-input", type: "number", min: 1, max: 365, value: backupCfg.syncEveryDays, onChange: (e) => set(p("socialV2.memoryCardBackup.syncEveryDays"), Math.min(365, Math.max(1, Math.round(Number(e.target.value) || 1)))) })),
           h(Row, { label: "发送到主人 QQ", hint: "开 = 按间隔把全量卡私聊给主人；只发给 admin.qq / ownerQQ，不发群" },
             h("input", { className: "qbw-switch", type: "checkbox", checked: backupCfg.sendEnabled, onChange: (e) => set(p("socialV2.memoryCardBackup.send.enabled"), e.target.checked) })),
+          h(Row, { label: "每次发送全部记忆文件", hint: "开 = 每次把全量卡 + 全部聊天存档都发给主人；关 = 只发新增/追加的存档（全量卡仍每次发）" },
+            h("input", { className: "qbw-switch", type: "checkbox", checked: backupCfg.fullArchive, onChange: (e) => set(p("socialV2.memoryCardBackup.send.fullArchive"), e.target.checked) })),
           h(Row, { label: "发送间隔（天）", hint: "默认 7 天；QQ 不在线不算失败，上线后自动补发" },
             h("input", { className: "qbw-input", type: "number", min: 1, max: 365, value: backupCfg.sendEveryDays, onChange: (e) => set(p("socialV2.memoryCardBackup.send.everyDays"), Math.min(365, Math.max(1, Math.round(Number(e.target.value) || 7)))) })),
-          h(Row, { label: "单次发送上限（MB）", hint: "超过上限的文件不发送（不会偷偷压缩），默认 90" },
+          h(Row, { label: "单次发送上限（MB）", hint: "超过上限的单个文件不发送（不会偷偷压缩），默认 90" },
             h("input", { className: "qbw-input", type: "number", min: 1, max: 100, value: backupCfg.maxSendMB, onChange: (e) => set(p("socialV2.memoryCardBackup.send.maxSendMB"), Math.min(100, Math.max(1, Math.round(Number(e.target.value) || 90)))) })),
-          h(Row, { label: "立即执行", hint: "手动执行不受开关限制；备份读源文件，发送直接发当前全量卡" },
+          h(Row, { label: "启用聊天全量存档", hint: "开 = 每条私聊/群聊原文都写到备份目录；关 = 只保留全量卡镜像。默认开" },
+            h("input", { className: "qbw-switch", type: "checkbox", checked: backupCfg.archiveEnabled, onChange: (e) => set(p("socialV2.memoryCardBackup.archive.enabled"), e.target.checked) })),
+          h(Row, { label: "聊天单文件上限（MB）", hint: `当前 ${backupCfg.archiveMaxFileMB}；一个文件写到上限就新建下一个，不压缩、不删除（1~512）` },
+            h("input", { className: "qbw-input", type: "number", min: 1, max: 512, value: backupCfg.archiveMaxFileMB, onChange: (e) => set(p("socialV2.memoryCardBackup.archive.maxFileMB"), Math.min(512, Math.max(1, Math.round(Number(e.target.value) || 16)))) })),
+          h(Row, { label: "立即执行", hint: `手动执行不受开关限制；备份读源文件，发送 = 全量卡 + ${backupCfg.fullArchive ? "全部" : "未发送的"}聊天存档` },
             h("div", { style: { display: "flex", gap: "8px", flexWrap: "wrap" } },
               h("button", { className: "qbw-btn2", type: "button", disabled: Boolean(backupBusy), onClick: () => runBackupAction("backup") }, backupBusy === "backup" ? "备份中…" : "立即备份"),
               h("button", { className: "qbw-btn2", type: "button", disabled: Boolean(backupBusy), onClick: () => runBackupAction("send") }, backupBusy === "send" ? "发送中…" : "立即发送"),
               h("button", { className: "qbw-btn", type: "button", onClick: loadBackupStatus }, "刷新"))),
           h("div", { className: "qbw-hint" }, backupLine),
+          h("div", { className: "qbw-hint" }, archiveLine),
           h("div", { className: "qbw-hint" }, `备份目录：${backupData?.dir || "尚未生成（保存后由桥接计算）"}${backupState.lastBackupError ? ` · 上次备份失败：${backupState.lastBackupError}` : ""}${backupState.lastSendError ? ` · 发送状态：${backupState.lastSendError}` : ""}`),
           h("div", { className: "qbw-hint" }, "开关和间隔改完点底部「保存」写入 config.json；备份设置约 1 分钟内生效，不需要重启桥接。")),
         h(Section, { title: "声线（群聊/私聊同一个人）", collapsible: false, hidden: activePage !== "voice", note: "每轮唤醒都带「人设锚 + 你自己说过的原话」，群聊再多一条私下节奏；不再只靠记忆撑人设" },
@@ -5606,9 +5847,11 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
       const chatCfg = draft.chat || {};
       const identCfg = chatCfg.ident || {};
       const screenCfg = draft.screen || {};
+      const compCfg = draft.companion || {};
       // 运行态（含 model visionOk），配置态在上面 draft.screen
       const screenState = st?.screen || {};
-    const screenMode = screenState.mode || (screenState.enabled === true ? "manual" : "off");
+    // 下拉框必须跟草稿走：跟运行态走的话，set() 只改草稿，受控 select 会立刻弹回旧值。
+    const screenMode = draft.screen?.mode || (draft.screen?.enabled === true ? "manual" : "off");
     const picCfg = st?.config?.pic || {};
       const petCfg = draft.pet || {};
       const petState = st?.pet || null;
@@ -5751,6 +5994,21 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
             (shot.windows || []).slice(0, 5).map((w, i) => h("div", { className: "qbw-hint", key: i }, "· " + (w.title || "").slice(0, 70))))
             : null),
 
+        h(Section, { title: "陪伴模式（一起看电影）", defaultOpen: false, note: "右键桌宠 → 陪伴 → 开启；桌宠会隐藏，屏幕底部出现字幕条。关闭也在右键菜单或托盘里。" },
+          h(Row, { label: "多久看一眼", hint: "画面没变化会自动跳过，不花模型钱；默认 60 秒。", badge: `${compCfg.intervalSec ?? 60} 秒` },
+            h("input", { className: "qbw-input", type: "number", min: 20, max: 180, value: compCfg.intervalSec ?? 60, style: { maxWidth: "110px" }, onChange: (e) => set("companion.intervalSec", Number(e.target.value)) })),
+          h(Row, { label: "每小时最多说几句", hint: "硬上限，防止看电影时一直调用模型。", badge: `${compCfg.maxCommentsPerHour ?? 12} 句` },
+            h("input", { className: "qbw-input", type: "number", min: 1, max: 30, value: compCfg.maxCommentsPerHour ?? 12, style: { maxWidth: "110px" }, onChange: (e) => set("companion.maxCommentsPerHour", Number(e.target.value)) })),
+          h(Row, { label: "字幕字号", hint: "也可以直接在字幕条上 Ctrl+滚轮调。", badge: `${compCfg.fontPx ?? 22} px` },
+            h("input", { className: "qbw-input", type: "number", min: 14, max: 40, value: compCfg.fontPx ?? 22, style: { maxWidth: "110px" }, onChange: (e) => set("companion.fontPx", Number(e.target.value)) })),
+          h(Row, { label: "字幕条宽度", hint: "最宽 1400；也可以在字幕条右下角拖着改。", badge: `${compCfg.width ?? 900} px` },
+            h("input", { className: "qbw-input", type: "number", min: 520, max: 1400, value: compCfg.width ?? 900, style: { maxWidth: "110px" }, onChange: (e) => set("companion.width", Number(e.target.value)) })),
+          h(Row, { label: "字幕背景不透明度", hint: "不喜欢黑块的可以调低；0 = 全透明，90 = 接近纯黑。", badge: `${compCfg.opacity ?? 55}%` },
+            slider(compCfg.opacity ?? 55, 0, 90, 1, (v) => set("companion.opacity", v))),
+          h(Row, { label: "上下文字幕", hint: "保留一问一答，字幕里最多同时显示 3 条；关掉就只显示最新一句。", badge: compCfg.contextSubtitles === true ? "开" : "关" },
+            h("input", { className: "qbw-switch", type: "checkbox", checked: compCfg.contextSubtitles === true, onChange: (e) => set("companion.contextSubtitles", e.target.checked) })),
+          h("div", { className: "qbw-hint" }, "点字幕回她；按住 Ctrl+Alt 展开历史，松开收回。桌宠会在陪伴期间自动隐藏，关闭后回来。")),
+
         h(Section, { title: "悬浮窗发图", defaultOpen: false, note: "只影响这个悬浮窗里的「图」按钮。和 QQ 那边的「发图」总开关是两套：那边关了这边照样能发，这边不开不影响 QQ。" },
           h(Row, { label: "允许在悬浮窗发图", hint: "开了面板顶部才出现「图」按钮。点了会按「QQ 表情 → 本地图库 → 现场生图」的顺序自己找一张。", badge: picCfg.enabled === true ? "开" : "关" },
             h("input", { className: "qbw-switch", type: "checkbox", checked: picCfg.enabled === true, onChange: (e) => set("pic.enabled", e.target.checked) })),
@@ -5766,8 +6024,9 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
             h("input", { className: "qbw-switch", type: "checkbox", checked: picCfg.attachToChat === true, onChange: (e) => set("pic.attachToChat", e.target.checked) })),
           h(Row, { label: "气泡图文一体", hint: "开：一条消息的图和字在同一个气泡（图在上、字在下）；关：拆成图、字两个气泡。图会等比缩到 240px 内，小图不放大。", badge: chatCfg.richBubble !== false ? "开" : "关" },
             h("input", { className: "qbw-switch", type: "checkbox", checked: chatCfg.richBubble !== false, onChange: (e) => set("chat.richBubble", e.target.checked) })),
-          h("div", { className: "qbw-hint" }, "图和表情只从「本地图库」和「QQ 收藏表情」拿；现场画的图会先落到悬浮窗的 media 目录再显示。"),
-          h("div", { className: "qbw-hint" }, "记忆：QQ 和悬浮窗共用同一张衰减记忆卡，不用单独开——她记得的事本来就是同一份，这边不另拉聊天原文。")),
+          h(Row, { label: "互通记忆", hint: "和 QQ、B站 共用同一张衰减记忆卡：这边聊的会写进去，那边的事她也记得。关掉 = 只当悬浮窗里的私聊，不写卡、也不读卡。", badge: chatCfg.shareMemory !== false ? "开" : "关" },
+            h("input", { className: "qbw-switch", type: "checkbox", checked: chatCfg.shareMemory !== false, onChange: (e) => set("chat.shareMemory", e.target.checked) })),
+          h("div", { className: "qbw-hint" }, "图和表情只从「本地图库」和「QQ 收藏表情」拿；现场画的图会先落到悬浮窗的 media 目录再显示。")),
 
         h(Section, { title: "试一试", defaultOpen: true, note: "这两下都是真的：发一句会出现在球上，试对话会真的走一次模型。" },
           h("input", {
@@ -5983,6 +6242,7 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
       ["characters", "角色"],
       ["purpose", "目的"],
       ["qq", "QQ"],
+      ["reply", "回复速度"],
       ["voice", "语音"],
       ["pic", "发图"],
       ["orb", "悬浮窗"],
@@ -6190,6 +6450,50 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
         if (tab === "characters") return h(CharactersTab, { overview, busy, setBusy, toast: notify, reload, goTab: setTab, unified, setUnified: setUnifiedPath });
         if (tab === "purpose") return h(PurposeTab, { qq, setQq: setQqPath, unified, setUnified: setUnifiedPath, overview, busy, setBusy, toast: notify, reload, goTab: setTab });
         if (tab === "qq") return h(QQTab, { cfg: qq, set: setQqPath, admin: unified?.admin ?? {}, setAdmin, unified, setUnified: setUnifiedPath, overview, busy, setBusy, toast: notify, reload, goTab: setTab });
+    // 回复速度页底部：手动换会话 / 回原会话（走 /api/socialV2/session）。
+    function ReplySessionActions({ toast }) {
+      const [busy, setBusy] = useState(false);
+      const [status, setStatus] = useState(null);
+      const load = async () => {
+        try {
+          const r = await api("/socialV2/latency");
+          setStatus(r);
+        } catch {}
+      };
+      useEffect(() => {
+        load();
+      }, []);
+      const run = async (action) => {
+        setBusy(true);
+        try {
+          const r = await api("/socialV2/session", { method: "POST", body: { action } });
+          const changed = (r.results || []).filter((x) => x && x.changed);
+          if (action === "rotate") toast(changed.length ? `✓ 已换到新会话：${changed.map((x) => x.key).join("、")}` : "没有可换的会话");
+          else toast(changed.length ? `✓ 已回到原会话：${changed.map((x) => x.key).join("、")}` : "本来就在原会话上");
+          await load();
+        } catch (e) {
+          toast(`✗ ${e?.message ?? e}`);
+        }
+        setBusy(false);
+      };
+      const convs = status?.conversations ? Object.keys(status.conversations) : [];
+      return h(Section, { title: "会话", defaultOpen: true, note: "「换会话」= 真的在 DSH 里新建一条会话（复用原来的建会话流程）；建不出来就继续用旧会话，不会把你晾在空会话上。" },
+        h("div", { style: { display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "8px" } },
+          h(Btn, { onClick: () => run("rotate"), disabled: busy }, "立即换一次会话"),
+          h(Btn, { onClick: () => run("restore"), disabled: busy }, "回到原会话")),
+        h("p", { className: "qbw-hint" }, `当前用「${status?.mode === "fast" ? "快回复" : "原版"}」那套；共 ${convs.length} 个会话。`),
+        ...convs.slice(0, 8).map((key) => {
+          const c = status.conversations[key] || {};
+          const state = c.unbound ? "无会话（下次发消息时新建）" : c.rotated ? "已换会话" : "原会话";
+          return h("p", { className: "qbw-hint", key }, `${key}：第 ${Number(c.turnsSinceRotate) || 0} 轮 · ${state}`);
+        }));
+    }
+
+        if (tab === "reply") return h("div", null,
+          h(FieldGroups, { groups: REPLY_FIELDS, cfg: qq, set: setQqPath }),
+          h("p", { className: "qbw-hint", style: { marginTop: "8px" } }, "改完点底部「保存」即可：桥接每 3 秒看一眼 config.json，回复参数会自己重载（换会话开关也会跟着生效）。两套参数各自独立：切到「快回复」用 fast 那组，切回「原版」用 legacy 那组。"),
+          h(ReplySessionActions, { toast: notify }),
+        );
         if (tab === "bili") return h(BiliTab, { cfg: bili, set: setBiliPath, qq: normalizedQq, setQqPath, admin: unified?.admin ?? {}, setAdmin, unified, setUnified: setUnifiedPath, qqPrivate: normalizedQq?.allow?.private ?? [], qqAllowAll: normalizedQq?.allowAllWhenEmpty === true, overview, busy, setBusy, toast: notify, reload });
         if (tab === "tokens") return h(TokenTab, { budget, limits: limitDraft, onChange: setLimitDraft, disabled: !!busy, alertedToday: tokenAlerted, onSave: () => save(false), busy, toast: notify });
         if (tab === "watch") return h(WatchTab, { busy, setBusy, toast: notify, goTab: setTab });

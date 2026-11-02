@@ -23,11 +23,15 @@
       <button class="ctxitem" id="ctxOpen" data-act="open">打开会话</button>
       <button class="ctxitem" id="ctxAction" data-act="action">换个动作</button>
       <button class="ctxitem" id="ctxSizeToggle" data-act="size">大小<span class="ctxchev">›</span></button>
-      <button class="ctxitem" id="ctxHide" data-act="hide">隐藏</button>
-      <!-- 点「大小」才展开的滑条：0-100% 映射到 120~320px，松手才改窗口 -->
       <div id="ctxSize" class="ctxsize hidden">
         <input id="ctxSizeRange" class="szrange" type="range" min="0" max="100" step="1" value="40" />
-        <span id="ctxSizeValue" class="szvalue">40%</span>
+        <b id="ctxSizeValue" class="szvalue">40%</b>
+      </div>
+      <button class="ctxitem" id="ctxHide" data-act="hide">隐藏到托盘</button>
+      <!-- 陪伴：直接放在菜单里，不藏二级面板 -->
+      <div id="ctxCompanionPanel" class="ctxcompanion">
+        <button class="ctxitem sub" id="ctxCompToggle" type="button">开启陪伴</button>
+        <label class="ctxcheck"><input id="ctxCompContext" type="checkbox" /> 上下文字幕</label>
       </div>
     </div>
 
@@ -60,8 +64,12 @@
       <!-- 主人往上翻历史时来了新消息：圆形里是条数；没有未读就显示向下箭头 -->
       <button class="jump hidden" id="btnJump" title="有新消息，点一下跳到最新">↓</button>
       <footer class="composer">
-        <input id="input" type="text" placeholder="和她说点什么…" maxlength="2000" />
-        <button id="btnSend" class="send">发</button>
+        <div id="composerAttachments" class="attachments hidden" aria-label="待发附件"></div>
+        <div class="composer-row">
+          <button id="btnAttach" class="attach" type="button" title="添加图片或文件（也可以直接粘贴/拖进来）" aria-label="添加图片或文件">+</button>
+          <input id="input" type="text" placeholder="和她说点什么…" maxlength="2000" />
+          <button id="btnSend" class="send">发</button>
+        </div>
       </footer>
       <div class="hint" id="hint"></div>
     </div>

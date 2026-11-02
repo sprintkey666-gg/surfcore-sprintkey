@@ -100,10 +100,12 @@ export function stripStageDirections(text) {
  * 用户消息和她的回复分开写：插件摄取时会把回复并进最近一条 pet-owner 记录，
  * 形成「主人说 → 她回」的一条记忆。
  */
-export function buildPetMemoryEvents({ userText = '', replyText = '', at = Date.now(), roleName = '' } = {}) {
+export function buildPetMemoryEvents({ userText = '', replyText = '', at = Date.now(), roleName = '', screenAware = false } = {}) {
   const events = [];
   const say = String(userText ?? '').trim();
   const reply = String(replyText ?? '').trim();
+  // screenVision：这一轮是「看着屏幕」说的（窗口标题或截图）——记忆照存，但 B站 那边一律不出圈。
+  const screenVision = screenAware === true;
   if (say) {
     events.push({
       at: at - 1,
@@ -113,6 +115,7 @@ export function buildPetMemoryEvents({ userText = '', replyText = '', at = Date.
       isOwner: true,
       private: true,
       direct: true,
+      screenVision,
       conversationKey: 'pet',
       text: say,
     });
@@ -126,6 +129,7 @@ export function buildPetMemoryEvents({ userText = '', replyText = '', at = Date.
       isSelf: true,
       private: true,
       direct: true,
+      screenVision,
       conversationKey: 'pet',
       text: reply,
     });
@@ -152,7 +156,7 @@ function tokenHash(text) {
  * @param {object} [opts.tokenBudget]  每日额度服务（可选，冒烟测试可不传）
  * @param {'pet'|'orb'} [opts.profile] 宿主：桌宠（默认）还是桌面悬浮球
  */
-export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, tokenBudget = null, profile = 'pet' } = {}) {
+export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, tokenBudget = null, profile = 'pet', archiveMessage = null } = {}) {
   // profile：'pet' = 桌宠（透明小人），'orb' = 桌面悬浮球。
   // 两个宿主共用人格 / 记忆 / 模型调用，但聊天历史与语音产物必须分开放，
   // 否则悬浮球上的「新对话」会把桌宠的上下文一起清掉。
@@ -241,7 +245,8 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
       chat: {
         // 悬浮球有自己的开关（orb.chat.enabled，由 orb-api 拦），不要被桌宠的开关连坐。
         enabled: isOrb ? orbChat.enabled !== false : chat.enabled !== false,
-        remember: chat.remember !== false,
+        // 记忆互通同样是两条线：悬浮窗看 orb.chat.shareMemory，桌宠看 pet.chat.remember。
+        remember: isOrb ? orbChat.shareMemory !== false : chat.remember !== false,
         maxReplyChars: clampInt(chat.maxReplyChars, 300, 40, 800),
         voiceMaxChars: clampInt(chat.voiceMaxChars, 120, 20, 300),
         historyTurns: clampInt(chat.historyTurns, 20, 2, 60),
@@ -278,6 +283,8 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
   function memoryBlock() {
     const unified = unifiedConfig();
     if (unified?.memoryCard?.enabled === false) return '';
+    // 悬浮窗的「互通记忆」关掉时，读也停：关掉就是这边自己的私聊，不拿卡里的记忆说话。
+    if (isOrb && unified?.orb?.chat?.shareMemory === false) return '';
     try { return String(memoryCardPromptBlock('qq') || '').trim(); } catch { return ''; }
   }
 
@@ -310,6 +317,26 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
 
   // ── 记忆卡：把对话写进和 QQ / B站 同一张卡 ─────────────────────────────
   // 只追加 inbox（轻量、原子），真正的评分/脱敏/衰减由插件的记忆卡维护器做。
+  // 写/读各自受开关控制：写看 settings().chat.remember（悬浮窗是 orb.chat.shareMemory），
+  // 读看 memoryBlock() 里同一个开关——关掉就整条线断开，不会只关一半。
+  // 桌面聊天全量存档（chat-archive 的 channel=desktop-orb）。
+  // 只落原文，不影响记忆卡；失败静默，聊天不能因为存档失败而中断。
+  function archiveDesktopMessage(role, text, at, extra = {}) {
+    if (typeof archiveMessage !== 'function') return null;
+    try {
+      return archiveMessage({
+        channel: 'desktop-orb',
+        role,
+        text,
+        at,
+        ...extra,
+      });
+    } catch (error) {
+      pluginLog('[pet-chat] 写桌面聊天存档失败：', String(error?.message ?? error).slice(0, 160));
+      return null;
+    }
+  }
+
   function rememberEvents(events) {
     if (!Array.isArray(events) || !events.length) return 0;
     if (!settings().chat.remember) return 0;
@@ -822,7 +849,7 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
   }
 
   // ── 对外：聊天 ──────────────────────────────────────────────────────────
-  async function chat({ text = '', modality = 'text', desktop = null, image = null, pics = [], screenMode = '', allowPic = false } = {}) {
+  async function chat({ text = '', modality = 'text', desktop = null, image = null, images = [], pics = [], screenMode = '', allowPic = false, archive = true, remember = true } = {}) {
     const s = settings();
     if (!s.chat.enabled) {
       return { ok: false, error: isOrb ? '悬浮球对话已关闭（设置 → 悬浮窗 → 互动）' : '桌宠对话已关闭（设置 → 桌宠 → 对话）' };
@@ -858,12 +885,17 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
     ].filter(Boolean).join('\n');
 
     try {
+      // 屏幕截图和主人随消息附的图可以同时存在：截图放最后，最多 4 张。
+      const chatImages = [
+        ...(Array.isArray(images) ? images : []),
+        ...(image ? [image] : []),
+      ].filter((item) => item && item.data).slice(-4);
       const result = await complete({
         system,
         user,
         maxTokens: mode === 'voice' ? 400 : 700,
         temperature: s.chat.temperature,
-        images: image ? [image] : null,
+        images: chatImages.length ? chatImages : null,
       });
       recordUsage(result.usage, result.model);
       let reply = cleanReply(result.text);
@@ -888,11 +920,25 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
       history.lastUserAt = now;
       history.lastAssistantAt = now;
       saveHistory(history);
-      const remembered = rememberEvents(buildPetMemoryEvents({
+      if (archive !== false) {
+        const archiveMedia = chatImages.map(() => ({ kind: 'image' }));
+        archiveDesktopMessage('user', say, now - 1, {
+          id: userMessage.id,
+          name: owner.name,
+          type: chatImages.length ? 'mixed' : 'text',
+          media: archiveMedia,
+        });
+        archiveDesktopMessage('assistant', historyText, now, {
+          id: aiMessage.id,
+          name: role.name,
+        });
+      }
+      const remembered = remember === false ? 0 : rememberEvents(buildPetMemoryEvents({
         userText: say,
         replyText: reply,
         at: now,
         roleName: role.name,
+        screenAware: Boolean(desktop) || Boolean(image),
       }));
       lastChatAt = now;
       lastError = '';
@@ -937,10 +983,16 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
     history.lastProactiveAt = now;
     history.lastAssistantAt = now;
     saveHistory(history);
+    archiveDesktopMessage('assistant', body, now, {
+      id: message.id,
+      name: roleInfo().name,
+      proactive: true,
+    });
     const remembered = rememberEvents(buildPetMemoryEvents({
       replyText: body,
       at: now,
       roleName: roleInfo().name,
+      screenAware: true,
     }));
     lastProactiveAt = now;
     emit({

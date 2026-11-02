@@ -9,6 +9,12 @@
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
+import {
+  normalizeChatArchiveConfig,
+  chatArchiveRoot,
+  chatArchiveStatus,
+  listChatArchiveFiles,
+} from './chat-archive.js';
 
 const DAY_MS = 86_400_000;
 const BACKUP_RETRY_MS = 10 * 60_000;
@@ -22,9 +28,11 @@ export const DEFAULT_MEMORY_CARD_BACKUP = Object.freeze({
   syncEveryDays: 1,
   send: Object.freeze({
     enabled: false,
+    fullArchive: true,
     everyDays: 7,
     maxSendMB: 90,
   }),
+  archive: Object.freeze({ enabled: true, maxFileMB: 16 }),
 });
 
 function clampInt(value, fallback, min, max) {
@@ -42,9 +50,11 @@ export function normalizeMemoryCardBackupConfig(raw) {
     syncEveryDays: clampInt(src.syncEveryDays, DEFAULT_MEMORY_CARD_BACKUP.syncEveryDays, 1, 365),
     send: {
       enabled: sendRaw.enabled === true,
+      fullArchive: sendRaw.fullArchive !== false,
       everyDays: clampInt(sendRaw.everyDays, DEFAULT_MEMORY_CARD_BACKUP.send.everyDays, 1, 365),
       maxSendMB: clampInt(sendRaw.maxSendMB, DEFAULT_MEMORY_CARD_BACKUP.send.maxSendMB, 1, 100),
     },
+    archive: normalizeChatArchiveConfig(src.archive),
   };
 }
 
@@ -107,19 +117,33 @@ function emptyRecord() {
     lastSendOk: false,
     lastSendError: '',
     lastSendAttemptAt: 0,
+    archiveSent: {},
   };
+}
+
+function normalizeArchiveSent(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [file, bytes] of Object.entries(raw)) {
+    const n = Number(bytes);
+    if (typeof file === 'string' && file && Number.isFinite(n) && n >= 0) out[file] = n;
+    if (Object.keys(out).length >= 500) break;
+  }
+  return out;
 }
 
 function normalizeRecord(rec) {
   const base = emptyRecord();
   if (!rec || typeof rec !== 'object' || Array.isArray(rec)) return base;
   for (const key of Object.keys(base)) {
+    if (key === 'archiveSent') continue;
     if (typeof base[key] === 'boolean') base[key] = rec[key] === true;
     else if (typeof base[key] === 'number') {
       const n = Number(rec[key]);
       base[key] = Number.isFinite(n) && n >= 0 ? n : 0;
     } else base[key] = String(rec[key] ?? '');
   }
+  base.archiveSent = normalizeArchiveSent(rec.archiveSent);
   return base;
 }
 
@@ -230,6 +254,15 @@ export function createMemoryCardBackupService(options = {}) {
     return defaultBackupDir(dshHome, src?.characterId);
   }
 
+  function archiveSnapshot(config, src) {
+    const root = chatArchiveRoot({ baseDir: resolveDir(config, src), characterId: src?.characterId });
+    return {
+      root,
+      summary: chatArchiveStatus(root, config.archive),
+      files: listChatArchiveFiles(root),
+    };
+  }
+
   function sourceSnapshot() {
     const src = getSource() || {};
     return {
@@ -289,65 +322,116 @@ export function createMemoryCardBackupService(options = {}) {
     const config = normalizeMemoryCardBackupConfig(getConfig());
     if (!manual && !config.send.enabled) return { ok: false, error: '发送开关未开启' };
     const src = sourceSnapshot();
-    if (!src.jsonl) return { ok: false, error: '找不到全量记忆卡（memory-card-full.jsonl 尚未生成）' };
     const owner = String(getOwnerQQ() ?? '').replace(/\D/g, '');
     if (!owner) return { ok: false, error: '未设置主人 QQ（config.json 的 admin.qq / ownerQQ）' };
     if (!isQQReady()) return { ok: false, error: 'QQ 未连接（SnowLuma 未启动或未登录），先不发送' };
-    const maxBytes = config.send.maxSendMB * 1024 * 1024;
-    if (src.jsonl.bytes > maxBytes) {
-      const at = now();
-      const doc = readDoc();
-      const rec = recordFor(doc, src.characterId);
-      const message = `全量卡 ${mb(src.jsonl.bytes)} 超过单次上限 ${config.send.maxSendMB} MB，未发送（可调高上限，或先手动存档）`;
+
+    const at = now();
+    const doc = readDoc();
+    const rec = recordFor(doc, src.characterId);
+    const fail = (message) => {
       rec.lastSendAttemptAt = at;
       rec.lastSendOk = false;
       rec.lastSendError = message;
       saveDoc(doc);
       log(`[记忆备份] ${message}`);
-      return { ok: false, action: 'send', error: message, at };
-    }
-    const at = now();
-    const doc = readDoc();
-    const rec = recordFor(doc, src.characterId);
+      return { ok: false, action: 'send', error: message, owner, at };
+    };
+
+    const maxBytes = config.send.maxSendMB * 1024 * 1024;
+    const fullArchive = config.send.fullArchive === true;
     const stamp = dateStamp(at);
     const skipped = [];
+    const archive = archiveSnapshot(config, src);
+    const sentArchive = { ...(rec.archiveSent || {}) };
+    const pendingArchive = [];
+    let payloadBytes = 0;
+    let fileCount = 0;
+
     const segments = [{
       type: 'text',
-      data: { text: `全量记忆卡备份（${src.characterName}） ${new Date(at).toLocaleString('zh-CN')}` },
+      data: {
+        text: `全量记忆卡 + 聊天存档（${src.characterName}） ${new Date(at).toLocaleString('zh-CN')}\n`
+          + `发送模式：${fullArchive ? '全部记忆文件' : '仅新增/追加'}\n`
+          + `全量卡：${src.jsonl ? mb(src.jsonl.bytes) : '未生成'}；`
+          + `聊天存档：私聊 ${archive.summary.private.files} 个 / 群聊 ${archive.summary.group.files} 个`,
+      },
     }];
-    segments.push({
-      type: 'file',
-      data: { file: toFileUrl(src.jsonl.path), name: `memory-card-full-${stamp}.jsonl` },
-    });
-    if (src.markdown) {
-      if (src.markdown.bytes <= maxBytes) {
-        segments.push({ type: 'file', data: { file: toFileUrl(src.markdown.path), name: `memory-card-full-${stamp}.md` } });
-      } else skipped.push(`md（${mb(src.markdown.bytes)}）超过上限，已跳过`);
+
+    const pushFile = (file, name) => {
+      if (!file || !file.path) return;
+      if (file.bytes > maxBytes) {
+        skipped.push(`${name}（${mb(file.bytes)}）超过单次上限 ${config.send.maxSendMB} MB，已跳过`);
+        return;
+      }
+      segments.push({ type: 'file', data: { file: toFileUrl(file.path), name } });
+      payloadBytes += file.bytes;
+      fileCount += 1;
+    };
+
+    if (src.jsonl) pushFile(src.jsonl, `memory-card-full-${stamp}.jsonl`);
+    if (src.markdown) pushFile(src.markdown, `memory-card-full-${stamp}.md`);
+    if (src.stats) pushFile(src.stats, `memory-card-full-${stamp}-stats.json`);
+
+    const allArchiveFiles = [...archive.files.private, ...archive.files.group]
+      .sort((a, b) => a.mtimeMs - b.mtimeMs);
+    const archiveFiles = fullArchive
+      ? allArchiveFiles
+      : allArchiveFiles
+        .filter((f) => f.bytes > Number(sentArchive[f.path] || 0))
+        .slice(0, 20);
+    for (const f of archiveFiles) {
+      const name = `chat-${f.kind}-${stamp}-${f.name}`;
+      if (f.bytes > maxBytes) {
+        skipped.push(`${name}（${mb(f.bytes)}）超过单次上限 ${config.send.maxSendMB} MB，已跳过`);
+        continue;
+      }
+      segments.push({ type: 'file', data: { file: toFileUrl(f.path), name } });
+      payloadBytes += f.bytes;
+      fileCount += 1;
+      pendingArchive.push(f);
     }
-    if (src.stats) {
-      if (src.stats.bytes <= maxBytes) {
-        segments.push({ type: 'file', data: { file: toFileUrl(src.stats.path), name: `memory-card-full-${stamp}-stats.json` } });
-      } else skipped.push(`stats（${mb(src.stats.bytes)}）超过上限，已跳过`);
+
+    if (!fileCount) {
+      if (!src.jsonl && !allArchiveFiles.length) {
+        return fail('没有可发送的备份文件（全量卡未生成且没有聊天存档）');
+      }
+      if (skipped.length) {
+        return fail(fullArchive ? '全部文件都超过单次上限，未发送' : '新文件都超过单次上限，未发送');
+      }
+      return fail(fullArchive ? '没有可发送的备份文件' : '没有新的可发送文件');
     }
+
     try {
       await sendSegments(segments);
-      const bytes = src.jsonl.bytes + (src.markdown?.bytes ?? 0) + (src.stats?.bytes ?? 0);
+      for (const f of pendingArchive) sentArchive[f.path] = f.bytes;
+      const keys = Object.keys(sentArchive);
+      if (keys.length > 500) {
+        for (const k of keys.slice(0, keys.length - 500)) delete sentArchive[k];
+      }
+      rec.archiveSent = sentArchive;
       rec.lastSendAt = at;
       rec.lastSendAttemptAt = at;
-      rec.lastSendBytes = bytes;
+      rec.lastSendBytes = payloadBytes;
       rec.lastSendOk = true;
       rec.lastSendError = '';
       saveDoc(doc);
-      log(`[记忆备份] 已私聊主人 ${owner}：${segments.length - 1} 个文件${skipped.length ? `（${skipped.join('；')}）` : ''}`);
-      return { ok: true, action: 'send', owner, files: segments.length - 1, bytes, skipped, at, characterId: src.characterId };
+      log(`[记忆备份] 已私聊主人 ${owner}：${fullArchive ? '全部' : '增量'}模式，${fileCount} 个文件（含存档 ${pendingArchive.length} 个）${skipped.length ? `（${skipped.join('；')}）` : ''}`);
+      return {
+        ok: true,
+        action: 'send',
+        owner,
+        files: fileCount,
+        bytes: payloadBytes,
+        archiveFiles: pendingArchive.length,
+        fullArchive,
+        skipped,
+        at,
+        characterId: src.characterId,
+      };
     } catch (error) {
       const message = String(error?.message ?? error);
-      rec.lastSendAttemptAt = at;
-      rec.lastSendOk = false;
-      rec.lastSendError = message;
-      saveDoc(doc);
-      log(`[记忆备份] 发送失败：${message}`);
-      return { ok: false, action: 'send', error: message, owner, at };
+      return fail(message);
     }
   }
 
@@ -415,6 +499,7 @@ export function createMemoryCardBackupService(options = {}) {
     const doc = readDoc();
     const rec = recordFor(doc, src.characterId);
     const at = now();
+    const archive = archiveSnapshot(config, src);
     const mirror = {
       jsonl: fileInfo(path.join(dir, 'memory-card-full.jsonl')),
       markdown: fileInfo(path.join(dir, 'memory-card-full.md')),
@@ -427,6 +512,7 @@ export function createMemoryCardBackupService(options = {}) {
       characterName: src.characterName,
       memoryDir: src.dir,
       dir,
+      archive: archive.summary,
       qqReady: isQQReady() === true,
       ownerQQ: String(getOwnerQQ() ?? '').replace(/\D/g, ''),
       files: { jsonl: src.jsonl, markdown: src.markdown, stats: src.stats },

@@ -361,6 +361,9 @@ const TOOL_CONFIG_FLAGS = {
   qq_send_video: 'sendMedia',
   // 自动发图（2026-10-31）：不登记就会「控制台显示关闭、模型仍收到描述再吃 403」。
   qq_send_pic: 'sendPic',
+  // 好友申请：只读列表 / 拍板（2026-11-01）。
+  qq_friend_requests: 'friendRequests',
+  qq_friend_decide: 'friendDecide',
 };
 const disabledTools = [];
 {
@@ -862,7 +865,7 @@ server.tool(
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
     purpose: z.enum(['messages', 'reply']).optional().describe('默认 messages：等新消息/回复/睡前观察；reply：回复前短静默，计入最后来信后已过去的时间，绝不授予睡前观察资格'),
-    timeoutMs: z.number().optional().describe('等待预算毫秒数，默认 30000、最大 600000；reply 达到静默即返回，不必等满；沉睡前观察用 messages 并传 300000'),
+    timeoutMs: z.number().optional().describe('等待预算毫秒数，默认 30000、最大 600000；reply 达到静默即返回，不必等满。沉睡前观察用 purpose="messages"，时长照唤醒提示里写的 preSleepWaitMs 传（后台可调，默认 300000），别自己写死'),
     minNewMessages: z.number().optional().describe('仅 messages 用途：至少等到多少条新消息才进入静默窗口，默认 1；reply 用途会忽略它'),
     quietMs: z.number().optional().describe('静默窗口毫秒数，建议 10000~12000；reply 从最后来信开始计时，messages 只在等到新消息后计时；后台默认至少 10000')
   },
@@ -1346,6 +1349,59 @@ if (cfg.socialV2?.pic?.enabled !== false && cfg.socialV2?.tools?.sendPic !== fal
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
       } catch (error) {
         return { content: [{ type: 'text', text: `发送图片失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+// 好友申请（2026-11-01）：网关不支持主动加好友，这里只管「别人来加我们」的拍板。
+if (cfg.socialV2?.friend?.enabled !== false && cfg.socialV2?.tools?.friendRequests !== false) {
+  server.tool(
+    'qq_friend_requests',
+    '查看待处理的好友申请（只读）：谁在加你、留言、是不是在白名单范围里（白名单私聊对象 / 白名单群里的人）、桥接给出的初步结论。网关没有「查询申请列表」的接口，这里只包含本次在线期间收到的申请，离线期间的收不到。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）')
+    },
+    async ({ key, token }) => {
+      try {
+        const data = await agentApi('/api/socialV2/friend-requests', {
+          method: 'GET',
+          headers: { 'x-agent-token': token },
+          timeoutMs: 30000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `查看好友申请失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.friend?.enabled !== false && cfg.socialV2?.tools?.friendDecide !== false) {
+  server.tool(
+    'qq_friend_decide',
+    '决定一个好友申请：通过或拒绝。通过前桥接会再核一次「必须在白名单范围内」（白名单私聊对象，或白名单群里的人），不满足会直接拒绝执行并告诉你原因。传 flag（来自 qq_friend_requests 的 pending 项）最准；也可以只传 qq。approved 之后如果开了「自动改备注」会顺手把备注设成对方昵称。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      flag: z.string().optional().describe('申请标识（来自 qq_friend_requests 的 pending[].flag）'),
+      qq: z.union([z.number(), z.string()]).optional().describe('申请人的 QQ 号（没记 flag 时用）'),
+      approve: z.boolean().describe('true=通过，false=拒绝'),
+      reason: z.string().optional().describe('给自己/主人看的一句话理由（可选，最多 200 字）'),
+      remark: z.string().optional().describe('通过后设置的备注名（可选，最多 24 字）')
+    },
+    async ({ key, token, flag, qq, approve, reason, remark }) => {
+      try {
+        const data = await agentApi('/api/socialV2/friend-decide', {
+          method: 'POST',
+          body: JSON.stringify({ key, flag: flag ?? '', qq: qq ?? '', approve: approve === true, reason: reason ?? '', remark: remark ?? '' }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 30000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `处理好友申请失败：${error?.message ?? error}` }], isError: true };
       }
     }
   );

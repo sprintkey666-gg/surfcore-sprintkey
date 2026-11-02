@@ -9,6 +9,7 @@ import dns from 'node:dns';
 import net from 'node:net';
 import http from 'node:http';
 import https from 'node:https';
+import tls from 'node:tls';
 import { StringDecoder } from 'node:string_decoder';
 
 const dnsLookup = dns.promises.lookup;
@@ -164,7 +165,49 @@ export async function resolveSafeHost(hostname) {
   return first;
 }
 
-export async function validateFetchUrl(raw) {
+/**
+ * 抓取策略（可选，默认保持原来的「纯直连 + 全局校验」）：
+ *  - `allowHosts`: 域名后缀白名单。命中后**不做本机 DNS 解析**，改走代理隧道，
+ *    由代理端解析。原因：本机 Clash fake-ip 会把 gxh.vip.qq.com 这类 QQ CDN 解析成
+ *    198.18.x.x 假地址，`resolveSafeAddresses` 直接判「解析到内网」把表情图全拦了。
+ *  - `proxy`: `http://127.0.0.1:7897` 这类 HTTP 代理（只用 CONNECT 隧道，不碰代理鉴权）。
+ * 白名单外的域名一律走原来的校验路径，SSRF 防护不放宽。
+ */
+function normalizePolicy(opts) {
+  const allowHosts = (Array.isArray(opts?.allowHosts) ? opts.allowHosts : [])
+    .map((x) => String(x ?? '').toLowerCase().trim().replace(/^\.+/, ''))
+    .filter(Boolean);
+  const raw = String(opts?.proxy ?? '').trim();
+  let proxy = null;
+  if (raw) {
+    try {
+      const u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`);
+      if (u.hostname) proxy = { host: u.hostname, port: Number(u.port) || 80 };
+    } catch {}
+  }
+  return { allowHosts, proxy };
+}
+
+/** hostname 是否命中白名单（`qq.com` 命中 a.qq.com，但不命中 aqq.com）。 */
+export function hostMatchesAllowList(hostname, allowHosts) {
+  const h = String(hostname || '').toLowerCase().replace(/^\.+/, '').replace(/\.$/, '');
+  if (!h) return false;
+  return (Array.isArray(allowHosts) ? allowHosts : []).some((raw) => {
+    const suffix = String(raw || '').toLowerCase().trim().replace(/^\.+/, '');
+    if (!suffix) return false;
+    return h === suffix || h.endsWith(`.${suffix}`);
+  });
+}
+
+/** 这一跳该直连哪些地址，还是整条走代理隧道。 */
+function targetsFor(url, addresses, policy) {
+  if (policy?.proxy && hostMatchesAllowList(url.hostname.replace(/^\[|\]$/g, ''), policy.allowHosts)) {
+    return [{ proxy: policy.proxy }];
+  }
+  return addresses;
+}
+
+export async function validateFetchUrl(raw, policy = null) {
   let url;
   try {
     url = new URL(String(raw ?? '').trim());
@@ -173,6 +216,10 @@ export async function validateFetchUrl(raw) {
   }
   if (!['http:', 'https:'].includes(url.protocol)) throw new Error('仅允许 http/https');
   if (url.username || url.password) throw new Error('URL 不能包含凭据');
+  // 白名单命中：不解析本机 DNS（fake-ip 会假报内网），交给代理端解析。
+  if (policy?.proxy && hostMatchesAllowList(url.hostname.replace(/^\[|\]$/g, ''), policy.allowHosts)) {
+    return { url, ip: null, addresses: [] };
+  }
   const addresses = await resolveSafeAddresses(url.hostname);
   return { url, ip: addresses[0], addresses };
 }
@@ -189,11 +236,59 @@ function validateLimit(value, name) {
 }
 
 /**
+ * 通过 HTTP 代理开 CONNECT 隧道（https 目标就在隧道里再起 TLS）。
+ * 走代理是必要的：本机 Clash 的 fake-ip 会把 QQ CDN 解析成 198.18.x.x，
+ * 本机解析必然判内网；代理端解析拿的是真地址。
+ */
+function openTunnel(url, proxy, budgetMs) {
+  return new Promise((resolve, reject) => {
+    const host = url.hostname.replace(/^\[|\]$/g, '');
+    const port = Number(url.port) || (url.protocol === 'https:' ? 443 : 80);
+    let settled = false;
+    const finish = (payload, error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error); else resolve(payload);
+    };
+    const agentReq = http.request({
+      host: proxy.host,
+      port: proxy.port,
+      method: 'CONNECT',
+      path: `${host}:${port}`,
+      headers: { host: `${host}:${port}` },
+      timeout: budgetMs,
+    });
+    const timer = setTimeout(() => {
+      finish(null, new Error(`代理 CONNECT 超时：${proxy.host}:${proxy.port}`));
+      agentReq.destroy();
+    }, budgetMs);
+    agentReq.on('connect', (res, socket) => {
+      if ((res.statusCode || 0) !== 200) {
+        socket.destroy();
+        finish(null, new Error(`代理拒绝 CONNECT：HTTP ${res.statusCode}`));
+        return;
+      }
+      if (url.protocol !== 'https:') { finish(socket); return; }
+      const tlsSocket = tls.connect({ socket, servername: host, rejectUnauthorized: true }, () => finish(tlsSocket));
+      tlsSocket.on('error', (error) => finish(null, error));
+    });
+    agentReq.on('timeout', () => { finish(null, new Error(`代理 CONNECT 超时：${proxy.host}:${proxy.port}`)); agentReq.destroy(); });
+    agentReq.on('error', (error) => finish(null, error));
+    agentReq.end();
+  });
+}
+
+/**
  * 用**一个**已校验的地址发起一次尝试，保留原始 Host/SNI（禁止重新解析 DNS）。
  * 返回 `{ok:true,result}` 或 `{ok:false,error,retryable}`；retryable 只标记网络层失败
  * （连接失败/超时/正文中断），大小与图片签名等策略性拒绝不重试。
+ * target 既可以是地址字符串，也可以是 `{proxy}`：后者先 CONNECT 建隧道再发请求
+ * （只给命中 allowHosts 白名单的域名用，DNS 由代理端解析）。
  */
-function attemptOnce(url, address, limit, binary, budgetMs) {
+function attemptOnce(url, target, limit, binary, budgetMs) {
+  const proxy = target && typeof target === 'object' ? target.proxy : null;
+  const address = proxy ? '' : target;
   return new Promise((resolve) => {
     let settled = false;
     let req;
@@ -214,69 +309,62 @@ function attemptOnce(url, address, limit, binary, budgetMs) {
     }, budgetMs);
     const mod = url.protocol === 'https:' ? https : http;
     const hostname = url.hostname.replace(/^\[|\]$/g, '');
-    try {
-      req = mod.request({
-        hostname: address,
-        port: url.port || (url.protocol === 'https:' ? 443 : 80),
-        path: url.pathname + url.search,
-        method: 'GET',
-        headers: {
-          host: url.host,
-          'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36',
-          accept: binary ? 'image/*,*/*;q=0.8' : 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'accept-language': 'zh-CN,zh;q=0.9',
-        },
-        servername: url.protocol === 'https:' && !net.isIP(hostname) ? hostname : undefined,
-        rejectUnauthorized: url.protocol === 'https:',
-        timeout: budgetMs,
-      }, (res) => {
-        response = res;
-        res.on('error', (error) => fail(error, true));
-        res.on('aborted', () => fail(new Error('响应体读取中断'), true));
-        res.on('close', () => {
-          if (!res.complete) fail(new Error('响应体读取中断'), true);
-        });
-        if (settled) { res.destroy(); return; }
-        const statusCode = res.statusCode || 0;
-        if (REDIRECT_STATUSES.has(statusCode)) {
-          done({ statusCode, redirect: String(res.headers.location || '') });
-          // 不下载重定向正文：攻击者可以发送无限正文消耗连接和带宽。
+    const headers = {
+      host: url.host,
+      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36',
+      accept: binary ? 'image/*,*/*;q=0.8' : 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'accept-language': 'zh-CN,zh;q=0.9',
+    };
+    /** 读完一个响应：直连和代理隧道共用这一段（限量、限时、图片大小校验）。 */
+    const onResponse = (res) => {
+      response = res;
+      res.on('error', (error) => fail(error, true));
+      res.on('aborted', () => fail(new Error('响应体读取中断'), true));
+      res.on('close', () => {
+        if (!res.complete) fail(new Error('响应体读取中断'), true);
+      });
+      if (settled) { res.destroy(); return; }
+      const statusCode = res.statusCode || 0;
+      if (REDIRECT_STATUSES.has(statusCode)) {
+        done({ statusCode, redirect: String(res.headers.location || '') });
+        // 不下载重定向正文：攻击者可以发送无限正文消耗连接和带宽。
+        res.destroy();
+        return;
+      }
+      const chunks = [];
+      const decoder = binary ? null : new StringDecoder('utf8');
+      let size = 0;
+      const appendText = (text) => {
+        const points = Array.from(text);
+        const remaining = limit - size;
+        chunks.push(points.slice(0, remaining).join(''));
+        size += Math.min(points.length, remaining);
+        if (size >= limit) {
+          done({ statusCode, body: chunks.join(''), truncated: true });
+          res.destroy();
+        }
+      };
+      res.on('data', (chunk) => {
+        if (settled) return;
+        if (!binary) { appendText(decoder.write(chunk)); return; }
+        size += chunk.length;
+        if (size > limit) {
+          fail(new Error(`图片超过大小限制（${limit} 字节）`), false);
           res.destroy();
           return;
         }
-        const chunks = [];
-        const decoder = binary ? null : new StringDecoder('utf8');
-        let size = 0;
-        const appendText = (text) => {
-          const points = Array.from(text);
-          const remaining = limit - size;
-          chunks.push(points.slice(0, remaining).join(''));
-          size += Math.min(points.length, remaining);
-          if (size >= limit) {
-            done({ statusCode, body: chunks.join(''), truncated: true });
-            res.destroy();
-          }
-        };
-        res.on('data', (chunk) => {
-          if (settled) return;
-          if (!binary) { appendText(decoder.write(chunk)); return; }
-          size += chunk.length;
-          if (size > limit) {
-            fail(new Error(`图片超过大小限制（${limit} 字节）`), false);
-            res.destroy();
-            return;
-          }
-          chunks.push(chunk);
-        });
-        res.on('end', () => {
-          if (settled) return;
-          if (binary) done({ statusCode, buffer: Buffer.concat(chunks) });
-          else {
-            appendText(decoder.end());
-            done({ statusCode, body: chunks.join(''), truncated: false });
-          }
-        });
+        chunks.push(chunk);
       });
+      res.on('end', () => {
+        if (settled) return;
+        if (binary) done({ statusCode, buffer: Buffer.concat(chunks) });
+        else {
+          appendText(decoder.end());
+          done({ statusCode, body: chunks.join(''), truncated: false });
+        }
+      });
+    };
+    const wire = () => {
       req.on('timeout', () => {
         const error = new Error(`请求超时：${url.hostname}`);
         fail(error, true);
@@ -285,6 +373,44 @@ function attemptOnce(url, address, limit, binary, budgetMs) {
       });
       req.on('error', (error) => fail(error, true));
       req.end();
+    };
+
+    if (proxy) {
+      openTunnel(url, proxy, budgetMs).then((tunnel) => {
+        if (settled) { tunnel.destroy(); return; }
+        try {
+          const agent = new mod.Agent({ keepAlive: false });
+          agent.createConnection = (opts, cb) => cb(null, tunnel);
+          req = mod.request({
+            host: hostname,
+            port: Number(url.port) || (url.protocol === 'https:' ? 443 : 80),
+            path: url.pathname + url.search,
+            method: 'GET',
+            headers,
+            agent,
+            timeout: budgetMs,
+          }, onResponse);
+          wire();
+        } catch (error) {
+          try { tunnel.destroy(); } catch {}
+          fail(error, true);
+        }
+      }, (error) => fail(error, true));
+      return;
+    }
+
+    try {
+      req = mod.request({
+        hostname: address,
+        port: url.port || (url.protocol === 'https:' ? 443 : 80),
+        path: url.pathname + url.search,
+        method: 'GET',
+        headers,
+        servername: url.protocol === 'https:' && !net.isIP(hostname) ? hostname : undefined,
+        rejectUnauthorized: url.protocol === 'https:',
+        timeout: budgetMs,
+      }, onResponse);
+      wire();
     } catch (error) {
       fail(error, true);
       req?.destroy();
@@ -300,8 +426,8 @@ function attemptOnce(url, address, limit, binary, budgetMs) {
  * 而「第一个地址是坏的 IPv6」不会再白等 20 秒。
  * 所有地址都失败时抛最后一个错误（保留原始错误文案，便于日志排查）。
  */
-async function requestOnce(url, addresses, limit, binary = false) {
-  const list = (Array.isArray(addresses) ? addresses : [addresses]).filter(Boolean);
+async function requestOnce(url, targets, limit, binary = false) {
+  const list = (Array.isArray(targets) ? targets : [targets]).filter(Boolean);
   if (!list.length) throw new Error(`没有可用地址：${url.hostname}`);
   const deadline = Date.now() + REQUEST_TIMEOUT_MS;
   let lastError = null;
@@ -327,16 +453,17 @@ async function requestOnce(url, addresses, limit, binary = false) {
   throw lastError ?? new Error(`请求失败：${url.hostname}`);
 }
 
-export async function safeFetch(urlString, maxChars = 50000) {
+export async function safeFetch(urlString, maxChars = 50000, opts = {}) {
   validateLimit(maxChars, 'maxChars');
+  const policy = normalizePolicy(opts);
   const MAX_REDIRECTS = 5;
-  let { url, addresses } = await validateFetchUrl(urlString);
+  let { url, addresses } = await validateFetchUrl(urlString, policy);
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
-    const result = await requestOnce(url, addresses, maxChars);
+    const result = await requestOnce(url, targetsFor(url, addresses, policy), maxChars);
     if ([301, 302, 303, 307, 308].includes(result.statusCode)) {
       if (!result.redirect) throw new Error(`重定向缺少 Location: ${result.statusCode}`);
       const next = new URL(result.redirect, url).toString();
-      ({ url, addresses } = await validateFetchUrl(next));
+      ({ url, addresses } = await validateFetchUrl(next, policy));
       continue;
     }
     const body = result.body || '';
@@ -361,16 +488,17 @@ export function looksLikeImageBuffer(buf) {
 }
 
 /** 抓取图片字节并返回 Buffer（带 SSRF 防护，且校验确实为图片）。 */
-export async function safeFetchBuffer(urlString, maxBytes = 8 * 1024 * 1024) {
+export async function safeFetchBuffer(urlString, maxBytes = 8 * 1024 * 1024, opts = {}) {
   validateLimit(maxBytes, 'maxBytes');
+  const policy = normalizePolicy(opts);
   const MAX_REDIRECTS = 5;
-  let { url, addresses } = await validateFetchUrl(urlString);
+  let { url, addresses } = await validateFetchUrl(urlString, policy);
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
-    const result = await requestOnce(url, addresses, maxBytes, true);
+    const result = await requestOnce(url, targetsFor(url, addresses, policy), maxBytes, true);
     if ([301, 302, 303, 307, 308].includes(result.statusCode)) {
       if (!result.redirect) throw new Error(`重定向缺少 Location: ${result.statusCode}`);
       const next = new URL(result.redirect, url).toString();
-      ({ url, addresses } = await validateFetchUrl(next));
+      ({ url, addresses } = await validateFetchUrl(next, policy));
       continue;
     }
     if (result.statusCode < 200 || result.statusCode >= 300) {

@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>陪伴字幕</title>
+<link rel="stylesheet" href="companion.css" />
+</head>
+<body>
+  <div id="bar" class="bar" role="region" aria-label="陪伴字幕">
+    <div class="top">
+      <span id="dot" class="dot"></span>
+      <span id="title" class="title">陪你看会儿</span>
+      <span id="mode" class="mode"></span>
+      <span class="spacer"></span>
+      <span id="fontCtl" class="fontctl" title="调整字号">
+        <button id="fontDown" class="fbtn" type="button">A−</button>
+        <b id="fontVal" class="fval">22</b>
+        <button id="fontUp" class="fbtn" type="button">A+</button>
+      </span>
+      <span id="hint" class="hint">长按拖动 · Ctrl+滚轮缩放 · Ctrl+Alt 历史</span>
+      <button id="close" class="close" type="button" title="关闭陪伴">×</button>
+    </div>
+
+    <div id="thread" class="thread" aria-live="polite"></div>
+    <div id="placeholder" class="placeholder">在陪你看着，先不说话。</div>
+
+    <div id="history" class="history" aria-label="历史字幕"></div>
+
+    <div id="inputRow" class="input-row">
+      <input id="input" class="input" type="text" maxlength="200" placeholder="回她一句…" autocomplete="off" />
+      <button id="send" class="send" type="button">发</button>
+    </div>
+
+    <div id="resize" class="resize" title="拖动改宽度"></div>
+  </div>
+  <script src="companion.js"></script>
+</body>
+</html>

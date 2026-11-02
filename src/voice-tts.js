@@ -200,12 +200,20 @@ export async function synthesizeSongToFile({
 
   // 引擎信息要跟着缓存走：命中缓存时响应头已经没了，只能靠这个 sidecar 还原「这是真 SVS 还是清唱」。
   // skipped：极个别字连重试+换模板都唱不出来时，适配器会留静音一拍并报数，别假装唱全了。
+  // 适配器的中文原因走 percent-encode（HTTP 头只能 latin-1），这里解回人类可读文本。
+  const pct = (v) => {
+    try {
+      return decodeURIComponent(v);
+    } catch {
+      return v;
+    }
+  };
   const info = {
     engine: res.headers.get('x-engine') || 'tts-syllable',
     rvc: res.headers.get('x-rvc') || 'off',
-    svsFallback: res.headers.get('x-svs-fallback') || '',
+    svsFallback: pct(res.headers.get('x-svs-fallback') || ''),
     skipped: Number(res.headers.get('x-skipped-chars')) || 0,
-    skippedChars: res.headers.get('x-skipped') || ''
+    skippedChars: pct(res.headers.get('x-skipped') || '')
   };
   writeSongMeta(file, info);
 

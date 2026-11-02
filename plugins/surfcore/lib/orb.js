@@ -23,6 +23,7 @@ import {
 } from './pet.js';
 import { readUnified, saveUnified } from './store.js';
 import { createPetAssetsService } from './pet-assets.js';
+import { DEFAULT_COMPANION, normalizeCompanionConfig } from './orb-companion.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** 随插件发布的悬浮窗应用源码目录。 */
@@ -53,6 +54,9 @@ export const DEFAULT_ORB = {
     // 气泡图文一体：同一条消息的图和字画在一个气泡里（图在上、字在下）。
     // 关掉就拆成「图气泡 + 文字气泡」，跟以前一样。
     richBubble: true,
+    // 互通记忆：和 QQ / B站 共用同一张衰减记忆卡——这边聊的写进去，那边的事她也读得到。
+    // 关掉 = 只当悬浮窗里的私聊：不写卡，读卡也停（桌宠的开关各管各的，不连坐）。
+    shareMemory: true,
     // 气泡上要不要显示头像/名字。默认显示——主人要求「像 QQ 那样一人一排」。
     ident: {
       showAvatar: true,
@@ -90,6 +94,8 @@ export const DEFAULT_ORB = {
     ],
   },
   // 悬浮窗会话里发图（跟 QQ 那边的 socialV2.pic 完全是两套开关）。
+  // 陪伴模式：和主人一起看电影/看屏幕，屏幕底部字幕条。
+  companion: { ...DEFAULT_COMPANION },
   pic: {
     // 默认关：打开后她才能在悬浮窗里发表情包/图片。
     enabled: false,
@@ -102,6 +108,11 @@ export const DEFAULT_ORB = {
     maxPerHour: 12,
   },
 };
+
+/** 去掉首尾空白和引号：资源管理器「复制文件地址」贴进来的是 "C:\…\a.jpg"。 */
+function stripQuotes(value) {
+  return String(value ?? '').trim().replace(/^["'\u201c\u201d]+/, '').replace(/["'\u201c\u201d]+$/, '').trim();
+}
 
 function clampNum(value, fallback, min, max, { integer = false } = {}) {
   const n = Number(value);
@@ -151,6 +162,7 @@ export function normalizeOrbConfig(raw) {
       maxBubbles: clampNum(chat.maxBubbles, DEFAULT_ORB.chat.maxBubbles, 1, 5, { integer: true }),
       maxPerTurn: clampNum(chat.maxPerTurn, DEFAULT_ORB.chat.maxPerTurn, 1, 5, { integer: true }),
       richBubble: chat.richBubble !== false,
+      shareMemory: chat.shareMemory !== false,
       ident: {
         showAvatar: chat.ident?.showAvatar !== false,
         showName: chat.ident?.showName !== false,
@@ -158,8 +170,9 @@ export function normalizeOrbConfig(raw) {
         meName: String(chat.ident?.meName ?? '').slice(0, 24),
         herQQ: String(chat.ident?.herQQ ?? '').replace(/[^0-9]/g, '').slice(0, 12),
         meQQ: String(chat.ident?.meQQ ?? '').replace(/[^0-9]/g, '').slice(0, 12),
-        herPath: String(chat.ident?.herPath ?? '').slice(0, 260),
-        mePath: String(chat.ident?.mePath ?? '').slice(0, 260),
+        // 资源管理器「复制文件地址」带的是带引号的路径，留着引号 fs.existsSync 永远 false。
+        herPath: stripQuotes(chat.ident?.herPath).slice(0, 260),
+        mePath: stripQuotes(chat.ident?.mePath).slice(0, 260),
       },
     },
     screen: {
@@ -181,6 +194,7 @@ export function normalizeOrbConfig(raw) {
       maxPerHour: clampNum(screen.maxPerHour, DEFAULT_ORB.screen.maxPerHour, 0, 60, { integer: true }),
       denyTitles: strList(screen.denyTitles, DEFAULT_ORB.screen.denyTitles),
     },
+    companion: normalizeCompanionConfig(src.companion),
     pic: {
       enabled: pic.enabled === true,
       preferQqSticker: pic.preferQqSticker !== false,
@@ -197,7 +211,7 @@ function pidAlive(pid) {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
-export function createOrbService({ stateDir, pluginLog = () => {}, getSubprocess = () => null, appSource = ORB_APP_SOURCE, petAssets = null } = {}) {
+export function createOrbService({ stateDir, pluginLog = () => {}, getSubprocess = () => null, appSource = ORB_APP_SOURCE, petAssets = null, archiveMessage = null } = {}) {
   const root = path.join(stateDir, 'orb');
   const appDir = path.join(root, 'app');
   const pidFile = path.join(root, 'run.pid');
@@ -301,11 +315,26 @@ export function createOrbService({ stateDir, pluginLog = () => {}, getSubprocess
     return abs.startsWith(base + path.sep);
   }
 
-  function addMessage({ who = 'her', text = '', kind = 'chat', at = Date.now(), image = '' } = {}) {
+  function cleanFiles(files = []) {
+    const list = Array.isArray(files) ? files : [];
+    return list.slice(0, 6).map((file) => {
+      const imagePath = file?.imagePath && picFileAllowed(file.imagePath) ? path.resolve(String(file.imagePath)) : '';
+      return {
+        name: String(file?.name || '附件').slice(0, 120),
+        size: Number(file?.size) || 0,
+        mime: String(file?.mime || 'application/octet-stream').slice(0, 100),
+        kind: ['image', 'text', 'binary'].includes(file?.kind) ? file.kind : 'binary',
+        ...(imagePath ? { imagePath } : {}),
+      };
+    });
+  }
+
+  function addMessage({ who = 'her', text = '', kind = 'chat', at = Date.now(), image = '', files = [] } = {}) {
     const clean = String(text ?? '').trim();
     const pic = picFileAllowed(image) ? path.resolve(String(image)) : '';
-    // 只有图没有字是合法的（发表情包的时候）。
-    if (!clean && !pic) return null;
+    const extras = cleanFiles(files);
+    // 只有图/附件没有字也是合法的（发表情包、丢个文件的时候）。
+    if (!clean && !pic && !extras.length) return null;
     const state = readState();
     const seq = state.seq + 1;
     const message = {
@@ -315,9 +344,27 @@ export function createOrbService({ stateDir, pluginLog = () => {}, getSubprocess
       kind: ['proactive', 'reply', 'chat', 'system', 'pic'].includes(kind) ? kind : 'chat',
       at: Number(at) || Date.now(),
       ...(pic ? { image: pic } : {}),
+      ...(extras.length ? { files: extras } : {}),
     };
     const messages = [...state.messages, message].slice(-MESSAGE_LIMIT);
     writeState({ seq, messages, seenId: state.seenId });
+    // 主动/系统气泡单独入库；用户句和普通回复已由 pet-chat 写，避免重复。
+    if (typeof archiveMessage === 'function' && message.who === 'her' && (message.kind === 'proactive' || message.kind === 'system')) {
+      try {
+        archiveMessage({
+          channel: 'desktop-orb',
+          role: 'assistant',
+          text: message.text,
+          at: message.at,
+          id: `orb:${message.at}:${message.id}`,
+          type: pic ? 'mixed' : 'text',
+          media: pic ? [{ kind: 'image' }] : [],
+          proactive: message.kind === 'proactive',
+        });
+      } catch (error) {
+        pluginLog('[orb] 写主动气泡存档失败：', String(error?.message ?? error).slice(0, 160));
+      }
+    }
     return message;
   }
 

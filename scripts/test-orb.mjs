@@ -190,7 +190,7 @@ ok('收起态允许桌宠贴到屏幕边', orbHas(mainJs, 'function clampForMode
 ok('不贴边就不吸右', orbHas(mainJs, 'docked: false'));
 ok('面板位置记在 prefs', orbHas(mainJs, 'panelX', 'panelY'));
 ok('面板可拖的 IPC', orbHas(mainJs, "orb:panel-move"));
-ok('菜单临时撑大窗口', orbHas(mainJs, 'orb:menurect', 'menuNeed', "displayMode === 'menu'"));
+ok('菜单临时撑大窗口', orbHas(mainJs, 'orb:menurect', 'menuNeed', 'menuOpen'));
 ok('面板头有「移」按钮', orbHas(html, 'id="btnMove"'));
 ok('渲染端做菜单位移补偿', orbHas(orbJs, 'menurect', '--pet-dx'));
 ok('渲染端按 screen 状态显示提示条', orbHas(orbJs, 'renderScreenHint', 'screenHint'));
@@ -308,6 +308,14 @@ ok('设置页有「聊天外观」段与清头像缓存', orbHas(clientJs, '聊�
   ok('气泡按角色头顶摆而不是窗口顶边', h(petJs, 'PET_HEAD_RATIO', 'function placeBubble(', 'bubble.style.bottom'));
   ok('气泡弹出/换动作/窗口变化都重摆', h(petJs, 'placeBubble();') && h(petJs, "window.addEventListener('resize', () => placeBubble())"));
   ok('气泡不再钉死在 top:8px', !h(petCss, 'top: 8px') && h(petCss, 'top: auto;'));
+
+  // ── 0.12.2：能拖到最上面 / 透明处不再挡点击 ──────────────────────────
+  ok('左边吸附不会把她吸出屏幕', h(mainSrc, "near.side === 'left' ? area.x : area.x + area.width - bounds.width"));
+  ok('往上拖不再被气泡带卡住', h(mainSrc, 'const bodyH = Math.min(height', 'const minY = area.y - (height - bodyH)'));
+  ok('主进程轮询光标决定穿透', h(mainSrc, 'function startClickWatch(', 'screen.getCursorScreenPoint()', 'orb:bubble-shown', 'orb:ui-hold'));
+  ok('只有宠物实体和气泡带可点', h(mainSrc, 'function bodyRectInWindow(', 'setClickThrough(!(inBody || inBubbleBand))'));
+  ok('气泡显示时才留出可点带', h(petJs, 'window.orb?.bubbleShown?.(true)', 'window.orb?.bubbleShown?.(false)'));
+  ok('菜单/看图打开时整窗可点', h(orbJs, 'window.orb?.uiHold?.(true)', 'window.orb?.uiHold?.(false)') && h(preload, 'uiHold:', 'bubbleShown:'));
   ok('桌宠按 pet-size 反推整帧放大', h(petCss, 'calc(var(--pet-size, 200px) * 1.22)') && h(petJs, "setProperty('--pet-size'"));
 
   // ── 0.10.3：大小滑条改 0-100%，拖动途中不窗口跳 ────────────────────────
@@ -331,7 +339,7 @@ ok('设置页有「聊天外观」段与清头像缓存', orbHas(clientJs, '聊�
   ok('两个开关能被关/开回来', orbNormOff.chat.richBubble === false && orbNormOff.pic.attachToChat === true);
   ok('挑图逻辑抽成 pickPic', h(httpSrc, 'async function pickPic(', 'source: \'sticker\'', 'source: \'local\''));
   ok('/pic 复用 pickPic', h(httpSrc, 'const picked = await pickPic({ hint, source, cfg })'));
-  ok('聊天回合抽成 runChatTurn', h(httpSrc, 'async function runChatTurn({ text, cfg })'));
+  ok('聊天回合抽成 runChatTurn', h(httpSrc, 'async function runChatTurn({ text, cfg'));
   ok('聊天队列串行执行', h(httpSrc, 'const chatQueue = []', 'let chatBusy = false', 'async function pumpChatQueue()'));
   ok('队列有上限', h(httpSrc, 'const CHAT_QUEUE_MAX = 20', '429'));
   ok('排队请求立刻回 200', h(httpSrc, 'body.queue === true', 'queued: true', 'position, state: stateForOrb()'));
@@ -343,8 +351,8 @@ ok('设置页有「聊天外观」段与清头像缓存', orbHas(clientJs, '聊�
   ok('聊天提示词支持配图暗号', h(chatSrc, 'allowPic', '[[配图: 画面描述]]'));
   ok('历史里不留配图暗号', h(chatSrc, 'historyText', 'reply.replace(/\\[\\[配图'));
   ok('面板支持图文一体分流', h(orbSrc, 'const rich = state?.config?.chat?.richBubble !== false', 'const splitPic', 'makeBubble(true, false, false)'));
-  ok('发送后立刻清空输入框', h(orbSrc, 'input.value = \'\';', 'body: { text, queue: true }'));
-  ok('清空在请求之前', orbSrc.indexOf('input.value = \'\';') < orbSrc.indexOf("body: { text, queue: true }"));
+  ok('发送后立刻清空输入框', h(orbSrc, 'input.value = \'\';', 'body: { text, queue: true'));
+  ok('清空在请求之前', orbSrc.indexOf('input.value = \'\';') < orbSrc.indexOf('body: { text, queue: true'));
   ok('发送失败把话还回去', h(orbSrc, 'if (!input.value) input.value = text;'));
   ok('排队时提示前面几条', h(orbSrc, '已排队：前面还有'));
   ok('排队没回完不自动收起', h(orbSrc, 'function queueBusy()', 'sending || queueBusy()'));
@@ -388,6 +396,35 @@ ok('设置页有「聊天外观」段与清头像缓存', orbHas(clientJs, '聊�
   // E. QQ 近况：撤掉原文通道，只用共用那张衰减记忆卡
   ok('不再有 QQ 原文通道', !h(httpSrc, 'recentQqLines') && !h(chatSrc, '你们刚在 QQ 上聊的') && !h(uiSrc, 'chat.shareQqRecent'));
   ok('悬浮窗仍用同一张记忆卡', h(chatSrc, "memoryCardPromptBlock('qq')", 'memoryBlock()'));
+
+  // ── 0.12.1：记忆三项互通（悬浮窗自己的开关 + B站 读桌宠记忆）───────────
+  ok('互通记忆默认开', def.chat.shareMemory === true);
+  ok('归一化带互通记忆', orbLibSrc.includes('shareMemory: chat.shareMemory !== false'));
+  const orbNormMem = normalizeOrbConfig({ chat: { shareMemory: false } });
+  ok('互通记忆能关', orbNormMem.chat.shareMemory === false);
+  ok('悬浮窗记忆开关走自己的配置', h(chatSrc, 'isOrb ? orbChat.shareMemory !== false : chat.remember !== false'));
+  ok('关掉互通就不再读卡', h(chatSrc, 'isOrb && unified?.orb?.chat?.shareMemory === false'));
+  ok('设置页有「互通记忆」', h(uiSrc, '互通记忆', 'chat.shareMemory'));
+  const memoryCardSrc = rd('src/memory-card.js');
+  ok('记忆卡有 B站 带桌宠的开关', h(memoryCardSrc, 'includePetInBili', 'includePetInBili: bool(raw.includePetInBili'));
+  ok('B站 记忆放行桌宠 scope', h(memoryCardSrc, "cfg.includePetInBili && record.scope === 'pet'"));
+  // 2026-11-01 隐私硬规则：B站 只放她自己那侧，主人私聊与隐私词在 visibleFor 就筛掉。
+  ok('B站 桌宠只放她自己那侧', h(memoryCardSrc, "record.source === 'pet-self'", 'record.screenSeen === false', 'biliPrivacyHit(record)'));
+  ok('隐私词命中整条不进 B站', h(memoryCardSrc, 'function biliPrivacyHit(', '/\\d{5,}/', 'BILI_PRIVATE_RE'));
+  ok('看屏幕那侧的记忆标了 screenSeen', h(memoryCardSrc, 'screenSeen: input.screenSeen === true', 'item.screenVision !== false'));
+  ok('聊天的看屏标记按 desktop/image 判定', h(chatSrc, 'screenAware: Boolean(desktop) || Boolean(image)', 'screenVision'));
+  ok('主动搭话永远算看屏那侧', h(chatSrc, 'screenAware: true'));
+  ok('B站 注入块是硬规矩不是提醒', h(memoryCardSrc, '硬规矩，不是建议', '一条都没有进这里'));
+  ok('设置页说清楚私聊进不来', h(uiSrc, '你和她的私聊记录', '一条都不会进 B站'));
+  ok('设置页有「B站 提示词带桌宠」', h(uiSrc, 'B站 提示词带桌宠', 'setConfig("includePetInBili"'));
+
+  // 2026-11-01 0.12.9：头像要真的能显示出来。
+  // 悬浮窗页面是 loadFile(index.html)（file:// 源）打开的，`/avatar?who=her` 这类相对路径
+  // 会被解析成 file:///avatar?… → 永远 404，头像只剩一个字母点；填什么都一样。
+  ok('头像给的是本地 file:// URL', h(httpSrc, 'function fileUrl(', 'file:///', "avatarUrlSync('her', id)", "avatarUrlSync('me', id)"));
+  ok('头像文件路径剥掉引号（复制文件地址自带引号）', h(httpSrc, 'function stripPath(', 'herPath: stripPath(raw.herPath)') && h(rd('plugins/surfcore/lib/orb.js'), 'function stripQuotes(', 'herPath: stripQuotes('));
+  ok('QQ 头像缓存按身份分文件名 + 后台补', h(httpSrc, 'function avatarCacheFor(', 'function ensureAvatar(', 'avatarPatching', 'sweepAvatarCache('));
+  ok('拿不到头像就不塞 src（别让 img 去请求页面本身）', h(orbSrc, 'if (who.avatarUrl) img.src = who.avatarUrl;', "else img.classList.add('noava');"));
 }
 
 if (fails.length) {

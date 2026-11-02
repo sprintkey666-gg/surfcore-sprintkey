@@ -8,6 +8,9 @@
   const empty = document.getElementById('empty');
   const input = document.getElementById('input');
   const btnSend = document.getElementById('btnSend');
+  const btnAttach = document.getElementById('btnAttach');
+  const composerEl = document.querySelector('.composer');
+  const attachmentsEl = document.getElementById('composerAttachments');
   const btnNew = document.getElementById('btnNew');
   const btnHide = document.getElementById('btnHide');
   const btnPin = document.getElementById('btnPin');
@@ -35,6 +38,155 @@
   function setHint(text, bad = false) {
     hint.textContent = text || '';
     hint.className = bad ? 'hint bad' : 'hint';
+  }
+
+  // ==== 待发附件（图片 / 文件）========================================
+  // 路径能拿到就只传路径（服务端读原文）；浏览器粘贴的图片没有路径，转 dataURL。
+  const MAX_PENDING_FILES = 6;
+  const MAX_PENDING_IMAGE = 8 * 1024 * 1024;
+  const MAX_PENDING_FILE = 20 * 1024 * 1024;
+  const MAX_PENDING_DATA = 16 * 1024 * 1024;
+  let pendingFiles = [];
+
+  const filesBytes = () => pendingFiles.reduce((n, f) => n + Number(f.size || 0), 0);
+  const dataBytes = () => pendingFiles.reduce((n, f) => n + (f.dataUrl ? String(f.dataUrl).length : 0), 0);
+  const fileUrlOf = (p) => `file:///${String(p).replace(/\\/g, '/')}`;
+  const fmtSize = (n) => {
+    const b = Number(n) || 0;
+    if (b >= 1024 * 1024) return `${(b / 1024 / 1024).toFixed(1)}M`;
+    if (b >= 1024) return `${Math.round(b / 1024)}K`;
+    return `${b}B`;
+  };
+
+  function renderAttachments() {
+    if (!attachmentsEl) return;
+    attachmentsEl.innerHTML = '';
+    attachmentsEl.classList.toggle('hidden', pendingFiles.length === 0);
+    pendingFiles.forEach((file, index) => {
+      const chip = document.createElement('div');
+      chip.className = 'file-chip';
+      chip.title = file.name;
+      if (file.kind === 'image' && (file.dataUrl || file.path)) {
+        const img = document.createElement('img');
+        img.className = 'thumb';
+        img.alt = '';
+        img.src = file.dataUrl || fileUrlOf(file.path);
+        chip.appendChild(img);
+      } else {
+        const icon = document.createElement('span');
+        icon.textContent = '📄';
+        icon.style.fontSize = '16px';
+        icon.style.flex = '0 0 auto';
+        chip.appendChild(icon);
+      }
+      const name = document.createElement('span');
+      name.className = 'fname';
+      name.textContent = `${file.name} · ${fmtSize(file.size)}`;
+      chip.appendChild(name);
+      const x = document.createElement('button');
+      x.className = 'chip-x';
+      x.type = 'button';
+      x.title = '移除';
+      x.textContent = '×';
+      x.addEventListener('click', () => {
+        pendingFiles.splice(index, 1);
+        renderAttachments();
+      });
+      chip.appendChild(x);
+      attachmentsEl.appendChild(chip);
+    });
+  }
+
+  function addPending(item) {
+    if (!item || !item.name) return false;
+    if (pendingFiles.length >= MAX_PENDING_FILES) {
+      setHint(`一次最多带 ${MAX_PENDING_FILES} 个附件`, true);
+      return false;
+    }
+    const size = Number(item.size) || 0;
+    if (item.kind === 'image' && size > MAX_PENDING_IMAGE) {
+      setHint(`图片「${item.name}」超过 8M，换张小点的`, true);
+      return false;
+    }
+    if (item.kind !== 'image' && size > MAX_PENDING_FILE) {
+      setHint(`文件「${item.name}」超过 20M`, true);
+      return false;
+    }
+    if (dataBytes() + (item.dataUrl ? String(item.dataUrl).length : 0) > MAX_PENDING_DATA) {
+      setHint('附件总共太大了，分两次发吧', true);
+      return false;
+    }
+    const dup = pendingFiles.some((f) => (f.path && item.path && f.path === item.path)
+      || (!f.path && !item.path && f.name === item.name && f.size === item.size));
+    if (dup) return false;
+    pendingFiles.push(item);
+    renderAttachments();
+    return true;
+  }
+
+  function addPicked(list) {
+    for (const raw of Array.isArray(list) ? list : []) {
+      if (!raw?.path) continue;
+      const name = String(raw.name || raw.path.split(/[\\/]/).pop() || '文件');
+      const kind = /\.(png|jpe?g|webp|gif|bmp)$/i.test(name) || String(raw.mime || '').startsWith('image/') ? 'image' : 'file';
+      addPending({ name, size: raw.size, path: raw.path, kind });
+    }
+  }
+
+  function readAsDataUrl(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => reject(reader.error || new Error('读取图片失败'));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function addFromFile(file) {
+    if (!file) return;
+    const name = String(file.name || '粘贴的文件');
+    const kind = String(file.type || '').startsWith('image/') ? 'image' : 'file';
+    const size = Number(file.size) || 0;
+    let path = '';
+    try { path = String(window.orb?.pathForFile?.(file) || ''); } catch { path = ''; }
+    if (path) {
+      addPending({ name, size, path, kind });
+      return;
+    }
+    if (kind === 'image') {
+      try {
+        const dataUrl = await readAsDataUrl(file);
+        addPending({ name, size, dataUrl, kind });
+      } catch (error) {
+        setHint(String(error?.message ?? error), true);
+      }
+      return;
+    }
+    // 没有路径的小文本文件：直接读成 text 交给服务端拼提示词。
+    if (size <= 200 * 1024 && (String(file.type || '').startsWith('text/') || /\.(txt|md|json|jsonl|csv|log|js|ts|py|html|css|xml|ya?ml)$/i.test(name))) {
+      try {
+        const text = await file.text();
+        addPending({ name, size, text, kind: 'file' });
+      } catch (error) {
+        setHint(String(error?.message ?? error), true);
+      }
+      return;
+    }
+    setHint('这个文件拿不到本地路径，换「+」选一次试试', true);
+  }
+
+  function addFromDataTransfer(dt) {
+    const files = Array.from(dt?.files || []);
+    for (const file of files) addFromFile(file);
+    // 有些应用拖拽只给 items，没有 files。
+    if (!files.length && dt?.items) {
+      for (const item of Array.from(dt.items)) {
+        if (item.kind === 'file') {
+          const file = item.getAsFile();
+          if (file) addFromFile(file);
+        }
+      }
+    }
   }
 
   function applyAvatar(cfg) {
@@ -80,7 +232,8 @@
         const img = document.createElement('img');
         img.className = 'ava';
         img.alt = '';
-        img.src = who.avatarUrl || '';
+        if (who.avatarUrl) img.src = who.avatarUrl;
+        else img.classList.add('noava');
         img.addEventListener('error', () => { img.classList.add('noava'); img.removeAttribute('src'); });
         div.appendChild(img);
       } else {
@@ -131,6 +284,32 @@
           el.appendChild(pic);
         }
         if (withText && m.text) el.appendChild(document.createTextNode(esc(m.text)));
+        if (withText && Array.isArray(m.files) && m.files.length) {
+          const box = document.createElement('div');
+          box.className = 'bubble-files';
+          for (const file of m.files) {
+            if (file?.kind === 'image' && file.imagePath) {
+              const img = document.createElement('img');
+              img.alt = file.name || '图片';
+              img.title = `${file.name || '图片'} · ${fmtSize(file.size)}`;
+              img.src = fileUrlOf(file.imagePath);
+              img.addEventListener('error', () => { img.style.display = 'none'; });
+              img.addEventListener('dblclick', (ev) => {
+                ev.preventDefault();
+                ev.stopPropagation();
+                openViewer(img.src);
+              });
+              box.appendChild(img);
+            } else {
+              const chip = document.createElement('span');
+              chip.className = 'bubble-file';
+              chip.title = file?.name || '文件';
+              chip.textContent = `📄 ${file?.name || '文件'} · ${fmtSize(file?.size)}`;
+              box.appendChild(chip);
+            }
+          }
+          el.appendChild(box);
+        }
         if (withMeta) {
           const meta = document.createElement('span');
           meta.className = 'meta';
@@ -360,6 +539,8 @@
   function openViewer(src) {
     if (!viewerEl || !viewerImg || !src) return;
     view.open = true;
+    // 看图是整窗覆盖层：打开期间别让主进程把窗口设成穿透，否则点不到 × 和背景
+    try { void window.orb?.uiHold?.(true); } catch {}
     view.scale = 1;
     view.tx = 0;
     view.ty = 0;
@@ -375,6 +556,7 @@
   function closeViewer() {
     if (!view.open || !viewerEl) return;
     view.open = false;
+    try { void window.orb?.uiHold?.(false); } catch {}
     view.drag = null;
     viewerEl.classList.add('hidden');
     viewerImg?.classList.remove('grabbing');
@@ -490,9 +672,9 @@
     }, 1200);
   }
 
-  function show() {
+  async function show() {
     try { window.SurfPet?.pause?.(); } catch {}
-    closeCtxMenu();
+    await closeCtxMenu();
     if (expanded) return;
     expanded = true;
     root.classList.add('expanded');
@@ -718,17 +900,31 @@
 
   async function send() {
     const text = input.value.trim();
-    if (!text) return;
-    // 先把输入框清掉再发：她回多久都不耽误主人接着打字（回复在后台排队逐条来）。
+    if (!text && !pendingFiles.length) return;
+    const files = pendingFiles.map((f) => ({
+      name: f.name,
+      ...(f.path ? { path: f.path } : {}),
+      ...(f.dataUrl ? { dataUrl: f.dataUrl } : {}),
+      ...(f.text ? { text: f.text } : {}),
+    }));
+    const hadFiles = files.length > 0;
+    const snapshot = pendingFiles.slice();
+    // 先把输入框和附件清掉再发：她回多久都不耽误主人接着打字（回复在后台排队逐条来）。
     input.value = '';
+    pendingFiles = [];
+    renderAttachments();
     btnSend.disabled = true;
     ball.classList.add('thinking');
     setHint('她在想…');
     try {
-      const res = await window.orb.http('/chat', { method: 'POST', body: { text, queue: true }, timeoutMs: 15000 });
+      const res = await window.orb.http('/chat', { method: 'POST', body: { text, queue: true, files }, timeoutMs: 30000 });
       if (!res.ok) {
         // 没发出去就把话说还给他，别让他白打一遍。
         if (!input.value) input.value = text;
+        if (hadFiles && !pendingFiles.length) {
+          pendingFiles = snapshot;
+          renderAttachments();
+        }
         setHint(res.error || '没发出去', true);
         ball.classList.remove('thinking');
       } else {
@@ -746,6 +942,44 @@
   }
 
   btnSend.addEventListener('click', send);
+  btnAttach?.addEventListener('click', async () => {
+    const res = await window.orb?.pickFiles?.();
+    if (!res?.ok) { if (res?.error) setHint(res.error, true); return; }
+    addPicked(res.files);
+    if (renderAttachments) renderAttachments();
+  });
+  // 输入框里直接粘贴图片/文件；纯文字粘贴交给浏览器原生处理。
+  input.addEventListener('paste', (ev) => {
+    const dt = ev.clipboardData;
+    const files = Array.from(dt?.files || []);
+    if (!files.length) return;
+    ev.preventDefault();
+    for (const file of files) addFromFile(file);
+  });
+  // 拖拽到面板任意位置都能加附件。
+  let dragDepth = 0;
+  panel.addEventListener('dragenter', (ev) => {
+    if (!ev.dataTransfer?.types?.includes('Files')) return;
+    ev.preventDefault();
+    dragDepth += 1;
+    composerEl?.classList.add('dragover');
+  });
+  panel.addEventListener('dragover', (ev) => {
+    if (!ev.dataTransfer?.types?.includes('Files')) return;
+    ev.preventDefault();
+    ev.dataTransfer.dropEffect = 'copy';
+  });
+  panel.addEventListener('dragleave', () => {
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (!dragDepth) composerEl?.classList.remove('dragover');
+  });
+  panel.addEventListener('drop', (ev) => {
+    if (!ev.dataTransfer?.types?.includes('Files')) return;
+    ev.preventDefault();
+    dragDepth = 0;
+    composerEl?.classList.remove('dragover');
+    addFromDataTransfer(ev.dataTransfer);
+  });
   input.addEventListener('keydown', (ev) => {
     if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); send(); }
   });
@@ -793,6 +1027,13 @@
   const ctxActionBtn = document.getElementById('ctxAction');
   const ctxHideBtn = document.getElementById('ctxHide');
   const ctxSizeToggle = document.getElementById('ctxSizeToggle');
+  const ctxCompanionBtn = document.getElementById('ctxCompanion');
+  const ctxCompanionPanel = document.getElementById('ctxCompanionPanel');
+  const ctxCompToggle = document.getElementById('ctxCompToggle');
+  const ctxCompContext = document.getElementById('ctxCompContext');
+  const ctxCompOpacity = document.getElementById('ctxCompOpacity');
+  const ctxCompOpacityValue = document.getElementById('ctxCompOpacityValue');
+  let companionState = null;
   let petMode = false;
   // 本地微调过的大小（右键滑条写的 prefs.petSize），开菜单时要用它回填滑条
   let petPrefs = null;
@@ -878,78 +1119,121 @@
   // 窗口尺寸一动不动，所以必须画在窗口内部，不能用原生菜单（原生菜单放不了控件）。
   let ctxOpenState = false;
   let ctxSizeShown = false;
+  // 打开菜单那一刻面板是不是展开的：关闭菜单只能回到这个状态，不能被中途的 click 改掉。
+  let ctxWasExpanded = false;
 
   function placeCtxMenu(ev) {
     if (!ctxMenuEl) return;
     const rootRect = root.getBoundingClientRect();
     const petRect = (petStage || root).getBoundingClientRect();
-    const mw = 168;
-    const mh = ctxSizeShown ? 214 : 176;
-    // 优先贴在宠物右边，放不下就翻到左边；竖直方向跟鼠标对齐，夹在窗口内。
+    const mw = Math.max(184, Math.ceil(ctxMenuEl.scrollWidth) + 4);
+    const mh = Math.max(120, Math.ceil(ctxMenuEl.scrollHeight) + 4);
+    // 优先贴在宠物右边，放不下就翻到左边；最后按窗口真实宽高夹一次，保证整块可见。
     let left = petRect.right - rootRect.left + 6;
-    if (left + mw > rootRect.width) left = petRect.left - rootRect.left - mw - 6;
-    if (left < 4) left = 4;
+    if (left + mw > rootRect.width - 4) left = petRect.left - rootRect.left - mw - 6;
+    left = Math.max(4, Math.min(left, rootRect.width - mw - 4));
     let top = (ev?.clientY ?? petRect.top - rootRect.top) - 8;
     top = Math.max(4, Math.min(top, rootRect.height - mh - 4));
     ctxMenuEl.style.left = `${Math.round(left)}px`;
     ctxMenuEl.style.top = `${Math.round(top)}px`;
   }
 
-  function openCtxMenu(ev) {
+  function paintCompanionMenu(state) {
+    if (state && typeof state === 'object') companionState = state;
+    const active = companionState?.active === true;
+    if (ctxCompToggle) {
+      ctxCompToggle.textContent = active ? '关闭陪伴' : '开启陪伴';
+      ctxCompToggle.classList.toggle('on', active);
+    }
+    if (ctxCompContext) ctxCompContext.checked = companionState?.contextSubtitles === true;
+    const opacity = Math.min(90, Math.max(0, Number(companionState?.opacity ?? 55)));
+    if (ctxCompOpacity) ctxCompOpacity.value = String(opacity);
+    if (ctxCompOpacityValue) ctxCompOpacityValue.textContent = `${Math.round(opacity)}%`;
+  }
+
+  async function refreshCompanionMenu() {
+    try {
+      const r = await window.orb?.companion?.status?.();
+      paintCompanionMenu(r?.companion || r?.status || r);
+    } catch {}
+  }
+
+  async function fitCtxWindow() {
+    try {
+      // 等一帧让刚展开的滑条/换行先完成布局，否则量到的是旧高度。
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const rect = ctxMenuEl?.getBoundingClientRect();
+      if (!rect) return null;
+      const need = {
+        width: Math.ceil(Math.max(rect.width, ctxMenuEl.scrollWidth, 190)) + 16,
+        height: Math.ceil(Math.max(rect.height, ctxMenuEl.scrollHeight, 120)) + 16,
+      };
+      const box = window.orb?.menurect ? await window.orb.menurect(need) : null;
+      if (box) {
+        root.style.setProperty('--pet-dx', `${Number(box.dx) || 0}px`);
+        root.style.setProperty('--pet-dy', `${Number(box.dy) || 0}px`);
+      }
+      return box;
+    } catch {
+      return null;
+    }
+  }
+
+  async function openCtxMenu(ev) {
     try { window.orb?.log?.('[menu] open'); } catch {}
+    ctxWasExpanded = expanded === true;
     ctxOpenState = true;
+    paintCompanionMenu(null);
+    void refreshCompanionMenu();
+    // 菜单是 HTML 覆盖层，可能画在宠物矩形之外：打开期间整窗保持可点
+    try { void window.orb?.uiHold?.(true); } catch {}
     ctxSizeShown = false;
     ctxSizeEl?.classList.add('hidden');
     ctxMenuEl?.classList.remove('hidden');
     root.classList.add('ctxopen');
+    // 先在窗口左上角量真实尺寸，等窗口长大/夹回屏幕后，再按新窗口摆菜单。
+    ctxMenuEl.style.left = '0px';
+    ctxMenuEl.style.top = '0px';
+    await fitCtxWindow();
+    if (!ctxOpenState) return;
     placeCtxMenu(ev);
-    // 菜单可能比窗口大：让主进程临时把窗口长大，并把宠物按 dx/dy 挪回去，视觉上宠物不动
-    try {
-      const rect = ctxMenuEl?.getBoundingClientRect();
-      const need = rect ? { width: Math.ceil(rect.width) + 16, height: Math.ceil(rect.height) + 16 } : { width: 0, height: 0 };
-      const box = window.orb?.menurect ? window.orb.menurect(need) : null;
-      const apply = (b) => {
-        if (!b) return;
-        root.style.setProperty('--pet-dx', `${Number(b.dx) || 0}px`);
-        root.style.setProperty('--pet-dy', `${Number(b.dy) || 0}px`);
-      };
-      if (box && typeof box.then === 'function') box.then(apply).catch(() => {});
-      else apply(box);
-    } catch {}
     const size = Number(petPrefs?.petSize) || Number(window.__petCfg?.size) || 200;
     const pct = sizeToPercent(size);
     if (ctxSizeRange) ctxSizeRange.value = String(pct);
     if (ctxSizeValue) ctxSizeValue.textContent = `${pct}%`;
   }
 
-  function closeCtxMenu() {
+  async function closeCtxMenu() {
     try { window.orb?.log?.('[menu] close'); } catch {}
     if (!ctxOpenState) return;
     ctxOpenState = false;
+    try { void window.orb?.uiHold?.(false); } catch {}
     ctxSizeShown = false;
     ctxMenuEl?.classList.add('hidden');
     ctxSizeEl?.classList.add('hidden');
     root.classList.remove('ctxopen');
-    // 还原窗口尺寸与宠物偏移
+    // 只关菜单：原来展开就恢复展开，原来收起才回球。
     try {
-      const box = window.orb?.menurect ? window.orb.menurect({ width: 0, height: 0 }) : null;
-      const apply = (b) => {
-        root.style.setProperty('--pet-dx', `${Number(b?.dx) || 0}px`);
-        root.style.setProperty('--pet-dy', `${Number(b?.dy) || 0}px`);
-      };
-      if (box && typeof box.then === 'function') box.then(apply).catch(() => {});
-      else apply(box);
-    } catch {}
+      const box = window.orb?.menurect
+        ? await window.orb.menurect({ width: 0, height: 0, restore: ctxWasExpanded ? 'expanded' : 'collapsed' })
+        : null;
+      root.style.setProperty('--pet-dx', '0px');
+      root.style.setProperty('--pet-dy', '0px');
+      return box;
+    } catch {
+      return null;
+    }
   }
 
-  ctxOpenBtn?.addEventListener('click', () => { closeCtxMenu(); show(); });
-  ctxActionBtn?.addEventListener('click', () => { closeCtxMenu(); window.SurfPet?.shuffle(); });
-  ctxHideBtn?.addEventListener('click', () => { closeCtxMenu(); hide(true); });
-  ctxSizeToggle?.addEventListener('click', () => {
+  ctxOpenBtn?.addEventListener('click', () => { void show(); });
+  ctxActionBtn?.addEventListener('click', async () => { await closeCtxMenu(); window.SurfPet?.shuffle(); });
+  ctxHideBtn?.addEventListener('click', async () => { await closeCtxMenu(); window.orb?.hide?.(); });
+  ctxSizeToggle?.addEventListener('click', async () => {
     try { window.orb?.log?.('[menu] size toggle ' + String(ctxSizeShown)); } catch {}
     ctxSizeShown = !ctxSizeShown;
     ctxSizeEl?.classList.toggle('hidden', !ctxSizeShown);
-    // 菜单变高了，重新夹一次位置，别被窗口下沿切掉
+    // 滑条展开/收起后菜单高度变了：重新量尺寸、扩窗，再摆位置。
+    await fitCtxWindow();
     placeCtxMenu(null);
   });
   ctxSizeRange?.addEventListener('input', () => {
@@ -957,12 +1241,48 @@
     const pct = Number(ctxSizeRange.value) || 0;
     if (ctxSizeValue) ctxSizeValue.textContent = `${Math.round(pct)}%`;
   });
-  ctxSizeRange?.addEventListener('change', () => {
+  ctxSizeRange?.addEventListener('change', async () => {
     const pct = Number(ctxSizeRange.value) || 0;
     const size = percentToSize(pct);
     if (ctxSizeValue) ctxSizeValue.textContent = `${Math.round(pct)}%`;
     try { window.SurfPet?.setSize?.(size); } catch {}
-    void window.orb?.petSize?.(size);
+    try { await window.orb?.petSize?.(size); } catch {}
+    // 宠物变大/变小会改变底窗尺寸，菜单要重新按新窗口夹位。
+    await fitCtxWindow();
+    placeCtxMenu(null);
+  });
+
+  ctxCompToggle?.addEventListener('click', async () => {
+    const active = companionState?.active === true;
+    ctxCompToggle.disabled = true;
+    try {
+      const r = await window.orb?.companion?.toggle?.(active);
+      paintCompanionMenu(r?.data?.companion || r?.data?.status || r?.companion || r?.status || r);
+      if (r?.ok === false || r?.data?.ok === false) ctxCompToggle.textContent = String(r?.error || r?.data?.error || '开启失败').slice(0, 24);
+    } catch (error) {
+      ctxCompToggle.textContent = String(error?.message || error).slice(0, 24);
+    } finally {
+      ctxCompToggle.disabled = false;
+      placeCtxMenu(null);
+    }
+  });
+
+  ctxCompContext?.addEventListener('change', async () => {
+    const checked = ctxCompContext.checked === true;
+    try {
+      const r = await window.orb?.companion?.config?.({ contextSubtitles: checked });
+      paintCompanionMenu(r?.companion || r?.config || r);
+    } catch {}
+  });
+
+  let opacityTimer = 0;
+  ctxCompOpacity?.addEventListener('input', () => {
+    const value = Math.min(90, Math.max(0, Number(ctxCompOpacity.value) || 0));
+    if (ctxCompOpacityValue) ctxCompOpacityValue.textContent = `${value}%`;
+    clearTimeout(opacityTimer);
+    opacityTimer = setTimeout(() => {
+      void window.orb?.companion?.config?.({ opacity: value });
+    }, 120);
   });
   // 点菜单外面 / Esc / 开始拖动，都把菜单收起来
   window.addEventListener('mousedown', (ev) => {
@@ -970,6 +1290,8 @@
     if (ctxMenuEl && ctxMenuEl.contains(ev.target)) return;
     closeCtxMenu();
   }, true);
+  // 点到桌面/别的窗口时 orb 会失焦，也把菜单收掉；只收菜单，不改变面板展开状态。
+  window.addEventListener('blur', () => { if (ctxOpenState) closeCtxMenu(); });
   window.addEventListener('keydown', (ev) => { if (ev.key === 'Escape' && ctxOpenState) closeCtxMenu(); });
 // 面板收起时，她最新一句（含主动）在头顶冒气泡；点气泡开会话。
   let lastBubbleMsgId = '';
@@ -994,6 +1316,18 @@
   }
 
   window.orb.onState(onState);
+  window.orb.onHidden?.(() => {
+    closeCtxMenu();
+    closeViewer?.();
+    expanded = false;
+    root.classList.remove('expanded');
+    window.orb?.log?.('[hide] 已隐藏到托盘');
+  });
+  window.orb.onShown?.(() => {
+    closeCtxMenu();
+    void refreshState();
+    setHint('');
+  });
   window.orb.onConn(({ ok, error }) => {
     connDot.className = `dot ${ok ? 'ok' : 'bad'}`;
     connDot.title = ok ? '已连上 SurfCore' : `连不上：${error || ''}`;

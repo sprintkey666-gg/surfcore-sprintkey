@@ -51,12 +51,17 @@ import * as voiceProfile from '../src/voice-profile.js';
 // 导出名，漏 spread 进沙箱会让所有 vm-load bridge 的用例在第一次 loadConfig 就
 // ReferenceError（PITFALLS #68 的同类坑：新增 src 模块必须同步改 harness）。
 import * as picAuto from '../src/pic-auto.js';
+// 好友申请（2026-11-01）：判定层也是独立模块，bridge 里用到就必须进沙箱。
+import * as friendGuard from '../src/friend-guard.js';
 // 记忆卡自动备份（2026-10-31）：bridge.js 的 loadConfig 会调 normalizeMemoryCardBackupConfig，
 // 漏 spread 进沙箱 → 所有 vm-load bridge 的用例在 loadConfig 就 ReferenceError（同类坑见 PITFALLS #68/#100）。
 import * as memoryBackup from '../src/memory-backup.js';
 // MCP 三条自检（2026-10-31）：bridge.js 的 main() 会调 ensureMcpEntries。这里给个桩，
 // 不引真实现 —— 真的那个会去读写用户的 DSH 补丁文件，测试不该碰用户 home。
 const ensureMcpEntries = () => ({ changed: false, added: [], backup: null, reason: '三条 MCP 都在' });
+// 会话归档（2026-11-01）：bridge.js 的 main() 会 createChatArchiveWriter(...)，
+// 和上面 memoryBackup 同一个坑 —— 模块加进 bridge 就必须同步 spread 进沙箱。
+import * as chatArchive from '../src/chat-archive.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -82,7 +87,7 @@ function wavFixture() {
   return Buffer.concat([h, data]);
 }
 
-export async function bridgeHarness({ config = {}, savedState, files = {}, globals = {}, history = {} } = {}) {
+export async function bridgeHarness({ config = {}, savedState, files = {}, globals = {}, history = {}, groupMembers = {} } = {}) {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-audit-bridge-'));
   fs.mkdirSync(path.join(temp, 'src'));
   fs.mkdirSync(path.join(temp, 'state'));
@@ -136,6 +141,20 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
         },
         arrayBuffer: async () => wavFixture()
       };
+    }
+    // 好友申请：网关没有「成员列表」权限，桥接是逐个群问 member_info。
+    // 夹具按 groupMembers={ '123456789': ['12345'] } 决定谁在群里；不在就回 retcode 100（真网关的表现）。
+    if (action === 'get_group_member_info') {
+      const gid = String(body.group_id ?? '');
+      const uid = String(body.user_id ?? '');
+      const members = (groupMembers[gid] ?? []).map(String);
+      if (!members.includes(uid)) {
+        return { ok: true, status: 200, json: async () => ({ status: 'failed', retcode: 100, wording: 'member not found' }) };
+      }
+      return { ok: true, status: 200, json: async () => ({ status: 'ok', retcode: 0, data: { user_id: Number(uid), nickname: 'm' + uid } }) };
+    }
+    if (action === 'get_stranger_info') {
+      return { ok: true, status: 200, json: async () => ({ status: 'ok', retcode: 0, data: { user_id: Number(body.user_id), nickname: 'stranger' + String(body.user_id) } }) };
     }
     if (action === 'fetch_ptt_text') {
       return { ok: true, status: 200, json: async () => ({ status: 'ok', retcode: 0, data: { text: 'fixture-transcript' } }) };
@@ -249,6 +268,8 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     voiceBudgetCheck, sendVoiceV2, sendVoiceForV2, assertOutboundAuditOk,
     // 自动发图：决策 → 真发 → 记账 整条链路可直接调（不连真 QQ，见 test-pic-wiring.mjs）。
     maybeAutoPicV2, picCfgNow, picRuntimeFor, picLogList, sendLocalImageV2,
+    // 好友申请（2026-11-01）：事件处理 → 动作 → 记账 整条链路可直接调，见 test-friend-wiring.mjs。
+    handleFriendRequestV2, applyFriendDecision, friendScopeOf, readFriendState, friendCfgNow,
     // 图文同条：发送器 + 挑图 + 记账都可直接调，才能断言「一条消息里同时有文字和表情」。
     sendMessagesV2, sendMergedTextPicV2, pickPicForCombineV2, recordPicSentV2,
     getStickerEntries() { return stickerEntries; },
@@ -290,7 +311,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     ...adminIdentity, ...roleCard, ...memoryCard, ...biliCard, ...characterStore, ...historyCatchup,
     ...purposeEngine,
     ...conversationClosure,
-    ...memoryStore, ...worldTreeStore, ...voiceProfile, ...picAuto, ...memoryBackup,
+    ...memoryStore, ...worldTreeStore, ...voiceProfile, ...picAuto, ...memoryBackup, ...friendGuard, ...chatArchive,
     ensureMcpEntries,
     // bridge 里用 as 重命名的绑定，VM 全局要按别名再给一份
     estimateMemoryTokens: memoryStore.estimateTokens,

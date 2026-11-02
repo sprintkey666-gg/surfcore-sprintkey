@@ -139,8 +139,8 @@ console.log('## 7. 节奏闸（时长/上限/本轮）');
   ok(decidePicSource(c, { ...base, now, lastAt: now - 300000, hourCount: 6 }) === null, '每小时上限 → 不发');
   ok(decidePicSource(c, { ...base, now, lastAt: now - 300000 }) !== null, '都满足 → 会发');
   ok(decidePicSource({ ...c, scopes: { ...c.scopes, private: false } }, { ...base, now, lastAt: 0 }) === null, '私聊关了 → 私聊不发');
-  ok(decidePicSource({ ...c, scopes: { ...c.scopes, groupDeny: ['1106703160'] } }, { ...base, kind: 'group', chatId: '1106703160', now }) === null, '黑名单群不发');
-  ok(decidePicSource({ ...c, scopes: { ...c.scopes, groupAllow: ['1106703160'] } }, { ...base, kind: 'group', chatId: '999', now }) === null, '白名单外不发');
+  ok(decidePicSource({ ...c, scopes: { ...c.scopes, groupDeny: ['123456789'] } }, { ...base, kind: 'group', chatId: '123456789', now }) === null, '黑名单群不发');
+  ok(decidePicSource({ ...c, scopes: { ...c.scopes, groupAllow: ['123456789'] } }, { ...base, kind: 'group', chatId: '999', now }) === null, '白名单外不发');
   const onlyGen = { ...c, sources: { sticker: { ...c.sources.sticker, enabled: false }, local: c.sources.local, generate: c.sources.generate } };
   ok(decidePicSource(onlyGen, { ...base, now, lastAt: 0, available: { sticker: false, local: false, generate: false } }) === null, '三路都不可用 → null');
 }

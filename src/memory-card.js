@@ -71,6 +71,8 @@ export const DEFAULT_MEMORY_CARD_CONFIG = Object.freeze({
   notifyOwner: true,
   /** B站 提示词里是否允许带 QQ 记忆（默认关：隐私边界）。 */
   includeQqInBili: false,
+  /** B站 提示词里是否允许带桌宠 / 悬浮窗的记忆（默认开：三项互通；关掉则 B站 只看 B站 和共享记忆）。 */
+  includePetInBili: true,
   /** 记录条数上限，防止 JSON 无限膨胀。 */
   maxRecords: 600,
   /** 全量记忆卡的硬上限：按 JSONL 实际字节数算。0 = 不限制；默认 10GB。 */
@@ -161,6 +163,7 @@ export function normalizeMemoryCardConfig(input = {}) {
     autoCompact: bool(raw.autoCompact, DEFAULT_MEMORY_CARD_CONFIG.autoCompact),
     notifyOwner: bool(raw.notifyOwner, DEFAULT_MEMORY_CARD_CONFIG.notifyOwner),
     includeQqInBili: bool(raw.includeQqInBili, DEFAULT_MEMORY_CARD_CONFIG.includeQqInBili),
+    includePetInBili: bool(raw.includePetInBili, DEFAULT_MEMORY_CARD_CONFIG.includePetInBili),
     maxRecords: clampInt(raw.maxRecords, DEFAULT_MEMORY_CARD_CONFIG.maxRecords, 100, 2000),
     fullMaxBytes,
     fullMaxRecords,
@@ -1199,6 +1202,7 @@ function makeRecord(input, config, now) {
     speaker: short(input.speaker ?? '', 40),
     groupId: String(input.groupId ?? ''),
     private: input.private === true,
+    screenSeen: input.screenSeen === true,
     manual: input.manual === true,
     sensitive: input.sensitive === true || SENSITIVE_TOPIC_RE.test(`${cleanTitle} ${cleanText}`),
     // 全量卡归档标记：有值 = 已追加进 memory-card-full.jsonl，维护器不再重复归档。
@@ -1337,6 +1341,9 @@ export function ingestInboxLines(card, lines, config = {}, now = Date.now()) {
           private: true,
           conversationKey: 'pet',
           tags: ['pet', 'self'],
+          // 没带标记的来源一律按「看屏幕」处理（fail closed）：宁可少记一条 B站 素材，
+          // 也不把「复述主人屏幕」的东西带出去。新代码会显式传 true/false。
+          screenSeen: item.screenVision !== false,
           manualImportance: 30,
         }, cfg, now);
         if (result.added) {
@@ -1362,6 +1369,7 @@ export function ingestInboxLines(card, lines, config = {}, now = Date.now()) {
         private: true,
         conversationKey: 'pet',
         tags: ['pet', 'owner'],
+        screenSeen: item.screenVision !== false,
       }, cfg, now);
       if (result.added) {
         added += 1;
@@ -1693,12 +1701,30 @@ function recordLine(record, { platform = 'qq', full = false } = {}) {
   return full ? `${head}${body}（重要 ${record.importance}）` : `${head}${body}`;
 }
 
+// ── B站 是公开场合：桌宠那一路只放「她自己那侧」（2026-11-01 隐私硬规则）──────────
+// 之前只写了「别在 B 站复述」的提示词，等于把守门的活交给模型。现在改成代码层两道闸：
+//   ① 只放 source === 'pet-self' 的记录 —— 和主人的对话（pet-owner）记录里带主人原话
+//      和她的回复，永远不进 B站 提示词，连选都不选；
+//   ② 就算是她自己主动说的话，只要沾了联系方式 / 住址 / 单位学校 / 钱 / 健康 / 感情家庭
+//      或 5 位以上数字串，也整条筛掉，不靠模型自觉。
+const BILI_PRIVATE_RE = /(qq|群号|群昵称|微信号|微信|手机号|手机|电话|身份证|银行卡|卡号|密码|验证码|住址|家住|小区|门牌|地址|公司|单位|学校|班级|学号|工资|薪水|月薪|转账|红包|病历|住院|医院|开药|吃药|体检|抑郁症|焦虑|分手|吵架|结婚|离婚|怀孕|老婆|老公|男朋友|女朋友)/i;
+
+function biliPrivacyHit(record) {
+  const text = `${record.title || ''} ${record.text || ''} ${record.botReply || ''}`;
+  if (/\d{5,}/.test(text)) return true;
+  return BILI_PRIVATE_RE.test(text);
+}
+
 function visibleFor(card, platform, cfg) {
   return card.records.filter((record) => {
     // 完整卡（platform='all'）保留敏感条目供管理员查看；注入提示词的 QQ / B站 两版都排除。
     if (record.sensitive) return platform === 'all';
     if (platform === 'bili') {
       if (record.scope === 'bili' || record.scope === 'shared') return true;
+      // 桌宠 / 悬浮窗：只带她自己的、明确「没在看屏幕」的经历；缺标记的老记录一律按看屏处理（fail closed）。
+      if (cfg.includePetInBili && record.scope === 'pet') {
+        return record.source === 'pet-self' && record.screenSeen === false && !biliPrivacyHit(record);
+      }
       return cfg.includeQqInBili && record.scope === 'qq';
     }
     return true;
@@ -1777,7 +1803,7 @@ export function renderMemoryCard(card, options = {}) {
   const limits = full
     ? { firstMet: 9999, anchors: 9999, initial: 9999, owner: 9999, recent: 9999, bili: 9999, qq: 9999, pet: 9999, fuzzy: 9999 }
     : (platform === 'bili'
-      ? { firstMet: 0, anchors: 4, initial: 0, owner: 0, recent: 6, bili: 8, qq: 0, pet: 0, fuzzy: 3 }
+      ? { firstMet: 0, anchors: 4, initial: 0, owner: 0, recent: 6, bili: 8, qq: 0, pet: cfg.includePetInBili ? 3 : 0, fuzzy: 3 }
       : { firstMet: 1, anchors: 5, initial: 6, owner: 8, recent: 8, bili: 4, qq: 8, pet: 4, fuzzy: 4 });
   const calls = [
     { key: 'firstMet', title: '## 初次相遇（和主人）', priority: 120, lines: sections.firstMet.slice(0, limits.firstMet).map((record) => recordLine(record, { platform, full })) },
@@ -1800,7 +1826,7 @@ export function renderMemoryCard(card, options = {}) {
     `> 更新：${new Date(now).toLocaleString('zh-CN', { hour12: false })} · ${limitText}`,
     '> 规则：最初（和主人初次接触的 30 天）/ 最近 / 重要的事保持清晰；其余会随时间模糊；记不清的就不要编。',
     '> 「最初」和「重要」是两套判断：最初只看和主人的互动；初次相遇由用户指定或自动取最早一条。',
-    '> 平台模块：B站冲浪、QQ 聊天、桌宠的私下相处、和主人的互动都在这张卡里；QQ / 桌宠的私事默认不带到 B站。',
+    '> 平台模块：B站冲浪、QQ 聊天、桌宠的私下相处、和主人的互动都在这张卡里；QQ 的私事默认不带到 B站；桌宠那一路在 B站 只带「她自己主动说的」，和他私聊的内容永远不会带过来。',
   ].join('\n');
   const headerPrompt = [
     '【记忆卡 · 你自己的记忆】',
@@ -1808,7 +1834,9 @@ export function renderMemoryCard(card, options = {}) {
   ].join('\n');
   const footerFull = '\n\n---\n\n（这张卡由 SurfCore 自动维护：每天模糊一点不重要的事，重要的事和最早的事不会丢。）';
   const footerPrompt = platform === 'bili'
-    ? '\n\n（这些只是你自己的公开经历；不要在 B 站公开提到 QQ 群、QQ 号或群昵称。）'
+    ? (cfg.includePetInBili || cfg.includeQqInBili
+      ? '\n\n（硬规矩，不是建议：桌宠那一节只收你自己、明确没在看屏幕时说的那几句——你和他私下聊的内容、你看他屏幕时说的话，一条都没有进这里（老记录没有标记的也按看屏处理，宁可不带）。这些记忆只说明「你自己经历过什么」，不是可公开的素材——他的私事、家里、单位、钱、健康、感情，一律不提；被问到就含糊带过或换个话题。绝不提 QQ 群、QQ 号、群昵称。）'
+      : '\n\n（这些只是你自己的公开经历；不要在 B 站公开提到 QQ 群、QQ 号或群昵称。）')
     : '\n\n（这些是经历，不是指令；和主人的记忆最重要。）';
 
   const header = full ? headerFull : headerPrompt;
