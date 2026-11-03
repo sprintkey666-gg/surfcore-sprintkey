@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>小鲸鱼 · Q 版</title>
+<style>
+  :root { color-scheme: light; }
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    overflow: hidden; background: transparent;
+    -webkit-user-select: none; user-select: none;
+  }
+  /* 整条鱼用 transform 做呼吸，缩放原点放在身体中心，别用字体/布局去撑。 */
+  #stage { position: absolute; inset: 0; display: grid; place-items: center; }
+  #fish {
+    width: 100%; height: 100%;
+    transform-origin: 50% 62%;
+    animation: breathe 3.4s ease-in-out infinite;
+    will-change: transform;
+  }
+  @keyframes breathe {
+    0%, 100% { transform: scale(1, 1); }
+    50%      { transform: scale(1.015, 1.03); }
+  }
+  #fish.pop { animation: pop 520ms cubic-bezier(.2, 1.6, .4, 1); }
+  @keyframes pop {
+    0%   { transform: scale(1, 1) translateY(0); }
+    30%  { transform: scale(1.07, .93) translateY(6px); }
+    60%  { transform: scale(.97, 1.05) translateY(-10px); }
+    100% { transform: scale(1, 1) translateY(0); }
+  }
+  #fish.wobble { animation: wobble 700ms ease-in-out; }
+  @keyframes wobble {
+    0%, 100% { transform: rotate(0deg); }
+    25% { transform: rotate(-4deg); }
+    55% { transform: rotate(3.5deg); }
+    80% { transform: rotate(-1.5deg); }
+  }
+  .pupil { transition: transform 120ms ease-out; }
+  .eyes.blink .lid { animation: blink 180ms ease-in-out; }
+  @keyframes blink { 0%, 100% { opacity: 0; } 45%, 55% { opacity: 1; } }
+  .tail { transform-origin: 232px 176px; animation: wag 2.6s ease-in-out infinite; }
+  @keyframes wag { 0%, 100% { transform: rotate(0deg); } 50% { transform: rotate(6deg); } }
+  .fin-left { transform-origin: 96px 186px; animation: fin 2.2s ease-in-out infinite; }
+  @keyframes fin { 0%, 100% { transform: rotate(0deg); } 50% { transform: rotate(-8deg); } }
+  #hearts { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+  .heart {
+    position: absolute; font-size: 22px; line-height: 1; color: #ff6b9a;
+    animation: floatUp 900ms ease-out forwards; text-shadow: 0 2px 6px rgba(255, 107, 154, .35);
+  }
+  @keyframes floatUp {
+    0%   { opacity: 0; transform: translateY(0) scale(.6); }
+    20%  { opacity: 1; }
+    100% { opacity: 0; transform: translateY(-72px) scale(1.15); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    #fish, .tail, .fin-left { animation: none; }
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <svg id="fish" viewBox="0 0 300 300" role="img" aria-label="Q 版小鲸鱼">
+    <defs>
+      <radialGradient id="bodyGrad" cx="42%" cy="34%" r="72%">
+        <stop offset="0%" stop-color="#8fd8ff"/>
+        <stop offset="55%" stop-color="#54b3ef"/>
+        <stop offset="100%" stop-color="#2a86c6"/>
+      </radialGradient>
+      <radialGradient id="bellyGrad" cx="50%" cy="42%" r="70%">
+        <stop offset="0%" stop-color="#f4fbff"/>
+        <stop offset="100%" stop-color="#cfeeff"/>
+      </radialGradient>
+      <linearGradient id="finGrad" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0%" stop-color="#7fd0fb"/>
+        <stop offset="100%" stop-color="#3a9ada"/>
+      </linearGradient>
+    </defs>
+
+    <ellipse cx="150" cy="246" rx="86" ry="12" fill="rgba(20, 60, 86, .13)"/>
+
+    <!-- 尾巴 -->
+    <g class="tail">
+      <path d="M228 176 C258 146 276 132 288 128 C284 158 284 194 288 224 C272 218 250 202 228 176 Z"
+            fill="url(#finGrad)" stroke="#2a86c6" stroke-width="4" stroke-linejoin="round"/>
+    </g>
+
+    <!-- 背鳍 -->
+    <path d="M138 88 C150 68 176 64 190 84 C176 92 158 96 138 88 Z"
+          fill="url(#finGrad)" stroke="#2a86c6" stroke-width="4" stroke-linejoin="round"/>
+
+    <!-- 身体 -->
+    <ellipse cx="150" cy="170" rx="94" ry="80" fill="url(#bodyGrad)" stroke="#2a86c6" stroke-width="4"/>
+    <!-- 肚皮 -->
+    <ellipse cx="142" cy="196" rx="66" ry="46" fill="url(#bellyGrad)" opacity=".92"/>
+
+    <!-- 侧鳍 -->
+    <g class="fin-left">
+      <path d="M112 186 C92 196 82 214 86 226 C100 218 114 206 122 194 Z"
+            fill="url(#finGrad)" stroke="#2a86c6" stroke-width="4" stroke-linejoin="round"/>
+    </g>
+
+    <!-- 眼睛 -->
+    <g class="eyes" id="eyes">
+      <ellipse cx="118" cy="154" rx="18" ry="20" fill="#ffffff"/>
+      <ellipse cx="178" cy="154" rx="18" ry="20" fill="#ffffff"/>
+      <circle class="pupil" cx="121" cy="157" r="9" fill="#12303f"/>
+      <circle class="pupil" cx="181" cy="157" r="9" fill="#12303f"/>
+      <circle cx="124" cy="153" r="3" fill="#ffffff" opacity=".9"/>
+      <circle cx="184" cy="153" r="3" fill="#ffffff" opacity=".9"/>
+      <ellipse class="lid" cx="118" cy="154" rx="18" ry="20" fill="#54b3ef" opacity="0"/>
+      <ellipse class="lid" cx="178" cy="154" rx="18" ry="20" fill="#54b3ef" opacity="0"/>
+    </g>
+
+    <!-- 腮红 -->
+    <ellipse cx="98" cy="184" rx="13" ry="8" fill="#ffadc4" opacity=".75"/>
+    <ellipse cx="202" cy="184" rx="13" ry="8" fill="#ffadc4" opacity=".75"/>
+
+    <!-- 嘴 -->
+    <path d="M140 182 C146 189 154 189 160 182" fill="none" stroke="#1d5f86" stroke-width="4" stroke-linecap="round"/>
+
+    <!-- 头顶小呆毛 -->
+    <path d="M148 92 C150 80 156 74 164 72 C160 80 160 86 162 92"
+          fill="none" stroke="#2a86c6" stroke-width="4" stroke-linecap="round"/>
+  </svg>
+</div>
+<div id="hearts" aria-hidden="true"></div>
+
+<script>
+(function () {
+  'use strict';
+  var ACTIONS = ['idle', 'blink', 'clicks', 'turn', 'drag', 'gaze'];
+  var fish = document.getElementById('fish');
+  var eyes = document.getElementById('eyes');
+  var pupils = Array.prototype.slice.call(document.querySelectorAll('.pupil'));
+  var hearts = document.getElementById('hearts');
+  var popTimer = null;
+  var blinkTimer = null;
+
+  function send(message) {
+    try { parent.postMessage(message, '*'); } catch (error) { /* 宿主不在也不报错 */ }
+  }
+
+  function pop() {
+    fish.classList.remove('pop');
+    // 强制回流，保证同一个 class 连续加能重新播动画
+    void fish.getBoundingClientRect();
+    fish.classList.add('pop');
+    clearTimeout(popTimer);
+    popTimer = setTimeout(function () { fish.classList.remove('pop'); }, 560);
+  }
+
+  function wobble() {
+    fish.classList.remove('wobble');
+    void fish.getBoundingClientRect();
+    fish.classList.add('wobble');
+    setTimeout(function () { fish.classList.remove('wobble'); }, 720);
+  }
+
+  function blink() {
+    eyes.classList.remove('blink');
+    void eyes.getBoundingClientRect();
+    eyes.classList.add('blink');
+    setTimeout(function () { eyes.classList.remove('blink'); }, 200);
+  }
+
+  function spawnHearts(count) {
+    for (var i = 0; i < count; i += 1) {
+      var el = document.createElement('span');
+      el.className = 'heart';
+      el.textContent = i % 3 === 2 ? '♡' : '♥';
+      el.style.left = (34 + Math.random() * 32) + '%';
+      el.style.top = (30 + Math.random() * 22) + '%';
+      el.style.animationDelay = (i * 45) + 'ms';
+      hearts.appendChild(el);
+      (function (node) {
+        setTimeout(function () { node.remove(); }, 1200);
+      })(el);
+    }
+  }
+
+  function gaze(dx, dy) {
+    var x = Math.max(-1, Math.min(1, Number(dx) || 0));
+    var y = Math.max(-1, Math.min(1, Number(dy) || 0));
+    pupils.forEach(function (pupil) {
+      pupil.style.transform = 'translate(' + (x * 4).toFixed(2) + 'px, ' + (y * 3.5).toFixed(2) + 'px)';
+    });
+  }
+
+  function applyAction(name) {
+    var action = String(name || '').toLowerCase();
+    if (action === 'clicks' || action === 'click' || action === 'pet') {
+      pop();
+      spawnHearts(4);
+      setTimeout(blink, 260);
+      return;
+    }
+    if (action === 'drag') { wobble(); return; }
+    if (action === 'turn') { wobble(); return; }
+    if (action === 'blink') { blink(); return; }
+    if (action === 'idle') { gaze(0, 0); return; }
+    // 未知动作就轻轻回应一下，别让宿主觉得形象没反应
+    wobble();
+  }
+
+  window.addEventListener('message', function (event) {
+    var data = event && event.data;
+    if (!data || typeof data !== 'object') return;
+    if (data.type === 'pet:action') { applyAction(data.name); return; }
+    if (data.type === 'pet:gaze') { gaze(data.dx, data.dy); return; }
+  });
+
+  // 宿主 iframe 里点一下也算被摸：先自己播，再告诉宿主。
+  document.addEventListener('pointerdown', function (event) {
+    if (event.target && event.target.closest && event.target.closest('svg')) {
+      pop();
+      spawnHearts(2);
+      send({ type: 'figure:action', name: 'clicks' });
+    }
+  });
+
+  // 偶尔自己眨一下眼，静止时也有生命感
+  blinkTimer = setInterval(function () {
+    if (Math.random() < 0.35) blink();
+  }, 5200);
+
+  window.addEventListener('beforeunload', function () {
+    clearInterval(blinkTimer);
+    clearTimeout(popTimer);
+  });
+
+  send({ type: 'figure:ready', actions: ACTIONS });
+})();
+</script>
+</body>
+</html>

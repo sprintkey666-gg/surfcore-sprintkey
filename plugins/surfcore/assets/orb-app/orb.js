@@ -612,6 +612,9 @@
     if (seq !== lastSeq || bubbles.querySelectorAll('.bubble').length !== list.length) {
       lastSeq = seq;
       renderMessages(list);
+      try {
+        window.orb?.log?.(`[state] seq=${String(seq)} messages=${list.length} expanded=${expanded ? 'y' : 'n'} pet=${petMode ? 'y' : 'n'} seen=${String(Number(next.read?.seenId || 0) || 0)}`);
+      } catch {}
       try { maybeBubble(list); } catch {}
     }
     // 面板开着就算读过了：收起后不再为她看过的消息冒气泡。
@@ -1033,6 +1036,29 @@
   const ctxCompContext = document.getElementById('ctxCompContext');
   const ctxCompOpacity = document.getElementById('ctxCompOpacity');
   const ctxCompOpacityValue = document.getElementById('ctxCompOpacityValue');
+  // 试一下气泡 / 皮肤 › / 监测 ›
+  const ctxBubbleTestBtn = document.getElementById('ctxBubbleTest');
+  const ctxSkinToggle = document.getElementById('ctxSkinToggle');
+  const ctxSkinEl = document.getElementById('ctxSkin');
+  const ctxSkinList = document.getElementById('ctxSkinList');
+  const ctxSkinPath = document.getElementById('ctxSkinPath');
+  const ctxSkinImportBtn = document.getElementById('ctxSkinImport');
+  const ctxSkinBrowseBtn = document.getElementById('ctxSkinBrowse');
+  const ctxSkinDirBtn = document.getElementById('ctxSkinDir');
+  const ctxMonitorToggle = document.getElementById('ctxMonitorToggle');
+  const ctxMonitorEl = document.getElementById('ctxMonitor');
+  const ctxMonWindow = document.getElementById('ctxMonWindow');
+  const ctxMonFiles = document.getElementById('ctxMonFiles');
+  const ctxMonMedia = document.getElementById('ctxMonMedia');
+  const ctxMonGap = document.getElementById('ctxMonGap');
+  const ctxMonPeekBtn = document.getElementById('ctxMonPeek');
+  const petToastEl = document.getElementById('petToast');
+  let ctxSkinShown = false;
+  let ctxMonitorShown = false;
+  let skinPacks = [];
+  let skinActiveId = '';
+  let skinBusy = false;
+  let activityCfg = null;
   let companionState = null;
   let petMode = false;
   // 本地微调过的大小（右键滑条写的 prefs.petSize），开菜单时要用它回填滑条
@@ -1158,6 +1184,424 @@
     } catch {}
   }
 
+  // ==== 桌宠小工具：日志 / toast =========================================
+  function plog(text) {
+    try { window.orb?.log?.(`[orb] ${text}`); } catch {}
+  }
+
+  let toastTimer = 0;
+  function toast(text, bad = false) {
+    const msg = String(text ?? '').trim();
+    if (!msg) return;
+    plog(`toast ${msg}`);
+    if (!petToastEl) {
+      try { showHintBriefly?.(msg); } catch {}
+      return;
+    }
+    petToastEl.textContent = msg;
+    petToastEl.classList.toggle('bad', bad === true);
+    petToastEl.classList.remove('hidden');
+    // 先移除再加，保证连续两次 toast 也能重新播一遍淡入
+    petToastEl.classList.remove('show');
+    requestAnimationFrame(() => {
+      if (!petToastEl.textContent) return;
+      petToastEl.classList.add('show');
+    });
+    clearTimeout(toastTimer);
+    const ttl = Math.max(1600, Math.min(6000, msg.length * 110));
+    toastTimer = setTimeout(() => {
+      petToastEl.classList.remove('show');
+      setTimeout(() => {
+        if (!petToastEl.classList.contains('show')) petToastEl.classList.add('hidden');
+      }, 200);
+    }, ttl);
+  }
+
+  async function copyText(text) {
+    const value = String(text ?? '');
+    if (!value) return false;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+        return true;
+      }
+    } catch {}
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = value;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      const done = document.execCommand('copy');
+      ta.remove();
+      return done === true;
+    } catch {
+      return false;
+    }
+  }
+
+  // ==== 皮肤 › ==========================================================
+  function packIsFigure(pack) {
+    if (!pack || typeof pack !== 'object') return false;
+    const kind = pack.kind || pack.packKind;
+    return kind === 'figure' || Boolean(pack.figureEntry || pack.entry && pack.entry !== 'webm');
+  }
+
+  function renderSkinList() {
+    if (!ctxSkinList) return;
+    ctxSkinList.textContent = '';
+    if (!skinPacks.length) {
+      const empty = document.createElement('div');
+      empty.className = 'ctxempty';
+      empty.textContent = '还没找到皮肤包';
+      ctxSkinList.appendChild(empty);
+      return;
+    }
+    for (const pack of skinPacks) {
+      const id = String(pack?.id ?? '');
+      if (!id) continue;
+      const active = id === skinActiveId;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = `ctxitem child${active ? ' on' : ''}`;
+      btn.dataset.pack = id;
+      const mark = document.createElement('span');
+      mark.className = 'ctxmark';
+      mark.textContent = active ? '✓' : '';
+      const name = document.createElement('span');
+      name.className = 'ctxname';
+      name.textContent = String(pack?.name || id);
+      const meta = document.createElement('span');
+      meta.className = 'ctxmeta';
+      const count = Number(pack?.webmCount) || 0;
+      if (packIsFigure(pack)) meta.textContent = '网页';
+      else if (count > 0) meta.textContent = `${count} 段`;
+      btn.append(mark, name, meta);
+      btn.addEventListener('click', () => { void activateSkin(id); });
+      ctxSkinList.appendChild(btn);
+    }
+  }
+
+  async function skinAction(body) {
+    const res = await window.orb.http('/pet-packs', { method: 'POST', body });
+    const data = res?.data ?? res ?? {};
+    if (res?.ok === false || data?.ok === false) {
+      throw new Error(String(data?.error || res?.error || '皮肤包操作失败'));
+    }
+    return data;
+  }
+
+  async function loadSkins() {
+    if (skinBusy) return;
+    skinBusy = true;
+    try {
+      const data = await skinAction({ action: 'list' });
+      skinPacks = Array.isArray(data?.packs) ? data.packs : [];
+      skinActiveId = String(data?.activePackId ?? data?.activeId ?? '');
+      renderSkinList();
+      plog(`skins ${skinPacks.length} active=${skinActiveId}`);
+    } catch (error) {
+      plog(`skins list 失败：${String(error?.message || error)}`);
+      if (ctxSkinList) {
+        ctxSkinList.textContent = '';
+        const empty = document.createElement('div');
+        empty.className = 'ctxempty';
+        empty.textContent = `列表拿不到：${String(error?.message || error).slice(0, 40)}`;
+        ctxSkinList.appendChild(empty);
+      }
+    } finally {
+      skinBusy = false;
+    }
+  }
+
+  async function activateSkin(id) {
+    if (!id) return;
+    if (id === skinActiveId) {
+      toast('已经在用这个皮肤了');
+      return;
+    }
+    try {
+      await skinAction({ action: 'activate', id });
+      skinActiveId = id;
+      const pack = skinPacks.find((p) => String(p?.id) === id);
+      renderSkinList();
+      toast(`换成「${String(pack?.name || id)}」了`);
+      // 不重载页面：pet.js 每 4s 热重载配置，这里再戳一下让它立刻去读
+      try { window.SurfPet?.refresh?.(); } catch {}
+      await fitCtxWindow();
+      placeCtxMenu(null);
+    } catch (error) {
+      toast(String(error?.message || error).slice(0, 90), true);
+    }
+  }
+
+  async function importSkin(rawPath) {
+    const path = String(rawPath ?? '').trim().replace(/^["']+|["']+$/g, '');
+    if (!path) {
+      toast('先填皮肤包路径（文件夹或 .tgz）');
+      return;
+    }
+    toast('正在导入皮肤包…');
+    try {
+      const data = await skinAction({ action: 'import', path });
+      toast(`导入好了：${String(data?.name || data?.id || '皮肤包')}`);
+      if (ctxSkinPath) ctxSkinPath.value = '';
+      await loadSkins();
+      await fitCtxWindow();
+      placeCtxMenu(null);
+    } catch (error) {
+      toast(String(error?.message || error).slice(0, 100), true);
+    }
+  }
+
+  async function browseSkinTgz() {
+    try {
+      const res = await window.orb?.pickFiles?.();
+      const file = res?.files?.[0];
+      if (!file?.path) return;
+      await importSkin(file.path);
+    } catch (error) {
+      toast(String(error?.message || error).slice(0, 90), true);
+    }
+  }
+
+  /** 「导入皮肤文件夹…」：系统目录选择器优先，拿不到就退回路径输入框。 */
+  async function browseSkinDir() {
+    try {
+      const res = await window.orb?.pickFiles?.({ directory: true });
+      const dir = res?.files?.[0]?.path;
+      if (dir) {
+        await importSkin(dir);
+        return;
+      }
+      if (res && res.ok === false) toast(String(res.error || '选不了目录').slice(0, 90), true);
+    } catch (error) {
+      toast(String(error?.message || error).slice(0, 90), true);
+    }
+  }
+
+  async function copySkinDir() {
+    const pack = skinPacks.find((p) => String(p?.id) === skinActiveId) || skinPacks[0];
+    const dir = String(pack?.dir ?? '');
+    if (!dir) {
+      toast('拿不到皮肤包目录');
+      return;
+    }
+    // 优先真的在资源管理器里打开；老版本 preload 没有 openPath 时退回复制路径。
+    try {
+      const opened = await window.orb?.openPath?.(dir);
+      if (opened?.ok) return;
+    } catch {}
+    const done = await copyText(dir);
+    if (done) toast('皮肤包目录已复制，粘到资源管理器就能打开');
+    else toast(`皮肤包目录：${dir}`, true);
+  }
+
+  async function toggleSkinMenu() {
+    ctxSkinShown = !ctxSkinShown;
+    ctxSkinEl?.classList.toggle('hidden', !ctxSkinShown);
+    ctxSkinToggle?.setAttribute('aria-expanded', ctxSkinShown ? 'true' : 'false');
+    if (ctxSkinShown) await loadSkins();
+    await fitCtxWindow();
+    placeCtxMenu(null);
+  }
+
+  // ==== 监测 › ==========================================================
+  // 配置形状跟 lib/orb-activity.js 的 normalizeActivityConfig 对齐：
+  //   { enabled, pollMs, kinds:{ window, file, music }, bubbleEveryMs }
+  // 主进程那边还没落地时全部走可选链，读不到就按默认值画（三个都开、10 分钟一句）。
+
+  function actKinds(cfg) {
+    const kinds = cfg && typeof cfg === 'object' && cfg.kinds && typeof cfg.kinds === 'object' ? cfg.kinds : null;
+    if (kinds) {
+      return {
+        window: kinds.window !== false,
+        file: kinds.file !== false,
+        music: kinds.music !== false,
+      };
+    }
+    return { window: true, file: true, music: true };
+  }
+
+  function actGapMin(cfg) {
+    const ms = Number(cfg?.bubbleEveryMs);
+    const min = Number.isFinite(ms) && ms > 0 ? Math.round(ms / 60000) : 10;
+    if ([5, 10, 30].includes(min)) return min;
+    return min <= 7 ? 5 : (min <= 20 ? 10 : 30);
+  }
+
+  /** 在旧配置上盖一层改动；三个开关全关时顺手把总开关也关掉。 */
+  function patchActivity(cfg, patch = {}) {
+    const base = cfg && typeof cfg === 'object' ? cfg : {};
+    const kinds = {
+      ...(base.kinds && typeof base.kinds === 'object' ? base.kinds : { window: true, file: true, music: true }),
+      ...(patch.kinds || {}),
+    };
+    const next = { ...base, kinds };
+    if (patch.minutes) next.bubbleEveryMs = Math.round(Number(patch.minutes) * 60000);
+    next.enabled = kinds.window !== false || kinds.file !== false || kinds.music !== false;
+    return next;
+  }
+
+  let lastSample = null;
+
+  function subscribeActivity() {
+    const on = window.orb?.onActivity;
+    if (typeof on !== 'function') {
+      plog('activity 推送还没接上（主进程缺 onActivity）');
+      return false;
+    }
+    try {
+      on((payload) => {
+        if (!payload || typeof payload !== 'object') return;
+        lastSample = payload;
+        plog(`[monitor] push ${JSON.stringify(payload).slice(0, 160)}`);
+      });
+      return true;
+    } catch (error) {
+      plog(`activity 订阅失败：${String(error?.message || error)}`);
+      return false;
+    }
+  }
+
+  function paintMonitorMenu() {
+    const kinds = actKinds(activityCfg);
+    if (ctxMonWindow) ctxMonWindow.checked = kinds.window;
+    if (ctxMonFiles) ctxMonFiles.checked = kinds.file;
+    if (ctxMonMedia) ctxMonMedia.checked = kinds.music;
+    if (ctxMonGap) {
+      const want = String(actGapMin(activityCfg));
+      if (want !== ctxMonGap.value) ctxMonGap.value = want;
+    }
+  }
+
+  function activityApi() {
+    const api = window.orb?.activityConfig;
+    return typeof api === 'function' ? api : null;
+  }
+
+  function cfgOf(res) {
+    const cfg = res?.config ?? res?.data?.config ?? res?.data ?? res;
+    return cfg && typeof cfg === 'object' && !Array.isArray(cfg) ? cfg : null;
+  }
+
+  async function loadActivity() {
+    const api = activityApi();
+    if (!api) {
+      paintMonitorMenu();
+      plog('监测还没接上（主进程缺 activityConfig）');
+      return false;
+    }
+    try {
+      const cfg = cfgOf(await api({ action: 'get' }));
+      if (cfg) activityCfg = cfg;
+      paintMonitorMenu();
+      plog(`监测配置 ${JSON.stringify(activityCfg || {}).slice(0, 160)}`);
+      return true;
+    } catch (error) {
+      plog(`监测 get 失败：${String(error?.message || error)}`);
+      return false;
+    }
+  }
+
+  async function saveActivity(patchFn) {
+    const api = activityApi();
+    if (!api) {
+      toast('监测还没接上，等主进程补上 activityConfig');
+      return false;
+    }
+    let next;
+    try {
+      next = patchFn(activityCfg || {});
+    } catch {
+      return false;
+    }
+    try {
+      const res = await api({ action: 'set', config: next });
+      activityCfg = cfgOf(res) || next;
+      paintMonitorMenu();
+      plog(`监测改好了 ${JSON.stringify(activityCfg).slice(0, 160)}`);
+      return true;
+    } catch (error) {
+      toast(String(error?.message || error).slice(0, 90), true);
+      return false;
+    }
+  }
+
+  /** 现在看一眼：GET 一次拿「上一次采样」，再等推送把更新的那份送过来。 */
+  async function peekActivity() {
+    const api = activityApi();
+    const beforeAt = Number(lastSample?.at) || 0;
+    let info = null;
+    if (api) {
+      try { info = await api({ action: 'get' }); } catch {}
+    }
+    const cfg = cfgOf(info);
+    if (cfg) { activityCfg = cfg; paintMonitorMenu(); }
+    const status = info?.status && typeof info.status === 'object' ? info.status : null;
+    if (status && status.enabled === false) {
+      toast('监测还关着，先把上面任意一个开关打开');
+      return;
+    }
+    const fallback = info?.last || info?.sample || info?.current || info?.activity || null;
+    // 主进程每 5 秒读一次 activity.json，等它把新的推下来（最多 2.5s）。
+    const deadline = Date.now() + 2500;
+    while (Date.now() < deadline) {
+      if (lastSample && (Number(lastSample.at) || 0) > beforeAt) break;
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+    const fresh = lastSample && (Number(lastSample.at) || 0) > beforeAt ? lastSample : null;
+    const sample = fresh || lastSample || (fallback && typeof fallback === 'object' ? fallback : null);
+    if (!sample) {
+      toast(api ? '她这会儿没抓到窗口' : '监测还没接上，等主进程补上 activityConfig');
+      return;
+    }
+    const bits = [];
+    if (sample.active) bits.push(String(sample.active.app || sample.active.title || sample.active.project || '在忙'));
+    else bits.push('没看到窗口');
+    if (sample.media && (sample.media.title || sample.media.app)) {
+      const t = [sample.media.title, sample.media.artist].filter(Boolean).join(' - ');
+      bits.push(`在听 ${t || sample.media.app}`);
+    }
+    toast(`她看到：${bits.filter(Boolean).join(' · ').slice(0, 80)}`);
+  }
+
+  async function toggleMonitorMenu() {
+    ctxMonitorShown = !ctxMonitorShown;
+    ctxMonitorEl?.classList.toggle('hidden', !ctxMonitorShown);
+    ctxMonitorToggle?.setAttribute('aria-expanded', ctxMonitorShown ? 'true' : 'false');
+    if (ctxMonitorShown) await loadActivity();
+    else paintMonitorMenu();
+    await fitCtxWindow();
+    placeCtxMenu(null);
+  }
+
+  // ==== 试一下气泡 =====================================================
+  const BUBBLE_TEST_LINES = [
+    '在的，我就在这儿。',
+    '刚才那句话还没说完呢…',
+    '你忙你的，我自己待一会儿就好。',
+    '抬头看我一眼吧。',
+    '今天也辛苦啦。',
+  ];
+
+  async function bubbleTestSay() {
+    const text = BUBBLE_TEST_LINES[Math.floor(Math.random() * BUBBLE_TEST_LINES.length)];
+    try {
+      const res = await window.orb.http('/say', { method: 'POST', body: { text, kind: 'proactive' } });
+      const data = res?.data ?? res ?? {};
+      if (res?.ok === false || data?.ok === false) {
+        toast(String(data?.error || res?.error || '没发出去'), true);
+        return;
+      }
+      plog(`试一下气泡 ok：${text}`);
+    } catch (error) {
+      toast(`没发出去：${String(error?.message || error).slice(0, 70)}`, true);
+    }
+  }
+
   async function fitCtxWindow() {
     try {
       // 等一帧让刚展开的滑条/换行先完成布局，否则量到的是旧高度。
@@ -1189,6 +1633,15 @@
     try { void window.orb?.uiHold?.(true); } catch {}
     ctxSizeShown = false;
     ctxSizeEl?.classList.add('hidden');
+    ctxSkinShown = false;
+    ctxMonitorShown = false;
+    ctxSkinEl?.classList.add('hidden');
+    ctxMonitorEl?.classList.add('hidden');
+    ctxSkinToggle?.setAttribute('aria-expanded', 'false');
+    ctxMonitorToggle?.setAttribute('aria-expanded', 'false');
+    // 子菜单先用上次读到的配置画一遍，展开时再向后端要最新值。
+    renderSkinList();
+    paintMonitorMenu();
     ctxMenuEl?.classList.remove('hidden');
     root.classList.add('ctxopen');
     // 先在窗口左上角量真实尺寸，等窗口长大/夹回屏幕后，再按新窗口摆菜单。
@@ -1209,8 +1662,12 @@
     ctxOpenState = false;
     try { void window.orb?.uiHold?.(false); } catch {}
     ctxSizeShown = false;
+    ctxSkinShown = false;
+    ctxMonitorShown = false;
     ctxMenuEl?.classList.add('hidden');
     ctxSizeEl?.classList.add('hidden');
+    ctxSkinEl?.classList.add('hidden');
+    ctxMonitorEl?.classList.add('hidden');
     root.classList.remove('ctxopen');
     // 只关菜单：原来展开就恢复展开，原来收起才回球。
     try {
@@ -1251,6 +1708,45 @@
     await fitCtxWindow();
     placeCtxMenu(null);
   });
+
+  ctxBubbleTestBtn?.addEventListener('click', async () => {
+    await closeCtxMenu();
+    await bubbleTestSay();
+  });
+
+  ctxSkinToggle?.addEventListener('click', () => { void toggleSkinMenu(); });
+  ctxMonitorToggle?.addEventListener('click', () => { void toggleMonitorMenu(); });
+  ctxSkinImportBtn?.addEventListener('click', () => {
+    // 输入框里有路径就按它导入；空的就弹系统目录选择器（这样「导入皮肤文件夹」不用手打路径）。
+    const typed = String(ctxSkinPath?.value || '').trim();
+    if (typed) void importSkin(typed);
+    else void browseSkinDir();
+  });
+  ctxSkinPath?.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Enter') return;
+    ev.preventDefault();
+    void importSkin(ctxSkinPath.value);
+  });
+  ctxSkinBrowseBtn?.addEventListener('click', () => { void browseSkinTgz(); });
+  ctxSkinDirBtn?.addEventListener('click', () => { void copySkinDir(); });
+
+  ctxMonWindow?.addEventListener('change', () => {
+    const on = ctxMonWindow.checked === true;
+    void saveActivity((cfg) => patchActivity(cfg, { kinds: { window: on } }));
+  });
+  ctxMonFiles?.addEventListener('change', () => {
+    const on = ctxMonFiles.checked === true;
+    void saveActivity((cfg) => patchActivity(cfg, { kinds: { file: on } }));
+  });
+  ctxMonMedia?.addEventListener('change', () => {
+    const on = ctxMonMedia.checked === true;
+    void saveActivity((cfg) => patchActivity(cfg, { kinds: { music: on } }));
+  });
+  ctxMonGap?.addEventListener('change', () => {
+    const minutes = Number(ctxMonGap.value) || 10;
+    void saveActivity((cfg) => patchActivity(cfg, { minutes }));
+  });
+  ctxMonPeekBtn?.addEventListener('click', () => { void peekActivity(); });
 
   ctxCompToggle?.addEventListener('click', async () => {
     const active = companionState?.active === true;
@@ -1295,25 +1791,47 @@
   window.addEventListener('keydown', (ev) => { if (ev.key === 'Escape' && ctxOpenState) closeCtxMenu(); });
 // 面板收起时，她最新一句（含主动）在头顶冒气泡；点气泡开会话。
   let lastBubbleMsgId = '';
+  function bubbleSkip(reason) {
+    try { window.orb?.log?.(`[bubble] skip reason=${reason}`); } catch {}
+  }
   function maybeBubble(list) {
-    if (!petMode || expanded) return;
+    if (!petMode) { bubbleSkip('not-pet-mode'); return; }
+    if (expanded) { bubbleSkip('panel-expanded'); return; }
     const last = [...list].reverse().find((m) => m && (m.text || m.image) && (m.who === 'her' || m.who === undefined));
-    if (!last || !last.id || last.id === lastBubbleMsgId) return;
+    if (!last) { bubbleSkip('no-her-message'); return; }
+    if (!last.id) { bubbleSkip('no-id'); return; }
+    if (last.id === lastBubbleMsgId) { bubbleSkip('same-id'); return; }
     // 面板里已经看过这条了（已读水位），收起后不要再弹一次。
     const seenId = Number(state?.read?.seenId || 0) || 0;
-    if (seenId > 0 && Number(last.id) <= seenId) return;
+    if (seenId > 0 && Number(last.id) <= seenId) {
+      bubbleSkip(`already-seen id=${String(last.id)} seen=${String(seenId)}`);
+      return;
+    }
     try { window.orb?.log?.('[pet] bubble ' + String(last.id)); } catch {}
     lastBubbleMsgId = last.id;
     const ttl = Number(state?.config?.chat?.bubbleTtlSec || 8) * 1000;
     // 图文一体时头顶气泡也带图；关掉就只冒字（图在面板里看）。
     const withPic = !!last.image && state?.config?.chat?.richBubble !== false;
-    window.SurfPet?.showBubble(String(last.text || ''), {
-      kind: last.kind === 'proactive' ? 'proactive' : 'her',
-      ttlMs: ttl,
-      image: withPic ? last.image : '',
-      onClick: () => show(),
-    });
+    const kind = last.kind === 'proactive' ? 'proactive' : 'her';
+    let shown = false;
+    try {
+      shown = window.SurfPet?.showBubble(String(last.text || ''), {
+        kind,
+        ttlMs: ttl,
+        image: withPic ? last.image : '',
+        onClick: () => show(),
+      }) !== false;
+    } catch (error) {
+      try { window.orb?.log?.(`[bubble] show 抛错：${String(error?.message || error)}`); } catch {}
+    }
+    try {
+      window.orb?.log?.(`[bubble] show id=${String(last.id)} kind=${kind} pic=${withPic ? 'y' : 'n'} shown=${shown ? 'y' : 'n'} ttl=${ttl}`);
+    } catch {}
   }
+
+  // 监测推送：主进程补齐 onActivity 后，这里会一直缓存最近一次采样，
+  // 菜单里的「现在看一眼」直接读它，不用每回都问一遍。
+  subscribeActivity();
 
   window.orb.onState(onState);
   window.orb.onHidden?.(() => {

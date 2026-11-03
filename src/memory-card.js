@@ -65,6 +65,18 @@ export const DEFAULT_MEMORY_CARD_CONFIG = Object.freeze({
   dailyHour: 4,
   /** 和主人相关、重要度达到这个值的记忆永远不遗忘（最差也保持「清楚」）。 */
   minOwnerImportance: 65,
+  /** 「最近很要紧的」段：把最近这段时间里够重要的记忆单独拎出来，不再被「最初的日子」按时间挤掉。
+   *  2026-11-03：主人和她约的暗号（importance 74，11-02）就是被 initial 段「按 createdAt 升序取前 6 条」挤掉的，
+   *  结果她答不上来。这一段是那道口的保险。 */
+  recentImportant: true,
+  /** 这一段往回看多少天。 */
+  recentImportantDays: 14,
+  /** 重要度门槛；和主人的记忆默认 minOwnerImportance(65) 起算。 */
+  recentImportantMinImportance: 65,
+  /** 这一段最多几条。
+   *  取 6 而不是 4：真机上「important 74、createdAt 11-02」的暗号记录在「74 分同分」的
+   *  一批记录里按 createdAt 倒序排到第 6 位（前面还有两条 79 分的），4 条会把暗号又漏掉。 */
+  recentImportantLimit: 6,
   /** 达到 100% 时是否自动压缩到 90%（仍然会弹窗提醒用户检查）。 */
   autoCompact: true,
   /** 容量告警是否私聊通知管理员（QQ 私聊）。 */
@@ -186,6 +198,15 @@ export function normalizeMemoryCardConfig(input = {}) {
     forgetAfterDays: clampInt(raw.forgetAfterDays, DEFAULT_MEMORY_CARD_CONFIG.forgetAfterDays, 7, 365),
     dailyHour: clampInt(raw.dailyHour, DEFAULT_MEMORY_CARD_CONFIG.dailyHour, 0, 23),
     minOwnerImportance: clampInt(raw.minOwnerImportance, DEFAULT_MEMORY_CARD_CONFIG.minOwnerImportance, 50, 100),
+    recentImportant: bool(raw.recentImportant, DEFAULT_MEMORY_CARD_CONFIG.recentImportant),
+    recentImportantDays: clampInt(raw.recentImportantDays, DEFAULT_MEMORY_CARD_CONFIG.recentImportantDays, 1, 90),
+    recentImportantMinImportance: clampInt(
+      raw.recentImportantMinImportance,
+      DEFAULT_MEMORY_CARD_CONFIG.recentImportantMinImportance,
+      30,
+      100,
+    ),
+    recentImportantLimit: clampInt(raw.recentImportantLimit, DEFAULT_MEMORY_CARD_CONFIG.recentImportantLimit, 1, 12),
     autoCompact: bool(raw.autoCompact, DEFAULT_MEMORY_CARD_CONFIG.autoCompact),
     notifyOwner: bool(raw.notifyOwner, DEFAULT_MEMORY_CARD_CONFIG.notifyOwner),
     includeQqInBili: bool(raw.includeQqInBili, DEFAULT_MEMORY_CARD_CONFIG.includeQqInBili),
@@ -1771,6 +1792,7 @@ function sectionize(card, { platform = 'all', now = Date.now(), config = {} } = 
   const visible = visibleFor(card, platform, cfg);
   const firstMet = [];
   const anchors = [];
+  const recentImportant = [];
   const initial = [];
   const owner = [];
   const recent = [];
@@ -1786,6 +1808,19 @@ function sectionize(card, { platform = 'all', now = Date.now(), config = {} } = 
   };
   for (const record of visible.filter((item) => item.pinned && item.firstMet)) push(firstMet, record);
   for (const record of visible.filter((item) => item.pinned && !item.firstMet)) push(anchors, record);
+  // 「最近很要紧的」：先于 initial / owner 分桶，避免重要的事被「最初 6 条」按时间挤掉。
+  // 只收桌面之外的（pet 仍归「桌宠」段），并且已经模糊的不再往前排。
+  if (cfg.recentImportant) {
+    const cutoff = now - cfg.recentImportantDays * DAY_MS;
+    for (const record of visible) {
+      if (record.pinned) continue;
+      if (record.platform === 'pet' || record.scope === 'pet') continue;
+      if (record.clarity === 'fuzzy' || record.clarity === 'trace') continue;
+      if (Number(record.importance) < cfg.recentImportantMinImportance) continue;
+      if (timeOf(record.createdAt, 0) < cutoff) continue;
+      push(recentImportant, record);
+    }
+  }
   for (const record of visible.filter((item) => !item.pinned && item.platform !== 'pet' && item.tags.includes('owner') && item.isInitial)) push(initial, record);
   for (const record of visible.filter((item) => !item.pinned && item.platform !== 'pet' && item.tags.includes('owner') && !item.isInitial)) push(owner, record);
   for (const record of visible.filter((item) => !item.pinned && item.platform !== 'pet' && !item.tags.includes('owner') && !item.isInitial)) {
@@ -1808,12 +1843,18 @@ function sectionize(card, { platform = 'all', now = Date.now(), config = {} } = 
 
   const byImportance = (a, b) => (b.importance - a.importance)
     || (timeOf(b.lastSeenAt, 0) - timeOf(a.lastSeenAt, 0));
+  // 「最近很要紧的」专用排序：重要度优先，同分比**事情发生的时间**（createdAt），不比 lastSeenAt。
+  // 为什么不能用 byImportance：lastSeenAt 会被「想起」刷新，而一条记忆只有进了提示词才可能被想起 ——
+  // 没被想起的重要记忆 lastSeenAt 永远停在当年，于是同分全排到后面，越漏越漏（暗号就是这么漏掉的）。
+  const byImportanceThenBorn = (a, b) => (b.importance - a.importance)
+    || (timeOf(b.createdAt, 0) - timeOf(a.createdAt, 0));
   const byRecent = (a, b) => timeOf(b.lastSeenAt, 0) - timeOf(a.lastSeenAt, 0);
 
   return {
     firstMet: firstMet.sort(byRecent),
     anchors: anchors.sort(byImportance),
-    initial: initial.sort((a, b) => timeOf(a.createdAt, 0) - timeOf(b.createdAt, 0)),
+    recentImportant: recentImportant.sort(byImportanceThenBorn),
+    initial: initial.sort(byImportance),
     owner: owner.sort(byImportance),
     recent: recent.sort(byRecent),
     biliModule: biliModule.sort(byImportance),
@@ -1836,13 +1877,25 @@ export function renderMemoryCard(card, options = {}) {
   const maxChars = full ? 0 : clampInt(options.maxChars, 0, 0, 20000);
   const sections = sectionize(card, { platform, full, now, config: cfg });
   const limits = full
-    ? { firstMet: 9999, anchors: 9999, initial: 9999, owner: 9999, recent: 9999, bili: 9999, qq: 9999, pet: 9999, fuzzy: 9999 }
+    ? { firstMet: 9999, anchors: 9999, recentImportant: 9999, initial: 9999, owner: 9999, recent: 9999, bili: 9999, qq: 9999, pet: 9999, fuzzy: 9999 }
     : (platform === 'bili'
-      ? { firstMet: 0, anchors: 4, initial: 0, owner: 0, recent: 6, bili: 8, qq: 0, pet: cfg.includePetInBili ? 3 : 0, fuzzy: 3 }
-      : { firstMet: 1, anchors: 5, initial: 6, owner: 8, recent: 8, bili: 4, qq: 8, pet: 4, fuzzy: 4 });
+      ? { firstMet: 0, anchors: 4, recentImportant: 0, initial: 0, owner: 0, recent: 6, bili: 8, qq: 0, pet: cfg.includePetInBili ? 3 : 0, fuzzy: 3 }
+      : {
+        firstMet: 1,
+        anchors: 5,
+        recentImportant: cfg.recentImportant ? cfg.recentImportantLimit : 0,
+        initial: 6,
+        owner: 8,
+        recent: 8,
+        bili: 4,
+        qq: 8,
+        pet: 4,
+        fuzzy: 4,
+      });
   const calls = [
     { key: 'firstMet', title: '## 初次相遇（和主人）', priority: 120, lines: sections.firstMet.slice(0, limits.firstMet).map((record) => recordLine(record, { platform, full })) },
     { key: 'anchors', title: '## 永远不会忘的', priority: 100, lines: sections.anchors.slice(0, limits.anchors).map((record) => recordLine(record, { platform, full })) },
+    { key: 'recentImportant', title: '## 最近很要紧的（别弄错）', priority: 90, lines: sections.recentImportant.slice(0, limits.recentImportant).map((record) => recordLine(record, { platform, full })) },
     { key: 'initial', title: '## 最初的日子（和主人）', priority: 45, lines: sections.initial.slice(0, limits.initial).map((record) => recordLine(record, { platform, full })) },
     { key: 'owner', title: '## 和主人（管理员）的记忆', priority: 40, lines: sections.owner.slice(0, limits.owner).map((record) => recordLine(record, { platform, full })) },
     { key: 'recent', title: '## 最近记得的', priority: 30, lines: sections.recent.slice(0, limits.recent).map((record) => recordLine(record, { platform, full })) },

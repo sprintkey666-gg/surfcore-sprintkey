@@ -19,8 +19,14 @@
   display: flex;
   align-items: flex-end;
   justify-content: center;
+  /* 视频层自带 z-index:1/3，这里必须先立一个层叠上下文，
+     否则它们会跑到 #bubble（z-index:auto）上面，把气泡整个盖住。 */
+  isolation: isolate;
+  z-index: 0;
 }
 
+/* 三层：pvA / pvIdleB 是常驻循环的待机垫底（交叉淡入），pvAction 盖在最上面。
+   opacity 的开关都由 pet.js 在「新的一路首帧解出来之后」才动，所以不会有黑一下。 */
 .petStage video {
   position: absolute;
   bottom: 0;
@@ -37,17 +43,55 @@
   max-width: none;
   object-fit: contain;
   opacity: 0;
-  transition: opacity 120ms ease-out;
+  transition: opacity 160ms ease-out;
   pointer-events: none;
   will-change: opacity;
+  backface-visibility: hidden;
 }
 
 .petStage video.on { opacity: 1; }
 
-/* 面朝方向：素材默认朝左，需要时整体镜像（文字类动作不镜像，否则反字） */
+/* 垫底的待机层 */
+.pvBase { z-index: 1; }
+
+/* 动作层：淡出比淡入慢一点，播完那一下是「软着地」，不是啪地一下消失 */
+.pvAction {
+  z-index: 3;
+  transition: opacity 200ms ease-out;
+}
+
+/* 面朝方向：素材默认朝左，需要时按「这一层」镜像（文字类动作不镜像，否则反字）。
+   pet.js 不再给 stageInner 加 .mirror，改成单层 .flip，省得动作层把待机层也翻过去。 */
+.petStage video.flip {
+  transform: translateX(calc(-50% + var(--gaze-shift, 0px))) scaleX(-1);
+}
+
+/* 兼容旧写法（整体镜像） */
 .petStage.mirror video {
   transform: translateX(calc(-50% + var(--gaze-shift, 0px))) scaleX(-1);
 }
+
+/* 网页形象（figure 包）：video 全藏起来，用 iframe 撑起宠物区。
+   sandbox="allow-scripts" 里没有 allow-same-origin，形象包读不到宿主页面。
+   形象包的画布是 1:1 的，这里给一个「贴底的正方形」：宽等于窗口内宽、高度靠
+   aspect-ratio 跟着走——比 inset:0 撑满整窗更贴地（整窗还含头顶的气泡带）。 */
+.petStage .petFigure {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 1 / 1;
+  max-height: 100%;
+  z-index: 2;
+  border: 0;
+  background: transparent;
+  pointer-events: none;
+  color-scheme: normal;
+}
+.petStage .petFigure.hidden { display: none; }
+#pet.figure .petStage video { display: none; }
 
 /* 素材不可用时的静态回退形象（avatar），由 pet.js 动态插入 */
 .petStage .petFallback {
@@ -68,10 +112,13 @@
 /* ── 头顶气泡 ────────────────────────────────────────────────────────────────
    老版本的问题：rgba 半透明 + backdrop-filter 模糊，在桌面上就是一块糊掉的黑块；
    而且宽度跟着内容量、位置跟着实测 headTop 算，窗口还会为它长高再缩回去。
-   现在是「实心卡片 + 细描边」，不模糊、不跟着窗口变，位置只由宠物身高决定。 */
+   现在是「深色卡片 + 1px 高光内描边 + 小尾巴」，不模糊、不跟着窗口变，
+   位置只由宠物身高决定；高度不够时只在文字里折叠（--bubble-max）。 */
 
 #bubble {
   position: absolute;
+  /* 盖在宠物层之上：视频层有 z-index 1/3，气泡必须更高一档 */
+  z-index: 6;
   /* 左右都钉住、自己用 fit-content 撑开：只写 left:50% 的话，浏览器按「从一半到右边」
      算可用宽度，长句会被挤成一两个字一行。 */
   left: 8px;
@@ -82,52 +129,54 @@
      这里的值只是加载瞬间的兜底。 */
   top: auto;
   bottom: 200px;
-  max-width: min(320px, calc(100% - 16px));
-  min-width: 56px;
+  max-width: min(300px, calc(100% - 16px));
+  min-width: 48px;
   /* 这里不要裁剪溢出——小尾巴是 ::after 画在框外的，会被一起切掉。
      限高挪到里层的 #bubbleText 上。 */
   overflow: visible;
   box-sizing: border-box;
-  padding: 6px 10px;
-  border-radius: 14px;
-  /* 实心深色卡片：不用 backdrop-filter，字才不糊 */
-  background: #1b2130;
-  color: #e9eefb;
-  font-size: 12.5px;
+  padding: 7px 11px;
+  border-radius: 10px;
+  /* 深色实心卡片：不用 backdrop-filter，字才不糊 */
+  background: rgba(22, 27, 38, 0.94);
+  color: #eef3ff;
+  font-size: 13.5px;
   line-height: 1.5;
   letter-spacing: 0.01em;
+  text-align: left;
   box-shadow:
-    0 1px 0 rgba(255, 255, 255, 0.06) inset,
-    0 6px 18px rgba(0, 0, 0, 0.32);
-  border: 1px solid rgba(140, 170, 225, 0.22);
+    0 1px 0 rgba(255, 255, 255, 0.09) inset,
+    0 0 0 1px rgba(140, 175, 235, 0.16),
+    0 10px 28px rgba(0, 0, 0, 0.45);
+  border: 1px solid rgba(140, 170, 225, 0.24);
   pointer-events: auto;
   cursor: pointer;
   word-break: break-word;
-  animation: bubbleIn 90ms ease-out;
+  animation: bubbleIn 120ms ease-out;
 }
 
 @keyframes bubbleIn {
-  from { opacity: 0; transform: translateY(3px) scale(0.98); }
+  from { opacity: 0; transform: translateY(4px); }
   to { opacity: 1; transform: none; }
 }
 
-/* 预览只留 3 行（全文在面板里）；限高裁切只作用于文字本身，
+/* 预览只留 4 行（全文在面板里）；限高裁切只作用于文字本身，
    这样气泡框和下面的小尾巴都不会被裁。--bubble-max 由 pet.js 按头顶余量算。 */
 #bubbleText {
   display: -webkit-box;
   -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
+  -webkit-line-clamp: 4;
   max-height: var(--bubble-max, 96px);
   overflow: hidden;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
-/* 带图时文字再收一点（2 行），保证整块气泡不超过头顶预留的那条带 */
+/* 带图时图在文字上方（40px 圆角缩略图），文字再收一点，保证整块不超过头顶预留的带 */
 #bubble.haspic #bubbleText {
   -webkit-line-clamp: 2;
-  max-height: calc(var(--bubble-max, 96px) * 0.5);
-  margin-top: 4px;
+  max-height: calc(var(--bubble-max, 96px) * 0.55);
+  margin-top: 5px;
 }
 
 /* 头顶气泡里的小图：等比缩、不拉伸、小图不放大；上限跟着气泡余量走。 */
@@ -138,8 +187,10 @@
   max-width: 100%;
   max-height: min(40px, calc(var(--bubble-max, 96px) * 0.4));
   object-fit: contain;
+  margin: 0 auto;
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.04);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06) inset;
 }
 
 #bubble .bubblePic.missing { display: none; }
@@ -149,18 +200,18 @@
 
 #bubble.hidden { display: none; }
 
-/* 小尾巴，指着宠物头（气泡底边就压在头顶 6px 处） */
+/* 小尾巴，指着宠物头（气泡底边就压在头顶 6px 处）：8px 旋转 45° 的方块 */
 #bubble::after {
   content: '';
   position: absolute;
   left: 50%;
-  bottom: -5px;
-  width: 10px;
-  height: 10px;
-  margin-left: -5px;
+  bottom: -4px;
+  width: 8px;
+  height: 8px;
+  margin-left: -4px;
   background: inherit;
-  border-right: 1px solid rgba(140, 170, 225, 0.22);
-  border-bottom: 1px solid rgba(140, 170, 225, 0.22);
+  border-right: 1px solid rgba(140, 170, 225, 0.24);
+  border-bottom: 1px solid rgba(140, 170, 225, 0.24);
   transform: rotate(45deg);
 }
 
@@ -171,14 +222,13 @@
 }
 
 #bubble.proactive {
-  border-color: rgba(120, 200, 255, 0.4);
+  border-color: rgba(120, 200, 255, 0.42);
   box-shadow:
-    0 1px 0 rgba(255, 255, 255, 0.06) inset,
-    0 0 0 1px rgba(120, 200, 255, 0.1),
-    0 6px 18px rgba(0, 0, 0, 0.32);
+    0 1px 0 rgba(255, 255, 255, 0.09) inset,
+    0 0 0 1px rgba(120, 200, 255, 0.12),
+    0 10px 28px rgba(0, 0, 0, 0.45);
 }
 
-/* 右键 → 桌宠大小面板（窗口会被临时撑成这个尺寸） */
 /* 右键菜单：窗口内的 HTML 菜单，落地尺寸约 168×176，不撑窗口 */
 .ctxmenu {
   position: absolute;
@@ -217,6 +267,7 @@
   cursor: pointer;
 }
 .ctxitem:hover { background: rgba(91, 156, 255, 0.18); }
+.ctxitem:disabled { opacity: 0.5; cursor: default; }
 .ctxchev { color: #7f92b0; font-size: 12px; }
 .ctxsize {
   display: flex;
@@ -229,6 +280,93 @@
 .ctxsize.hidden { display: none; }
 .szrange { flex: 1; accent-color: #5b9cff; }
 .szvalue { width: 34px; text-align: right; font-variant-numeric: tabular-nums; color: #9fc2ff; font-size: 12px; }
+
+/* 二级菜单（皮肤 / 监测） */
+.ctxsub {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  box-sizing: border-box;
+  padding: 4px 4px 5px;
+  margin: 0 0 2px;
+  border-top: 1px solid rgba(140, 175, 235, 0.18);
+}
+.ctxsub.hidden { display: none; }
+.ctxitem.child {
+  justify-content: flex-start;
+  gap: 8px;
+  padding: 6px 8px 6px 16px;
+  font-size: 12.5px;
+  color: #cbd6e6;
+}
+.ctxitem.child .ctxname {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ctxitem.child .ctxmeta { flex: 0 0 auto; font-size: 11px; color: #7f92b0; }
+.ctxitem.child .ctxmark { flex: 0 0 12px; color: #5b9cff; font-size: 11px; }
+.ctxitem.child.on { background: rgba(91, 156, 255, 0.16); color: #cfe3ff; }
+.ctxitem.child:hover { background: rgba(91, 156, 255, 0.22); }
+.ctxempty { padding: 4px 4px 6px 16px; font-size: 11.5px; color: #8794aa; line-height: 1.45; }
+.ctxselect {
+  flex: 0 0 auto;
+  accent-color: #5b9cff;
+  background: rgba(30, 38, 54, 0.92);
+  color: #dfe7f5;
+  border: 1px solid rgba(140, 175, 235, 0.28);
+  border-radius: 6px;
+  padding: 2px 4px;
+  font-size: 12px;
+  font-family: inherit;
+}
+
+/* 右键 → 皮肤：包列表 + 路径导入行 */
+.ctxskinlist {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: 132px;
+  overflow-y: auto;
+  padding: 1px 0 3px;
+}
+.ctxskinlist:empty { display: none; }
+.ctxrow {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 4px 5px 12px;
+}
+.ctxinput {
+  flex: 1 1 auto;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 4px 7px;
+  border-radius: 6px;
+  border: 1px solid rgba(140, 175, 235, 0.26);
+  background: rgba(16, 21, 31, 0.9);
+  color: #e9eefb;
+  font-size: 11.5px;
+  font-family: inherit;
+  outline: none;
+}
+.ctxinput::placeholder { color: #6f7d95; }
+.ctxinput:focus { border-color: rgba(91, 156, 255, 0.55); }
+.ctxmini {
+  flex: 0 0 auto;
+  padding: 4px 9px;
+  border-radius: 6px;
+  border: 1px solid rgba(91, 156, 255, 0.42);
+  background: rgba(91, 156, 255, 0.16);
+  color: #cfe0ff;
+  font-size: 11.5px;
+  font-family: inherit;
+  cursor: pointer;
+}
+.ctxmini:hover { background: rgba(91, 156, 255, 0.3); }
+.ctxmini:disabled { opacity: 0.55; cursor: default; }
 
 /* 右键 → 陪伴：开关 / 上下文字幕 / 背景透明度 */
 .ctxcompanion {
@@ -279,3 +417,28 @@
 
 /* 菜单里出现滑条时，宠物淡一点，免得挡住 */
 #root.ctxopen #pet { opacity: 0.85; }
+
+/* ── 操作回执（切皮肤 / 导入 / 监测开关）─────────────────────────────────── */
+.pet-toast {
+  position: absolute;
+  z-index: 60;
+  left: 50%;
+  bottom: 10px;
+  max-width: min(280px, calc(100% - 16px));
+  box-sizing: border-box;
+  padding: 6px 11px;
+  border-radius: 9px;
+  border: 1px solid rgba(140, 175, 235, 0.3);
+  background: rgba(22, 27, 38, 0.96);
+  color: #dfe7f5;
+  font-size: 12px;
+  line-height: 1.45;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.42);
+  opacity: 0;
+  transform: translateX(-50%) translateY(6px);
+  transition: opacity 140ms ease-out, transform 140ms ease-out;
+  pointer-events: none;
+}
+.pet-toast.hidden { display: none; }
+.pet-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+.pet-toast.bad { border-color: rgba(240, 120, 120, 0.5); color: #ffd6d6; }

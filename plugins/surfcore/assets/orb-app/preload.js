@@ -4,8 +4,10 @@ const { contextBridge, ipcRenderer, webUtils } = require('electron');
 contextBridge.exposeInMainWorld('orb', {
   /** 调插件的 /dsh-surfcore/orb-api/*（令牌和 baseUrl 永远留在主进程）。 */
   http: (path, options = {}) => ipcRenderer.invoke('orb:http', { path, ...options }),
-  /** 系统文件选择框：图片/文件都能选，返回绝对路径。 */
-  pickFiles: () => ipcRenderer.invoke('orb:pick-files'),
+  /** 系统文件选择框：图片/文件都能选，返回绝对路径。传 { directory:true } 变成选目录。 */
+  pickFiles: (options) => ipcRenderer.invoke('orb:pick-files', options && typeof options === 'object' ? options : {}),
+  /** 在资源管理器里打开一个目录（皮肤文件夹）。 */
+  openPath: (target) => ipcRenderer.invoke('orb:open-path', String(target ?? '')),
   /** 拖进来/粘贴进来的 File 取真实路径；取不到返回空串。 */
   pathForFile: (file) => {
     try { return webUtils.getPathForFile(file) || ''; } catch { return ''; }
@@ -36,6 +38,16 @@ contextBridge.exposeInMainWorld('orb', {
   menurect: (width, height) => ipcRenderer.invoke('orb:menurect', { width, height }),
   /** 形象配置：是不是桌宠、素材在哪、动画清单长什么样。 */
   petconfig: () => ipcRenderer.invoke('orb:petconfig'),
+  /** 皮肤包：{action:'list'|'catalog'|'detail'|'install'|'activate'|'remove'|'import', id?, path?}。 */
+  petPacks: (payload) => ipcRenderer.invoke('orb:pet-packs', payload || {}),
+  /** 互动监测配置：{action:'get'|'set', config?}。 */
+  activityConfig: (payload) => ipcRenderer.invoke('orb:activity-config', payload || {}),
+  /** 主进程推来的采样（关着时推 null）。 */
+  onActivity: (fn) => {
+    const handler = (_event, data) => { try { fn(data); } catch {} };
+    ipcRenderer.on('orb:activity', handler);
+    return () => ipcRenderer.removeListener('orb:activity', handler);
+  },
   /** 自己走两步：{dx,dy,ms}，主进程负责夹到屏幕内并平滑移动，返回 {clamped}。 */
   petMove: (payload) => ipcRenderer.invoke('orb:pet-move', payload || {}),
   /** 鼠标位置：宠物窗口是全透明覆盖层，收不到可靠 mousemove，注视只能问主进程。 */

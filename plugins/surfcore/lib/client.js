@@ -5857,6 +5857,7 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
     const screenMode = draft.screen?.mode || (draft.screen?.enabled === true ? "manual" : "off");
     const picCfg = st?.config?.pic || {};
       const petCfg = draft.pet || {};
+      const actCfg = draft.activity || {};
       const petState = st?.pet || null;
       const petMode = ballCfg.mode === "ball" ? "ball" : "pet";
       const running = Boolean(st?.running);
@@ -5933,6 +5934,40 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
                   `包目录：${petState?.assets?.activePackDir || petState?.assets?.dir || "（还没装）"}`,
                   petState?.assets?.packs?.length > 1 ? ` · 共 ${petState.assets.packs.length} 个包` : ""),
 
+                // ── 内置皮肤包清单（随插件发布的 index.json）─────────────────
+                // 没装的显示「下载」，装了的显示「启用/删除」；figure 包不用 webm，靠 index.html 自绘。
+                h("div", { className: "qbw-kv", style: { marginTop: "10px" } }, h("span", null, "皮肤包"),
+                  h("span", null, `${(petState?.assets?.packs || []).length} 个`)),
+                h("div", { style: { display: "flex", flexDirection: "column", gap: "6px" } },
+                  ...(petState?.assets?.packs || []).slice(0, 12).map((p) => h("div", {
+                    key: p.id, style: { display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" },
+                  },
+                    h("span", { className: "qbw-hint", style: { minWidth: "180px" } },
+                      `${p.name || p.id}${p.active ? " ✓ 使用中" : ""} · `
+                      + `${p.kind === "figure" ? "网页形象" : `${Number(p.webmCount) || 0} 段动作`}`
+                      + `${p.license ? ` · ${p.license}` : ""}${p.builtin ? " · 内置" : ""}`),
+                    p.installed
+                      ? h(Btn, {
+                        kind: "qbw-btn2", disabled: !!busy || p.active,
+                        onClick: () => act("pet-packs", { action: "activate", id: p.id }, "✓ 已切换皮肤包，球会自己重载"),
+                      }, p.active ? "使用中" : "启用")
+                      : h(Btn, {
+                        kind: "qbw-btn2", disabled: !!busy,
+                        onClick: () => act("pet-packs", { action: "install", id: p.id }, "✓ 已下载并启用"),
+                      }, busy === "pet-packs" ? "下载中…" : (p.npm ? `下载 ${p.version || ""}`.trim() : "安装")),
+                    p.installed && !p.builtin
+                      ? h(Btn, {
+                        kind: "qbw-btn2", disabled: !!busy,
+                        onClick: () => act("pet-packs", { action: "remove", id: p.id }, "✓ 已删除这个皮肤包"),
+                      }, "删除")
+                      : null,
+                    p.error ? h("span", { className: "qbw-hint", style: { color: "#c66" } }, p.error) : null)),
+                  ...((petState?.assets?.packs || []).length ? [] : [h("div", { className: "qbw-hint", key: "none" }, "还没读到皮肤包清单（稍等一下，或点「校验素材」）。")])),
+                h("div", { className: "qbw-hint" },
+                  "网页形象包（figure）= 一个 index.html 自己画的形象：会呼吸、点了有反应、眼睛跟着光标转。"
+                  + "它只跑纯前端代码（不能读你的文件），放进包里即可，不需要 webm 动作素材。"
+                  + "Coopanion 的鲸鱼是 AGPL 授权，不随插件分发，想要只能自己导入文件夹。"),
+
                 h("div", { className: "qbw-kv", style: { marginTop: "10px" } }, h("span", null, "动作测试"), h("span", null, "点一下就在桌宠身上播")),
                 h("div", { style: { display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" } },
                   h("select", { className: "qbw-input", "data-pet-action": "1", defaultValue: "", style: { maxWidth: "320px" } },
@@ -5977,6 +6012,24 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
               h("option", { value: "auto" }, "跟随系统"), h("option", { value: "dark" }, "深色"), h("option", { value: "light" }, "浅色")))),
           h("div", { className: "qbw-hint" }, "头像：默认用插件自带的那张 Q 版形象；换成绝对路径就是你换的头像。"),
           h("input", { className: "qbw-input", placeholder: "头像绝对路径（可空）", value: ballCfg.avatar || "", style: { maxWidth: "420px" }, onChange: (e) => set("ball.avatar", e.target.value) })),
+
+        // ── 互动监测（2026-11-03）：让她知道主人在忙什么，但不偷看内容 ──────
+        h(Section, { title: "互动监测", defaultOpen: false, note: "只采「前台窗口标题 / 正在编辑的文件与项目 / 在听的歌」，存在本机 state/orb/activity.json，关掉即删。默认关。" },
+          h(Row, { label: "开启互动监测", hint: "开了以后隔一阵采一次，她可以在气泡里顺口接一句。涉及隐私的窗口按「看屏幕」那份屏蔽词跳过（密码、银行、支付…）。" },
+            h("input", { className: "qbw-switch", type: "checkbox", checked: actCfg.enabled === true, onChange: (e) => set("activity.enabled", e.target.checked) })),
+          h(Row, { label: "看窗口标题", hint: "知道你在用哪个程序、窗口叫什么。" },
+            h("input", { className: "qbw-switch", type: "checkbox", checked: actCfg.kinds?.window !== false, onChange: (e) => set("activity.kinds.window", e.target.checked) })),
+          h(Row, { label: "看文件名 / 项目名", hint: "从 VSCode / Cursor / JetBrains / 记事本 / Sublime 的标题里拆出「文件 — 项目」。解析不出来就只给标题。" },
+            h("input", { className: "qbw-switch", type: "checkbox", checked: actCfg.kinds?.file !== false, onChange: (e) => set("activity.kinds.file", e.target.checked) })),
+          h(Row, { label: "看在听的歌", hint: "走 Windows 的媒体控件，读到歌名 / 歌手 / 播放状态（本机播放器才读得到）。" },
+            h("input", { className: "qbw-switch", type: "checkbox", checked: actCfg.kinds?.music !== false, onChange: (e) => set("activity.kinds.music", e.target.checked) })),
+          h("div", { className: "qbw-kv", style: { marginTop: "8px" } }, h("span", null, "采样间隔"), h("span", null, `${Math.round((actCfg.pollMs ?? 20000) / 1000)} 秒`)),
+          slider(Math.round((actCfg.pollMs ?? 20000) / 1000), 10, 120, 5, (v) => set("activity.pollMs", Number(v) * 1000)),
+          h("div", { className: "qbw-kv" }, h("span", null, "主动气泡频率"), h("span", null, `${Math.round((actCfg.bubbleEveryMs ?? 600000) / 60000)} 分钟`)),
+          slider(Math.round((actCfg.bubbleEveryMs ?? 600000) / 60000), 1, 60, 1, (v) => set("activity.bubbleEveryMs", Number(v) * 60000)),
+          h("div", { className: "qbw-hint" },
+            "采样内容是给「她接话」用的，不会上传到任何服务器；关掉开关会把 activity.json 一起删掉。"
+            + (st?.activity?.lastAt ? ` 上次采样：${new Date(st.activity.lastAt).toLocaleTimeString()}` : " 还没采过样。"))),
 
         h(Section, { title: "聊天外观", defaultOpen: true, note: "气泡上显示谁说的话：头像和名字。默认用机器人自己的昵称和你们各自的 QQ 头像。" },
           h(Row, { label: "显示头像", hint: "关掉就只显示气泡。" },

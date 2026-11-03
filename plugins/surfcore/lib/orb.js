@@ -80,8 +80,8 @@ export const DEFAULT_ORB = {
     bili: true,
     identity: true,
     recent: true,
-    recentLines: 12,
-    recentHours: 24,
+    recentLines: 30,
+    recentHours: 48,
     personaMaxChars: 12000,
     memoryMaxChars: 8000,
   },
@@ -95,6 +95,14 @@ export const DEFAULT_ORB = {
     gaze: { enabled: true, intervalMs: 40 },
     // 自己溜达：隔一阵挪一小步，撞到屏幕边就掉头。
     wander: { enabled: true, minMs: 8000, maxMs: 20000 },
+  },
+  // 互动监测：定时看看主人在干什么（前台窗口/文件/媒体），让桌宠能接话、能吐槽。
+  // 默认关：这是「她主动注意主人」的能力，得主人自己点开；关掉时 activity.json 会被删。
+  activity: {
+    enabled: false,
+    pollMs: 20000,
+    kinds: { window: true, file: true, music: true },
+    bubbleEveryMs: 600000,
   },
   screen: {
     // 看屏幕三档：off 关 / manual 只有主人点「眼」那一下 / auto 她想看就看。
@@ -199,6 +207,23 @@ export function normalizeOrbConfig(raw) {
         wander: { enabled: wander.enabled !== false, minMs: wMin, maxMs: wMax },
       };
     })(),
+    // 互动监测：窗口/文件/音乐三个开关 + 采样间隔 + 主动气泡频率。
+    activity: (() => {
+      const act = src.activity && typeof src.activity === 'object' ? src.activity : {};
+      const kinds = act.kinds && typeof act.kinds === 'object' ? act.kinds : {};
+      return {
+        enabled: act.enabled === true,
+        // 10s 以下太费 CPU，2 分钟以上就谈不上「互动」了。
+        pollMs: clampNum(act.pollMs, DEFAULT_ORB.activity.pollMs, 10000, 120000, { integer: true }),
+        kinds: {
+          window: kinds.window !== false,
+          file: kinds.file !== false,
+          music: kinds.music !== false,
+        },
+        // 隔多久允许她主动就「主人在干什么」冒一句（0 之外最低 1 分钟，最高 6 小时）。
+        bubbleEveryMs: clampNum(act.bubbleEveryMs, DEFAULT_ORB.activity.bubbleEveryMs, 60000, 6 * 60 * 60 * 1000, { integer: true }),
+      };
+    })(),
     chat: {
       enabled: chat.enabled !== false,
       bubbleTtlSec: clampNum(chat.bubbleTtlSec, DEFAULT_ORB.chat.bubbleTtlSec, 3, 30, { integer: true }),
@@ -272,6 +297,11 @@ export function createOrbService({ stateDir, pluginLog = () => {}, getSubprocess
     const cfg = readConfig();
     const assets = pets.status();
     const wantPet = cfg.ball.mode === 'pet';
+    let activePack = null;
+    try { activePack = pets.activePack(); } catch (error) {
+      pluginLog('[orb] 读生效皮肤包失败：', String(error?.message ?? error));
+    }
+    const packKind = activePack?.kind === 'figure' ? 'figure' : 'webm';
     return {
       mode: wantPet && assets.installed ? 'pet' : 'ball',
       wantMode: cfg.ball.mode,
@@ -284,6 +314,10 @@ export function createOrbService({ stateDir, pluginLog = () => {}, getSubprocess
       wander: cfg.pet.wander,
       avatar: cfg.ball.avatar,
       packId: assets.activePackId || '',
+      // 渲染端靠这两个字段决定：webm 走动画帧，figure 走 iframe 加载 entry 页面。
+      packKind,
+      packEntry: packKind === 'figure' ? (activePack?.entry || '') : '',
+      packEntryUrl: packKind === 'figure' ? (activePack?.entryUrl || '') : '',
       dir: pets.dir,
       manifest: wantPet && assets.installed ? pets.manifest() : null,
       assets,

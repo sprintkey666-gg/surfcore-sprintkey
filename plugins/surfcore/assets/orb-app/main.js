@@ -10,7 +10,7 @@
 // 注意：这个文件是 **CommonJS**（package.json 没有 "type": "module"）。
 // 曾用 import 写过，Electron 会把它当 ES module 重新解析，于是 __dirname 未定义，
 // 窗口创建直接抛 ReferenceError、球根本不出现（2026-10-31 踩过）。别改回 import。
-const { app, BrowserWindow, ipcMain, screen, Menu, Tray, globalShortcut, nativeImage, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, Menu, Tray, globalShortcut, nativeImage, dialog, shell } = require('electron');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -69,7 +69,8 @@ function bandFor() {
 /** 收起状态下的窗口尺寸：桌宠是「宠物 + 头顶气泡 + 一点余量」，球就是球。 */
 function baseSize() {
   const pet = readPet();
-  if (pet && pet.mode === 'pet' && pet.manifest) {
+  // figure 包没有 manifest（靠 index.html 自绘），判据要看 packKind。
+  if (pet && pet.mode === 'pet' && (pet.manifest || pet.packKind === 'figure')) {
     const wanted = Number(prefs.petSize) || Number(pet.size) || 200;
     const size = Math.min(Math.max(Math.round(wanted), PET_MIN), PET_MAX);
     return { width: size + PET_SIDE_SPACE, height: size + bandFor(), pet: true };
@@ -996,6 +997,59 @@ function startPolling() {
   pollTimer = setInterval(tick, STATE_POLL_MS);
 }
 
+// ── 互动监测（主进程只做搬运）────────────────────────────────────────────
+// 采样在插件里（powershell 每 pollMs 跑一次，写 activity.json）；
+// 这边每 5 秒看一眼文件的 mtime，变了就把内容推给渲染端。
+const ACTIVITY_FILE = path.join(ORB_DIR, 'activity.json');
+const ACTIVITY_POLL_MS = 5000;
+let activityTimer = null;
+let activitySentMtime = null;
+
+function pushActivity() {
+  if (!win || win.isDestroyed()) return;
+  let mtimeMs = null;
+  let data = null;
+  try {
+    const stat = fs.statSync(ACTIVITY_FILE);
+    mtimeMs = stat.mtimeMs;
+    // 只在 mtime 变了才解析：每 5 秒读一次 JSON 没必要。
+    if (mtimeMs !== activitySentMtime) data = JSON.parse(fs.readFileSync(ACTIVITY_FILE, 'utf8'));
+  } catch {
+    // 文件不存在 = 互动监测关着（或还没采到）；只在从有到无时推一次 null，把旧内容清掉。
+    mtimeMs = null;
+  }
+  if (mtimeMs === activitySentMtime) return;
+  activitySentMtime = mtimeMs;
+  try { win.webContents.send('orb:activity', data || null); } catch {}
+}
+
+function startActivityWatch() {
+  pushActivity();
+  activityTimer = setInterval(pushActivity, ACTIVITY_POLL_MS);
+}
+
+/** 渲染端读写互动监测配置：get 读当前配置+状态，set 写回插件并立刻生效。 */
+ipcMain.handle('orb:activity-config', async (_event, payload = {}) => {
+  const action = String(payload?.action || 'get').trim().toLowerCase();
+  if (action === 'set') {
+    const config = payload?.config && typeof payload.config === 'object' ? payload.config : {};
+    const res = await call('/activity', { method: 'POST', body: { config }, timeoutMs: 20000 });
+    // 开关一改，主进程手里的「上次推送 mtime」作废，下一次轮询立刻把新状态送下去。
+    activitySentMtime = undefined;
+    pushActivity();
+    return res.ok ? { ok: true, ...(res.data || {}) } : res;
+  }
+  const res = await call('/activity', { timeoutMs: 8000 });
+  return res.ok ? { ok: true, ...(res.data || {}) } : res;
+});
+
+/** 设置页的皮肤包操作：转发给插件（列表/安装/启用/删除/导入）。 */
+ipcMain.handle('orb:pet-packs', async (_event, payload = {}) => {
+  const body = payload && typeof payload === 'object' ? payload : {};
+  const res = await call('/pet-packs', { method: 'POST', body, timeoutMs: 180000 });
+  return res.ok ? { ok: true, ...(res.data || {}) } : res;
+});
+
 /** 渲染端拿形象配置：自己是不是桌宠、素材在哪、清单长什么样。 */
 ipcMain.handle('orb:petconfig', () => {
   const pet = readPet();
@@ -1014,6 +1068,10 @@ ipcMain.handle('orb:petconfig', () => {
         wander: pet.wander && typeof pet.wander === 'object' ? pet.wander : null,
         avatar: String(pet.avatar ?? ''),
         packId: String(pet.packId ?? ''),
+        // figure 包（自绘页面）走 iframe；webm 包照旧读 manifest 播动画。
+        packKind: pet.packKind === 'figure' ? 'figure' : 'webm',
+        packEntry: String(pet.packEntry ?? ''),
+        packEntryUrl: String(pet.packEntryUrl ?? ''),
         // 设置页点「试播」时插件往 preview.json 写一条，渲染端 4 秒一轮问一次。
         preview: readPetPreview(),
       }
@@ -1155,14 +1213,20 @@ ipcMain.handle('orb:http', async (_event, payload = {}) => {  const apiPath = St
   });
 });
 
-ipcMain.handle('orb:pick-files', async () => {
+ipcMain.handle('orb:pick-files', async (_event, payload = {}) => {
   try {
+    // 桌宠右键「导入皮肤文件夹…」要选目录：允许渲染端要 openDirectory。
+    const wantDir = payload?.directory === true;
     const result = await dialog.showOpenDialog(win, {
-      title: '选择要发给她的图片或文件',
-      properties: ['openFile', 'multiSelections'],
-      filters: [{ name: '所有文件', extensions: ['*'] }],
+      title: wantDir ? '选择桌宠皮肤文件夹（里面有 pack.json 或 webm/）' : '选择要发给她的图片或文件',
+      properties: wantDir ? ['openDirectory'] : ['openFile', 'multiSelections'],
+      filters: wantDir ? undefined : [{ name: '所有文件', extensions: ['*'] }],
     });
     if (result.canceled || !Array.isArray(result.filePaths)) return { ok: true, files: [] };
+    if (wantDir) {
+      const dir = result.filePaths[0] || '';
+      return { ok: true, files: dir ? [{ path: dir, name: path.basename(dir), size: 0, directory: true }] : [] };
+    }
     const files = [];
     for (const file of result.filePaths.slice(0, 6)) {
       try {
@@ -1172,6 +1236,19 @@ ipcMain.handle('orb:pick-files', async () => {
       } catch {}
     }
     return { ok: true, files };
+  } catch (error) {
+    return { ok: false, error: String(error?.message ?? error) };
+  }
+});
+
+/** 在资源管理器里打开一个目录（桌宠右键「打开皮肤文件夹」）。 */
+ipcMain.handle('orb:open-path', async (_event, target = '') => {
+  try {
+    const dir = String(target ?? '').trim();
+    if (!dir) return { ok: false, error: '没有路径' };
+    if (!fs.existsSync(dir)) return { ok: false, error: '目录不存在' };
+    const error = await shell.openPath(dir);
+    return error ? { ok: false, error } : { ok: true };
   } catch (error) {
     return { ok: false, error: String(error?.message ?? error) };
   }
@@ -1204,7 +1281,9 @@ ipcMain.handle('orb:prefs', () => ({ ...prefs, expanded, ball: ballRect, bubbleB
 ipcMain.handle('orb:bubble-space', (_event, payload = {}) => {
   if (!win || win.isDestroyed()) return { ok: false, band: bandFor() };
   const pet = readPet();
-  if (!pet || pet.mode !== 'pet' || !pet.manifest) return { ok: false, band: bandFor() };
+  // figure（网页形象）包没有 manifest，但它同样有头顶气泡 —— 别因为没 manifest 就拒绝申请。
+  const figurePack = String(pet?.packKind || '') === 'figure';
+  if (!pet || pet.mode !== 'pet' || (!pet.manifest && !figurePack)) return { ok: false, band: bandFor() };
   if (displayMode === 'expanded') return { ok: false, band: bandFor() };
   const area = screen.getDisplayNearestPoint(win.getBounds()).workArea;
   const size = Math.min(Math.max(Math.round(Number(prefs.petSize) || Number(pet.size) || 200), PET_MIN), PET_MAX);
@@ -1564,6 +1643,7 @@ ipcMain.handle('orb:log', (_event, text) => {
 app.on('window-all-closed', () => app.quit());
 app.on('before-quit', () => {
   if (pollTimer) clearInterval(pollTimer);
+  if (activityTimer) clearInterval(activityTimer);
   stopClickWatch();
   try { globalShortcut.unregisterAll(); } catch {}
   try { tray?.destroy(); } catch {}
@@ -1600,5 +1680,6 @@ if (!gotLock) {
       startClickWatch();
     }
     startPolling();
+    startActivityWatch();
   });
 }

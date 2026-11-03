@@ -1,0 +1,11 @@
+{
+  "id": "sprintkey-fish",
+  "name": "小鲸鱼（Q 版）",
+  "version": "1.0.0",
+  "kind": "figure",
+  "author": "sprintkey",
+  "license": "MIT",
+  "source": "SurfCore 自绘",
+  "entry": "index.html",
+  "description": "圆滚滚的 Q 版小鲸鱼：会呼吸、会眨眼、被点会弹一下。纯前端 SVG，无任何依赖。"
+}

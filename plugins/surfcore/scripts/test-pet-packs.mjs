@@ -51,6 +51,14 @@ function mkPackDir(parent, id, names = ['待机', '转圈']) {
   return dir;
 }
 
+function mkFigureDir(parent, id, { entry = true } = {}) {
+  const dir = path.join(parent, id);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'pack.json'), JSON.stringify({ id, name: `${id} 的网页形象`, version: '1.0.0', license: 'MIT' }));
+  if (entry) fs.writeFileSync(path.join(dir, 'index.html'), '<!doctype html><html><body>fish</body></html>');
+  return dir;
+}
+
 const state = mkState();
 // 走 pet-assets 这个真实入口：它才是给 pet-packs 注入 readTar/buildManifest 的那一层。
 const assets = createPetAssetsService({ stateDir: state });
@@ -125,6 +133,77 @@ check('删掉导入的包后回落到内置', () => {
   const r = svc.remove('cat-01');
   assert.equal(r.ok, true);
   assert.equal(svc.list().activePackId, 'dsh-pet');
+});
+
+await acheck('figure 包：导入后按 index.html 判成 figure', async () => {
+  const src = mkFigureDir(path.join(state, 'imports'), 'fish-01');
+  const imported = await svc.handleAction({ action: 'import', path: src });
+  assert.equal(imported.ok, true, imported.error);
+  const item = svc.list().packs.find((p) => p.id === 'fish-01');
+  assert.equal(item.kind, 'figure');
+  assert.equal(item.installed, true);
+  assert.ok(item.entry.endsWith('index.html'), `entry 要指向 index.html：${item.entry}`);
+  const d = svc.detail('fish-01');
+  assert.equal(d.ok, true);
+  assert.equal(d.pack.kind, 'figure');
+  assert.equal(d.pack.manifest, null, 'figure 包没有动画清单');
+  assert.match(d.pack.entryUrl, /^file:\/\//, 'entryUrl 要是 file:// URL');
+  assert.equal(svc.verify('fish-01').ok, true);
+  const act = await svc.handleAction({ action: 'activate', id: 'fish-01' });
+  assert.equal(act.ok, true, act.error);
+  assert.equal(svc.list().activePackId, 'fish-01');
+  assert.equal(svc.active().kind, 'figure');
+  assert.ok(assets.dir.includes('fish-01'), `assets.dir 要切到 figure 包：${assets.dir}`);
+});
+
+await acheck('figure 包：tgz 里只带 index.html 也能装', async () => {
+  const tgz = path.join(state, 'figure.tgz');
+  const stage = path.join(state, 'stage-figure');
+  fs.mkdirSync(path.join(stage, 'fig'), { recursive: true });
+  fs.writeFileSync(path.join(stage, 'fig', 'index.html'), '<!doctype html><html><body>tgz-fish</body></html>');
+  const { execFileSync } = await import('node:child_process');
+  execFileSync('tar', ['-czf', tgz, '-C', stage, 'fig']);
+  const imported = await svc.handleAction({ action: 'import', path: tgz, id: 'fish-tgz' });
+  assert.equal(imported.ok, true, imported.error);
+  const item = svc.list().packs.find((p) => p.id === 'fish-tgz');
+  assert.equal(item.kind, 'figure');
+  assert.equal(item.installed, true);
+});
+
+check('activate 失败时保持原包不回落', () => {
+  const dir = path.join(state, 'orb', 'pet', 'packs', 'broken-fig');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'pack.json'), JSON.stringify({ id: 'broken-fig', name: '坏包', kind: 'figure' }));
+  const before = svc.list().activePackId;
+  const r = svc.activate('broken-fig');
+  assert.equal(r.ok, false);
+  assert.match(String(r.error), /index\.html/);
+  assert.equal(svc.list().activePackId, before, '切换失败不能把 activePackId 改掉');
+});
+
+check('list 形状：id/name/kind/active/error 齐全', () => {
+  for (const p of svc.list().packs) {
+    assert.equal(typeof p.id, 'string');
+    assert.equal(typeof p.name, 'string');
+    assert.ok(['webm', 'figure'].includes(p.kind), `kind 不合法：${p.id} ${p.kind}`);
+    assert.equal(typeof p.active, 'boolean');
+    assert.equal(typeof p.error, 'string');
+    assert.ok('entry' in p && 'license' in p && 'installed' in p);
+  }
+});
+
+await acheck('内置清单 + install 随仓 figure 包', async () => {
+  const cat = svc.catalog();
+  assert.ok(cat.packs.some((p) => p.id === 'dsh-pet' && /^dsh-pet@/.test(p.npm || '')), '清单里要有 dsh-pet@npm');
+  assert.ok(cat.packs.some((p) => p.id === 'sprintkey-fish' && p.bundled), '清单里要有随仓的 sprintkey-fish');
+  const r = await svc.handleAction({ action: 'install', id: 'sprintkey-fish' });
+  assert.equal(r.ok, true, r.error);
+  const item = svc.list().packs.find((p) => p.id === 'sprintkey-fish');
+  assert.equal(item.kind, 'figure');
+  assert.equal(item.installed, true);
+  assert.equal(svc.list().activePackId, 'sprintkey-fish', 'install 默认装完就切换');
+  const reg = JSON.parse(fs.readFileSync(path.join(state, 'orb', 'pet', 'packs.json'), 'utf8'));
+  assert.ok(reg.packs.some((p) => p.id === 'sprintkey-fish'), 'install 后要写进 packs.json 注册表');
 });
 
 if (failed) { console.error(`\n✗ pet packs：${failed} 项失败`); process.exit(1); }

@@ -251,6 +251,7 @@ export function createOrbApiService({
   identDefaults = () => ({}), setScreenEnabled = null,
   consoleCall = null, picLocalDirs = () => [], adminQQ = () => '',
   companion: injectedCompanion = null, archiveMessage = null,
+  activity = null,
 }) {
   const root = path.join(stateDir, 'orb');
   const hostFile = path.join(root, 'host.json');
@@ -699,6 +700,14 @@ export function createOrbApiService({
     try { pet = orb.petInfo(); } catch (error) {
       pluginLog('[orb-api] 取形象配置失败：', String(error?.message ?? error));
     }
+    // 互动监测：主进程只知道「开没开 / 上次采到什么时候」，内容走 activity.json。
+    let activityInfo = { enabled: false, lastAt: 0 };
+    try {
+      const st = activity?.status?.();
+      if (st) activityInfo = { enabled: st.enabled === true, lastAt: Number(st.lastAt) || 0 };
+    } catch (error) {
+      pluginLog('[orb-api] 取互动监测状态失败：', String(error?.message ?? error));
+    }
     return {
       version: HOST_FILE_VERSION,
       baseUrl: String(currentDshUrl() || '').replace(/\/+$/, ''),
@@ -718,9 +727,14 @@ export function createOrbApiService({
           wander: pet.wander || null,
           avatar: pet.avatar || '',
           packId: pet.packId || '',
+          // figure 包靠 iframe 加载 index.html；webm 包继续读 manifest。
+          packKind: pet.packKind || 'webm',
+          packEntry: pet.packEntry || '',
+          packEntryUrl: pet.packEntryUrl || '',
           manifest: pet.manifest,
         }
         : null,
+      activity: activityInfo,
       pluginVersion: String(version || ''),
       updatedAt: new Date().toISOString(),
     };
@@ -1182,6 +1196,55 @@ export function createOrbApiService({
     }
     if (req.method === 'GET' && suffix === '/state') {
       json(res, 200, stateForOrb());
+      return;
+    }
+    // 皮肤包：桌面端设置页（右键菜单/面板）直接打这里，不用绕到插件主 API。
+    // 换包/导入之后必须重写 host.json，不然渲染端还拿旧 manifest。
+    if (req.method === 'POST' && suffix === '/pet-packs') {
+      let body = {};
+      try { body = JSON.parse((await readBody(req, ORB_BODY_LIMIT)) || '{}'); } catch {
+        json(res, 400, { ok: false, error: '请求体不是合法 JSON' });
+        return;
+      }
+      const action = String(body?.action || '').trim().toLowerCase();
+      const result = await orb.petAssets.packs.handleAction(body || {});
+      if (['activate', 'import', 'import-dir', 'import-tgz', 'remove', 'install', 'publish'].includes(action)) {
+        try { writeHostFile(true); } catch {}
+      }
+      json(res, 200, result);
+      return;
+    }
+    // 互动监测：主进程每 5 秒读 activity.json 推给渲染端，开关走这里。
+    if (suffix === '/activity') {
+      if (req.method === 'GET') {
+        let config = null;
+        try { config = orb.readConfig().activity; } catch {}
+        let status = null;
+        let last = null;
+        try { status = activity?.status?.() || null; last = activity?.last?.() || null; } catch {}
+        json(res, 200, { ok: true, config, status, last });
+        return;
+      }
+      let body = {};
+      try { body = JSON.parse((await readBody(req, ORB_BODY_LIMIT)) || '{}'); } catch {
+        json(res, 400, { ok: false, error: '请求体不是合法 JSON' });
+        return;
+      }
+      const patch = body?.config && typeof body.config === 'object' ? body.config : (body || {});
+      const current = orb.readConfig();
+      const nextActivity = {
+        ...current.activity,
+        ...patch,
+        kinds: { ...current.activity.kinds, ...(patch.kinds && typeof patch.kinds === 'object' ? patch.kinds : {}) },
+      };
+      delete nextActivity.action;
+      const saved = orb.writeConfig({ ...current, activity: nextActivity });
+      let status = null;
+      try { status = activity?.configure?.(saved.activity) || null; } catch (error) {
+        pluginLog('[orb-api] 应用互动监测配置失败：', String(error?.message ?? error));
+      }
+      try { writeHostFile(true); } catch {}
+      json(res, 200, { ok: true, config: saved.activity, status });
       return;
     }
     if (req.method === 'GET' && suffix === '/history') {

@@ -437,6 +437,56 @@
 
 **验证**：真机 PowerShell 截到 2111×1337@(245,77)，`read_image` 确认只有窗口内容、无桌面偏移；黑名单 / 屏幕权限关 / 超限 / manual 模式都不占额度。
 
+## 27. 记忆卡：「最近很要紧的」——暗号事故的根因与修法
+
+**事故**：2026-11-02 上午她在 QQ 私聊里和主人约了暗号（问「在吗 鲸鲸」→ 答「赖着不走的鱼」）。11-03 晚上在悬浮窗里问，她一本正经地说「暗号对上了，鲸鲸在」——**在编**。
+
+**这不是互通没接上**：那条记忆确实在卡里（`mem_654c17336ab254`，importance 74，tags `owner/qq/initial`），悬浮窗也确实在读同一张卡。真正的问题在**渲染**：
+
+1. `sectionize()` 把 `owner + isInitial` 的记录放进「最初的日子」，排序是 `createdAt` **升序**（最早的在前），QQ 版限额 6 条 → 11-02 的新约定被 10-28 那批老记录挤掉，整条都没进注入块。
+2. 想用 `lastSeenAt` 兜也不行：一条记忆只有进了提示词才可能被「想起」，被想起才会刷新 `lastSeenAt` —— 没被想起的重要记忆永远停在当年，同分全排到后面，**越漏越漏**。
+
+**修法**（`src/memory-card.js`）：
+
+- 新增 `recentImportant` 段（`## 最近很要紧的（别弄错）`，priority 90，排在 anchors 之后、initial 之前）。条件：非 pinned、非桌宠/悬浮窗来源、未模糊、`importance >= 65`、`createdAt` 在 `recentImportantDays`（默认 14 天）内。
+- 该段排序用 `importance` 降序，**同分比 `createdAt`（事情发生的时间），不比 `lastSeenAt`** —— 断掉上面那个死循环。
+- 默认 `recentImportantLimit: 6`（真机那张卡里，暗号按同分排到第 6 位；4 条仍会漏）。
+- 「最初的日子」的排序也从 `createdAt` 升序改成按重要度。
+- 配置项：`recentImportant` / `recentImportantDays` / `recentImportantMinImportance` / `recentImportantLimit`（钳制 1~90 天、30~100 分、1~12 条）；B站 版这一段恒为 0（私事不进 B站 卡）。
+
+**跨端最近对话**：`interop.recentLines` 12→30、`recentHours` 24→48。暗号那轮在 6 小时前、约 100 条消息之前，12 行 / 24 小时根本够不着。
+
+**验证**：拿本机真卡（610 条）直接渲染 —— `renderMemoryCard(card, {platform:'qq'})` 1656 字、含「赖着不走的鱼」；`platform:'bili'` 0 字。`scripts/test-memory-card-recent-important.mjs`（9 组，含「同分但 lastSeenAt 更新的一批记录不能把暗号挤掉」这条真机陷阱）。
+
+**重建注入块**：`saveMemoryCardOutputs(paths, card, cfg)` 会同时重写 `memory-card.md` / `-prompt-qq.md` / `-prompt-bili.md`；改完卡渲染逻辑后跑一次，重启前就能生效。
+
+## 28. 互动监测：她在用什么窗口、改什么文件、听什么歌
+
+- 采样脚本 `plugins/surfcore/scripts/activity.ps1`（**必须保持纯 ASCII**：PS 5.1 会把无 BOM 的 UTF-8 当 ANSI，中文注释直接 ParserError；中文常量用 `-join @([char]0x8BB0,…)` 拼）。输出一行 JSON：
+  `{"at":…,"active":{"app","title","kind","file","project"}|null,"media":{"app","title","artist","album","status"}|null,"cursor":{x,y}}`
+- 前台窗口用 P/Invoke 枚举 z-order（跳过自己的三个窗口）；标题按 VSCode / Cursor / JetBrains 的 `file — project — App`、记事本 `文件名 - 记事本`、Sublime 等规则解析出「在改哪个文件」；命中 `orb.screen.denyTitles` 的窗口直接返回 `active:null`。音乐走 WinRT `GlobalSystemMediaTransportControlsSessionManager`（PS 5.1 要用 `System.WindowsRuntimeSystemExtensions` 的泛型 `AsTask` 反射 + 自定义 `Await`，`.GetAwaiter()` 会报「__ComObject 不包含 GetAwaiter」）。
+- 调度 `lib/orb-activity.js`：`pollMs` 默认 20s（钳 10~120s），内容没变不重写文件，5 秒限流防抖，关开关就 `stop()` 并删 `state/orb/activity.json`，失败只记日志保留旧数据。
+- 入口：`GET|POST /api/orb/activity`；桌面端 `orb:activity-config`（get/set）、`orb:activity`（5 秒按 mtime 推送）；右键菜单「监测 ›」三个开关 + 5/10/30 分钟 + 「现在看一眼」；设置页「悬浮窗 → 外观」同一组开关。
+- 配置：`orb.activity { enabled:false, pollMs:20000, kinds:{window,file,music}, bubbleEveryMs:600000 }`。
+- 实测输出：`{"active":{"app":"WINWORD","title":"工业机器人典型应用_期末复习范围(1).pdf - Word","kind":"document"},"media":{"app":"QQMusic.exe","title":"Chase the Light","artist":"塞壬唱片-MSR/ADÀI宋黛霆/David Lin/Erik Castro","status":"playing"},"cursor":{"x":807,"y":500}}`
+- **验证**：`plugins/surfcore/scripts/test-orb-activity.mjs`（17 项：配置钳位、清洗、去重、限流、kinds 三态、stop 删文件、真实 PS 采样、标题解析、denyTitles）。
+
+## 29. 桌宠气泡与动作过渡（0.12.17）：真的能看见、真的不闪
+
+**气泡「没出现」的真元凶之一**：三层视频层带 `z-index:1/3`，而 `.petStage` 不是层叠上下文、`#bubble` 是 `auto` —— 气泡被自己身上的视频盖住了。修法：`.petStage{isolation:isolate;z-index:0}`、`#bubble{z-index:6}`。另外 `ensureBand()` 里 `headroom()>=64` 的短路删掉（首次必申请一次气泡带），并且 `hideBubble()` 不再把窗口缩回去（断开「气泡长高→窗口长高→位置漂移」）。
+
+**定位**：`maybeBubble` 六道门全加了日志（`[bubble] skip reason=not-pet-mode|panel-expanded|no-her-message|no-id|same-id|already-seen`），成功路径打 `[bubble] show id=…` 与 `[bubble] rect top=… win=…`。下次「气泡没出来」直接看 `~/.dsh/surfcore/orb/orb-app.log` 就知道卡在哪一道。
+
+**样式**：深色卡片 `rgba(22,27,38,.94)` + 1px 内高光描边 + 10px 圆角 + 旋转 45° 的小尾巴 + `0 10px 28px rgba(0,0,0,.45)` 投影，13.5px/1.5、4 行折叠，120ms 淡入；带图时缩略图在文字上方。
+
+**动作不再闪**：原来 `play()` 在 `next.play()` 之后**立刻**切 `classList`，新视频首帧还没解出来就换层，播完又立刻 `play(idle)` 硬切。现在三层：`pvA`/`pvIdleB` 两路 idle **常驻循环**交叉淡入，`pvAction` 动作层盖顶；任何切层都先等 `requestVideoFrameCallback`（900ms 超时回落 `readyState>=2`）再动 opacity，动作播完 `finishAction()` 先淡出 200ms、再 pause + 卸 `src`，露出下面一直在跑的 idle。`currentTime=0` 只对刚装载的源用，可见层绝不重置。
+
+**figure（网页形象）包**：`pack.json.kind='figure'` 时隐藏视频层、iframe（`sandbox="allow-scripts"`）加载 `entry`；宿主→形象 `{type:'pet:action',name}` / `{type:'pet:gaze',dx,dy}`，形象→宿主 `{type:'figure:ready',actions:[…]}`；6 秒没 ready 自动退回 webm。随仓内置 `sprintkey-fish`（纯前端 SVG Q 版蓝鲸，MIT）。
+
+**右键菜单**：新增「试一下气泡」（走 `POST /say` 正常链路）、「皮肤 ›」（包列表 / 导入文件夹 / 导入 .tgz / 打开皮肤文件夹 —— 走 `shell.openPath`）、「监测 ›」。旧项全部保留。
+
+**验证**：`scripts/test-orb.mjs`（67 + 289 项）、`test-orb-window-state.mjs`（28 项）、`test-pet-packs.mjs`（13 项）；真机看日志里 `[state]` 与 `[bubble]` 行。
+
 ## 附：新增文件清单
 
 | 文件 | 作用 |
@@ -483,7 +533,13 @@
 | `scripts/test-orb-agent.mjs` | 会话驱动器 17 项单测（只认 turn/end、ready 缓存、失败/超时清理） |
 | `scripts/test-memory-card-channel.mjs` | 记忆卡数据类型 22 项单测（悬浮窗/字幕/桌宠的标题前缀与 tag） |
 | `scripts/test-chat-archive-recent.mjs` | 存档数据类型 + 尾部回读 20 项单测 |
-| `src/memory-card.js` | 衰减记忆卡（含 `includePetInBili`、B站 侧 fail-closed） |
+| `src/memory-card.js` | 衰减记忆卡（含 `includePetInBili`、B站 侧 fail-closed、「最近很要紧的」段） |
+| `scripts/test-memory-card-recent-important.mjs` | 记忆卡「最近很要紧的」9 组单测（暗号事故回归） |
+| `plugins/surfcore/lib/orb-activity.js` | 互动监测调度：采样 / 去重 / 限流 / 开关 / 落盘 |
+| `plugins/surfcore/scripts/activity.ps1` | 前台窗口 + 标题解析 + WinRT 音乐 + 光标采样（**纯 ASCII**，一行 JSON） |
+| `plugins/surfcore/scripts/test-orb-activity.mjs` | 互动监测 17 项单测（配置/清洗/去重/限流/kinds/真实采样/标题解析/黑名单） |
+| `plugins/surfcore/assets/pet-packs/index.json` | 内置皮肤清单（dsh-pet@0.4.1 按需下载 / sprintkey-fish 随仓） |
+| `plugins/surfcore/assets/pet-packs/sprintkey-fish/` | 随仓自绘 figure 形象包（`pack.json` + 纯前端 SVG `index.html`，MIT） |
 
 修改的既有文件：`src/bridge.js`、`plugins/surfcore/lib/index.js`、`plugins/surfcore/lib/client.js`。
 

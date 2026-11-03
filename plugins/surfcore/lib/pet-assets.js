@@ -17,7 +17,7 @@ import zlib from 'node:zlib';
 import { createPetPacksService, BUILTIN_PACK_ID } from './pet-packs.js';
 
 export const PET_PKG = 'dsh-pet';
-export const PET_VERSION = '0.3.8';
+export const PET_VERSION = '0.4.1';
 export const PET_MARKER = '.surfcore-pet.json';
 
 // 先从国内镜像试，失败再回 npm 官方。两个都是同一份 tarball。
@@ -187,7 +187,13 @@ export function createPetAssetsService({ stateDir, pluginLog = () => {} }) {
     stateDir,
     builtinDir: dir,
     pluginLog,
-    helpers: { downloadTo, readTar, stripJsonc, buildManifest },
+    helpers: {
+      downloadTo,
+      readTar,
+      stripJsonc,
+      buildManifest,
+      installFromNpm: (spec, opts) => installFromNpm(spec, opts),
+    },
   });
 
   function readMarker() {
@@ -208,11 +214,13 @@ export function createPetAssetsService({ stateDir, pluginLog = () => {} }) {
     const webmCount = countWebm();
     const builtinInstalled = Boolean(marker) && webmCount > 0;
     // 换皮后「装没装」要看当前生效的包，而不能只看内置包。
+    // figure 包没有动画清单，判据是 entry（index.html）存在。
     let activePack = null;
     try { activePack = packs.active(); } catch (error) {
       pluginLog('[orb] 读动画包失败：', String(error?.message ?? error));
     }
-    const customUsable = Boolean(activePack && !activePack.builtin && activePack.manifest);
+    const customUsable = Boolean(activePack && !activePack.builtin
+      && (activePack.kind === 'figure' ? activePack.entry : activePack.manifest));
     const installed = builtinInstalled || customUsable;
     let packList = [];
     try { packList = packs.list().packs; } catch {}
@@ -225,6 +233,7 @@ export function createPetAssetsService({ stateDir, pluginLog = () => {} }) {
       dir,
       activePackId: activePack?.id || BUILTIN_PACK_ID,
       activePackName: activePack?.name || '内置 · dsh-pet（小鲸鱼）',
+      activePackKind: activePack?.kind || 'webm',
       activePackDir: activePack?.dir || dir,
       packs: packList,
       updatedAt: marker?.installedAt || '',
@@ -247,10 +256,15 @@ export function createPetAssetsService({ stateDir, pluginLog = () => {} }) {
     } catch { return null; }
   }
 
-  async function install({ onProgress } = {}) {
+  /**
+   * 装内置 dsh-pet 素材。version 参数是「装哪个版本」，默认跟插件声明的 PET_VERSION 走；
+   * 内置清单里的 `dsh-pet@0.4.1` 会从 installFromNpm 把版本传进来。
+   */
+  async function install({ onProgress, version } = {}) {
     if (job && job.phase !== 'done' && job.phase !== 'error') {
       return { ok: false, error: '正在下载，稍等', status: status() };
     }
+    const wantVersion = normalizeVersion(version) || FETCH_VERSION;
     job = { phase: 'download', percent: 0, error: '', startedAt: new Date().toISOString() };
     const report = (p) => {
       job = { ...job, ...p };
@@ -272,7 +286,7 @@ export function createPetAssetsService({ stateDir, pluginLog = () => {} }) {
       let lastError = null;
       // 本机已经有离线包就直接用：npm 在国内经常连不上，而插件进程又不走系统代理，
       // 主人在终端里 curl 下来的 tar 包放这儿就能装（省得卡在 download 进度上）。
-      const localTgz = path.join(dir, `dsh-pet-${FETCH_VERSION}.tgz`);
+      const localTgz = path.join(dir, `${PET_PKG}-${wantVersion}.tgz`);
       try {
         const st = fs.statSync(localTgz);
         if (st.size > 1024 * 1024) {
@@ -283,8 +297,8 @@ export function createPetAssetsService({ stateDir, pluginLog = () => {} }) {
       } catch {}
       for (const url of (tgz ? [] : MIRRORS)) {
         try {
-          pluginLog('[orb] 下载桌宠素材：', url(FETCH_VERSION));
-          tgz = await downloadTo(url(FETCH_VERSION), (p) => report({ phase: 'download', percent: p.percent, downloaded: p.downloaded, total: p.total }));
+          pluginLog('[orb] 下载桌宠素材：', url(wantVersion));
+          tgz = await downloadTo(url(wantVersion), (p) => report({ phase: 'download', percent: p.percent, downloaded: p.downloaded, total: p.total }));
           if (tgz?.length) break;
         } catch (error) {
           lastError = error;
@@ -331,16 +345,16 @@ export function createPetAssetsService({ stateDir, pluginLog = () => {} }) {
       if (licenseText) {
         fs.writeFileSync(
           path.join(dir, 'LICENSE-pet.txt'),
-          `${licenseText.trim()}\n\n---\n素材来自 npm 包 ${PET_PKG}@${FETCH_VERSION}（github.com/PC2005-cloud/dsh-pet），MIT License。\nSurfCore 只取动画素材与动画清单，聊天气泡/会话/人设为本插件自有实现。\n`,
+          `${licenseText.trim()}\n\n---\n素材来自 npm 包 ${PET_PKG}@${wantVersion}（github.com/PC2005-cloud/dsh-pet），MIT License。\nSurfCore 只取动画素材与动画清单，聊天气泡/会话/人设为本插件自有实现。\n`,
           'utf8',
         );
       }
       const marker = {
-        version: FETCH_VERSION,
+        version: wantVersion,
         webmCount,
         bytes,
         installedAt: new Date().toISOString(),
-        source: `${PET_PKG}@${FETCH_VERSION}`,
+        source: `${PET_PKG}@${wantVersion}`,
       };
       fs.writeFileSync(markerFile, `${JSON.stringify(marker, null, 2)}\n`, 'utf8');
       job = { ...job, phase: 'done', percent: 100, error: '' };
@@ -352,6 +366,24 @@ export function createPetAssetsService({ stateDir, pluginLog = () => {} }) {
       pluginLog('[orb] 装桌宠素材失败：', message);
       return { ok: false, error: message, status: status() };
     }
+  }
+
+  /**
+   * 按 npm 规格装内置素材：`dsh-pet` / `dsh-pet@0.4.1`。
+   * 只支持 dsh-pet 本身：自带 webm 的第三方皮肤包走 pet-packs 的 installFromDir，
+   * 不要把任意 npm 包解进内置目录。
+   */
+  async function installFromNpm(spec, { onProgress } = {}) {
+    const parsed = parseNpmSpec(spec);
+    if (!parsed.ok) return { ok: false, error: parsed.error, status: status() };
+    const result = await install({ onProgress, version: parsed.version });
+    if (result.ok) {
+      // 装完登记进 packs.json，设置页的「已安装」才亮。
+      try { packs.publish(BUILTIN_PACK_ID); } catch (error) {
+        pluginLog('[orb] 登记内置皮肤包失败：', String(error?.message ?? error));
+      }
+    }
+    return result;
   }
 
   function remove() {
@@ -384,6 +416,7 @@ export function createPetAssetsService({ stateDir, pluginLog = () => {} }) {
     status,
     manifest,
     install,
+    installFromNpm,
     remove,
     version: PET_VERSION,
   };
@@ -391,3 +424,20 @@ export function createPetAssetsService({ stateDir, pluginLog = () => {} }) {
 
 // 下载时用当前版本（抽成常量，install 里两处引用保持一致）
 const FETCH_VERSION = PET_VERSION;
+
+/** 版本号只能认 x.y.z（可带预发布后缀），latest/^1.2 之类一律回落到默认版本。 */
+export function normalizeVersion(version) {
+  const v = String(version || '').trim();
+  return /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(v) ? v : '';
+}
+
+/** 解析 `dsh-pet` / `dsh-pet@0.4.1`（也认 @scope/name@1.2.3 的写法）。 */
+export function parseNpmSpec(spec) {
+  const raw = String(spec || '').trim();
+  if (!raw) return { ok: false, error: '空规格：要像 dsh-pet@0.4.1 这样给' };
+  const at = raw.lastIndexOf('@');
+  const pkg = at > 0 ? raw.slice(0, at) : raw;
+  const version = at > 0 ? normalizeVersion(raw.slice(at + 1)) : '';
+  if (pkg !== PET_PKG) return { ok: false, error: `只支持 ${PET_PKG}，不支持 ${pkg}` };
+  return { ok: true, pkg, version: version || PET_VERSION };
+}

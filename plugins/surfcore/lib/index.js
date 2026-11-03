@@ -72,6 +72,7 @@ import { createPetPurposeService } from './pet-purpose.js';
 import { createPetApiService } from './pet-api.js';
 import { createOrbService, normalizeOrbConfig } from './orb.js';
 import { createOrbApiService, ORB_API_PREFIX } from './orb-api.js';
+import { createOrbActivity } from './orb-activity.js';
 import { createUpdatesService, resumePendingApply } from './updates.js';
 import {
   adminFromSources, adminSummary, projectAdminSave,
@@ -292,6 +293,22 @@ export function apply(ctx) {
     getSubprocess: () => ctx.get('subprocess'),
     archiveMessage: desktopArchive.record,
   });
+  // 互动监测：每 pollMs 采一次「主人在干什么」，落 state/orb/activity.json 给悬浮窗读。
+  // 采样脚本在插件根 scripts/activity.ps1；denyTitles 跟「看屏幕」共用一份，隐私一条线。
+  const orbActivity = createOrbActivity({
+    stateDir: STATE_DIR,
+    pluginLog,
+    getPluginRoot: () => path.resolve(HERE, '..'),
+    getDenyTitles: () => {
+      try { return orbService.readConfig().screen.denyTitles; } catch { return []; }
+    },
+  });
+  // 启动就按配置接上（关着就确保盘上没有旧 activity.json）。
+  try {
+    orbActivity.configure(orbService.readConfig().activity);
+  } catch (error) {
+    pluginLog('[orb] 启动互动监测失败：', String(error?.message ?? error));
+  }
   // 悬浮球对话：同一个人格卡 / 记忆卡 / 模型，历史单独放（profile='orb'）。
   const orbChat = createPetChatService({ ctx, stateDir: STATE_DIR, pluginLog, tokenBudget, profile: 'orb', archiveMessage: desktopArchive.record, readRecent: desktopArchive.recent });
   const orbApi = createOrbApiService({
@@ -316,6 +333,7 @@ export function apply(ctx) {
     // 但那个作用域里根本没有 adminQQ（只存在于 deriveIdentDefaults 内部），
     // 一调就 ReferenceError，表情分支被 catch 吞掉 → 每次都掉到生图。
     adminQQ: () => deriveIdentDefaults().meQQ,
+    activity: orbActivity,
   });
 
   // ── 组件更新（2026-10-26 用户要求）──────────────────────────────────────
@@ -2268,6 +2286,10 @@ if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output 
           llm: orbChat.status().llm,
           role: orbChat.status().role,
           pet: orbService.petInfo(),
+          // 互动监测的实时状态（开关、上次采样时间、采样文件）。
+          activity: (() => {
+            try { return orbActivity.status(); } catch { return { enabled: false }; }
+          })(),
           // 让设置页能显示「当前模型能不能看懂图」
           screen: (() => {
             try { return orbApi.stateForOrb().screen; } catch { return {}; }
@@ -2277,6 +2299,14 @@ if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output 
           })(),
           events: { hostFile: orbApi.hostFile },
         });
+        return;
+      }
+      if (suffix === '/activity' && method === 'GET') {
+        let config = null;
+        try { config = orbService.readConfig().activity; } catch {}
+        let status = null;
+        try { status = orbActivity.status(); } catch {}
+        json(res, 200, { ok: true, config, status, last: orbActivity.last() });
         return;
       }
       if (suffix === '/companion' && method === 'GET') {
@@ -2292,12 +2322,32 @@ if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output 
         // 这里只负责「切完之后把 host.json 刷一遍」——不刷的话桌面端永远用旧包。
         const result = await orbService.petAssets.packs.handleAction(body || {});
         const action = String(body?.action || '').trim();
-        if (action === 'activate' || action === 'import' || action === 'remove') {
+        if (action === 'activate' || action === 'import' || action === 'remove'
+          || action === 'install' || action === 'publish') {
           try { orbApi.writeHostFile(true); } catch (error) {
             pluginLog('[orb] 换包后刷新 host.json 失败：', String(error?.message ?? error));
           }
         }
         json(res, 200, result);
+        return;
+      }
+      if (suffix === '/activity') {
+        // 互动监测开关：写进 orb 配置（normalizeOrbConfig 兜底），同时让采样器立刻生效/停表。
+        const patch = body?.config && typeof body.config === 'object' ? body.config : (body || {});
+        const current = orbService.readConfig();
+        const nextActivity = {
+          ...current.activity,
+          ...patch,
+          kinds: { ...current.activity.kinds, ...(patch.kinds && typeof patch.kinds === 'object' ? patch.kinds : {}) },
+        };
+        delete nextActivity.action;
+        const saved = orbService.writeConfig({ ...current, activity: nextActivity });
+        let status = null;
+        try { status = orbActivity.configure(saved.activity); } catch (error) {
+          pluginLog('[orb] 应用互动监测配置失败：', String(error?.message ?? error));
+        }
+        try { orbApi.writeHostFile(true); } catch {}
+        json(res, 200, { ok: true, config: saved.activity, status: status || orbActivity.status() });
         return;
       }
       if (suffix === '/pet-assets') {
@@ -2375,9 +2425,16 @@ if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output 
       }
       if (suffix === '/config') {
         const next = orbService.writeConfig({ ...orbService.readConfig(), ...(body.config || {}) });
+        // 设置页保存时如果带了互动监测段，采样器要立刻跟上（不然得重启插件才生效）。
+        if (body?.config?.activity) {
+          try { orbActivity.configure(next.activity); } catch (error) {
+            pluginLog('[orb] 应用互动监测配置失败：', String(error?.message ?? error));
+          }
+        }
+        try { orbApi.writeHostFile(true); } catch {}
         // 开关关上就等于「收起球」：别让一个不可见的进程留在后台。
         if (next.enabled === false && orbService.running()) await orbService.stop();
-        json(res, 200, { ok: true, config: next, status: orbService.status() });
+        json(res, 200, { ok: true, config: next, status: orbService.status(), activity: orbActivity.status() });
         return;
       }
       if (suffix === '/install') { json(res, 200, await orbService.install({ force: body.force === true })); return; }
@@ -3231,6 +3288,7 @@ if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output 
     try { tokenBudget.dispose(); } catch {}
     try { memoryCardTimer?.stop?.(); } catch {}
     try { closeAllQrLogins(); } catch {}
+    try { orbActivity.stop(); } catch {}
     if (characterTimer) clearInterval(characterTimer);
     if (syncTimer) clearInterval(syncTimer);
     if (bridgeRepairTimer) clearInterval(bridgeRepairTimer);

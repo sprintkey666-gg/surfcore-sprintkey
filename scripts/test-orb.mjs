@@ -146,7 +146,7 @@ ok('空闲间隔 min 不大于 max', petCfg.pet.idleMaxMs >= petCfg.pet.idleMinM
 
 const petAssetsSrc = fs.readFileSync(path.join(ROOT, 'plugins/surfcore/lib/pet-assets.js'), 'utf8');
 ok('素材服务导出 createPetAssetsService', /export function createPetAssetsService/.test(petAssetsSrc));
-ok('素材版本钉死 dsh-pet 0.3.8', /PET_VERSION = '0\.3\.8'/.test(petAssetsSrc));
+ok('素材版本钉死（pet-assets.js 里一个 semver 字面量）', /export const PET_VERSION = '\d+\.\d+\.\d+'/.test(petAssetsSrc));
 ok('tar 解包偏移按 512 对齐（别把 size 加两遍）', /dataStart \+ Math\.ceil\(size \/ 512\) \* 512/.test(petAssetsSrc));
 ok('素材写进 orb/pet（不进 git）', /path\.join\(stateDir, 'orb', 'pet'\)/.test(petAssetsSrc));
 ok('素材带 MIT 许可说明', /LICENSE-pet\.txt/.test(petAssetsSrc));
@@ -155,7 +155,10 @@ ok('manifest 只留 JSON（不把 jsonc 直接给前端）', /manifest\.json/.te
 const petJs = fs.readFileSync(path.join(ORB_APP_SOURCE, 'pet.js'), 'utf8');
 const petCss = fs.readFileSync(path.join(ORB_APP_SOURCE, 'pet.css'), 'utf8');
 const orbJs = fs.readFileSync(path.join(ORB_APP_SOURCE, 'orb.js'), 'utf8');
-ok('双 video 双缓冲（换动作不闪黑）', /pvA/.test(html) && /pvB/.test(html) && /pvA|pvB/.test(petJs));
+ok('三层 video + 网页形象层（换动作不闪黑）', /id="pvA"/.test(html) && /id="pvIdleB"/.test(html) && /id="pvAction"/.test(html) && /idleVids|actionVid/.test(petJs));
+ok('网页形象用 iframe（sandbox 收权）', /id="petFigure"/.test(html) && /sandbox="allow-scripts"/.test(html) && /frame-src/.test(html));
+ok('切层等首帧再淡入（不许 play 完立刻换 class）', /requestVideoFrameCallback/.test(petJs) && /function whenFirstFrame\(/.test(petJs));
+ok('动作层播完先淡出再卸源', /function finishAction\(/.test(petJs) && /ACTION_FADE_MS/.test(petJs));
 ok('头顶气泡元素', /id="bubble"/.test(html) && /#bubble/.test(petCss));
 ok('透明区：窗口保持可点（穿透在 Windows 上会让命中判定永远回不来）', /setIgnoreMouseEvents\(false\)/.test(mainJs) && !/setIgnoreMouseEvents\(!hit/.test(mainJs));
 // 0.6.0：右键菜单改成窗口内 HTML（原生菜单放不下滑条，一弹还撑窗口），写窗口统一走模式不变量
@@ -172,6 +175,18 @@ ok('缩放起点要求展开态 + expanded 模式', /displayMode !== 'expanded'\
 ok('右键菜单有「打开会话」', /id="ctxOpen"[^>]*>打开会话</.test(html));
 ok('渲染端只走 window.orb（不自己发 HTTP）', !/fetch\(/.test(petJs));
 ok('素材 URL 转义中文/空格', /encodeURI/.test(petJs));
+// 0.14：皮肤包 / 活动监测 / 试一下气泡
+ok('右键有「皮肤 ›」子菜单', /id="ctxSkinToggle"/.test(html) && /id="ctxSkin"/.test(html) && /id="ctxSkinList"/.test(html));
+ok('皮肤子菜单能导入 + 打开目录', /id="ctxSkinImport"/.test(html) && /id="ctxSkinBrowse"/.test(html) && /id="ctxSkinDir"/.test(html));
+ok('皮肤包走 /pet-packs 的 list/activate/import', orbHas(orbJs, "'/pet-packs'", "action: 'list'", "action: 'activate'", "action: 'import'"));
+ok('右键有「监测 ›」子菜单（三个开关 + 间隔 + 现在看一眼）', /id="ctxMonitorToggle"/.test(html) && /id="ctxMonWindow"/.test(html) && /id="ctxMonFiles"/.test(html) && /id="ctxMonMedia"/.test(html) && /id="ctxMonGap"/.test(html) && /id="ctxMonPeek"/.test(html));
+ok('监测配置走 activityConfig（get/set）', orbHas(orbJs, 'activityConfig', "action: 'get'", "action: 'set'"));
+ok('右键有「试一下气泡」→ POST /say', /id="ctxBubbleTest"/.test(html) && orbHas(orbJs, "'/say'", 'kind: \'proactive\''));
+ok('气泡每道门都留了日志', orbHas(orbJs, '[bubble] skip reason=', 'not-pet-mode', 'panel-expanded', 'already-seen'));
+ok('网页形象握手（figure:ready / pet:action）', orbHas(petJs, "'figure:ready'", "'pet:action'"));
+ok('figure 包没有动画清单时按 null 对照（不会每 4 秒重载一次）',
+  /state\.manifest = pet\?\.manifest \? normalizeManifest\(pet\.manifest\) : null/.test(petJs)
+  && (petJs.match(/cfg\??\.pet\??\.manifest \? normalizeManifest\(/g) || []).length >= 2);
 
 
 // 2026-10-31 第二轮契约：自由停靠 / 面板可拖 / 菜单自适应 / 平滑过渡 / 气泡身份 / 对话看图
@@ -325,10 +340,15 @@ ok('设置页有「聊天外观」段与清头像缓存', orbHas(clientJs, '聊�
   ok('松手才真改窗口（拖动中只更新数字）', changeAt > inputAt && inputAt >= 0 && !/petSize/.test(orbSrc.slice(inputAt, changeAt)));
   ok('滑条改完同步角色尺寸', h(orbSrc, 'window.SurfPet?.setSize?.(size)') && h(petJs, 'function setSize(', 'setSize,'));
 
-  // ── 0.12.15：气泡改浮层 + 3 行折叠（窗口不再跟着气泡改高）────────────────
+  // ── 0.12.15：气泡改浮层 + 4 行折叠（窗口不再跟着气泡改高）────────────────
   const bubbleRule = (petCss.match(/#bubble \{[^}]*\}/) || [''])[0];
-  ok('气泡框不再裁剪小尾巴', !/overflow:\s*hidden/.test(bubbleRule) && h(petCss, '#bubbleText', '-webkit-line-clamp: 3', 'overflow: hidden'));
+  ok('气泡框不再裁剪小尾巴', !/overflow:\s*hidden/.test(bubbleRule) && h(petCss, '#bubbleText', '-webkit-line-clamp: 4', 'overflow: hidden'));
   ok('气泡文字走里层 span', h(htmlSrc, '<span id="bubbleText"></span>') && h(petJs, "document.getElementById('bubbleText')"));
+  // 三层视频各自带 z-index（1/3），气泡必须比它们高，否则会被待机层整个盖住。
+  const bubbleZ = Number((bubbleRule.match(/z-index:\s*(\d+)/) || [, '0'])[1]) || 0;
+  const stageRule = (petCss.match(/\.petStage \{[^}]*\}/) || [''])[0];
+  ok('气泡盖在视频层之上（不会被她自己挡住）',
+    bubbleZ > 3 && /isolation:\s*isolate/.test(stageRule) && bubbleZ > (Number((petCss.match(/\.pvAction \{[^}]*z-index:\s*(\d+)/) || [, '0'])[1]) || 0));
 
   // ── 0.11.0：气泡图文一体 / 聊天配图 / 发送即清空与排队 ─────────────────
   ok('图文一体默认开', def.chat.richBubble === true);

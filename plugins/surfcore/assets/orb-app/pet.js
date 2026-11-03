@@ -1,36 +1,47 @@
 // 桌宠形象（素材来自 dsh-pet@0.3.8，MIT，Copyright (c) 2026 PC2005-cloud）
 //
-// 这里只做三件事：
-//   1. 把 webm 动作播出来（双 <video> 交叉淡入，单个 video 换 src 会闪黑）；
+// 这里只做四件事：
+//   1. 把 webm 动作播出来。三层模型：idleA / idleB 常驻循环垫底（交叉淡入），
+//      动作单独一层盖在最上面——任何切层都等「新的一路首帧解出来」再改 opacity，
+//      所以换动作不闪黑、播完回待机也不闪回初始帧；
 //   2. 在头顶画一个「窗口内浮层」气泡——不再按内容反复改窗口高度；
-//   3. 让她知道主人在屏幕哪个方向（注视），并且偶尔真的走两步（走位）。
+//   3. 让她知道主人在屏幕哪个方向（注视），并且偶尔真的走两步（走位）；
+//   4. 网页形象（figure）包：video 全藏起来，换成一个 iframe，用 postMessage 收发动作。
 //
 // 逻辑全都走主进程（window.orb），页面自己不发 HTTP、不碰令牌。
-//
-// 三条经验直接来自参考项目（dsh-pet 是 MIT，可以照抄实现；Coopanion 是 AGPL，
-// 只在设计上参考了「注视方向 + 待机动作」的思路，没有复制它的代码）：
-//   1. 两个 <video> 双缓冲交叉淡入；
-//   2. 「只有宠物身体能点」——窗口比宠物大（头顶留气泡），其余部分必须把鼠标让回桌面；
-//   3. 动作之间要有呼吸感：idle 里插 turn（东张西望）和 move（走两步），别一直站着不动。
 (() => {
   'use strict';
 
   const stage = document.getElementById('pet');
   const stageInner = stage ? stage.querySelector('.petStage') : null;
-  const vids = [document.getElementById('pvA'), document.getElementById('pvB')];
+  // 垫底的两路待机（常驻循环，只在首帧就绪后交叉淡入）
+  const idleVids = [document.getElementById('pvA'), document.getElementById('pvIdleB')];
+  // 动作层：盖在待机层上面，播完淡出、露回一直在跑的待机
+  const actionVid = document.getElementById('pvAction');
+  // 网页形象：figure 包用 iframe 撑满宠物区
+  const figureFrame = document.getElementById('petFigure');
   const bubble = document.getElementById('bubble');
+  const vids = [...idleVids, actionVid].filter(Boolean);
 
   const state = {
     ready: false,
     paused: false,
-    cfg: null,          // { mode,size,dir,manifest,singleClickOpens,idleMinMs,idleMaxMs,gaze,wander,packId }
+    initing: null,
+    cfg: null,          // { mode,size,dir,manifest,singleClickOpens,idleMinMs,idleMaxMs,gaze,wander,packId,packKind,packEntry }
     manifest: null,     // 归一化后的动作清单
     files: new Map(),   // 动作名 -> file:// URL
-    active: 0,          // 当前在播的 video 下标
+    sizePx: 200,
+    idleActive: 0,      // 当前在台上的待机层下标
+    idleName: '',       // 当前待机动作名
+    idleToken: 0,       // 待机层代次：迟到的淡入作废
+    actionName: '',
+    actionToken: 0,
     chain: 0,           // 播放代次：旧视频迟到的 ended 事件用它过滤
-    playing: null,      // { name, kind }
+    playing: null,      // { name, kind } 动作层在播什么
     timer: null,        // 下一个随机动作
     bubbleTimer: null,
+    watchdog: null,
+    bubbleClick: null,
     busy: false,
     bandRequested: false,
     moveBias: 0,        // 撞到屏幕边以后反过来走
@@ -39,6 +50,14 @@
     gazeTimer: null,
     pollTimer: null,
     failCount: 0,
+    hoverPoint: null,
+    lastPreviewAt: 0,
+    packKind: 'webm',   // 'webm' | 'figure'
+    figureEntry: '',
+    figureReady: false,
+    figureActions: [],
+    figureResolve: null,
+    figureGazeAt: 0,
     logOnce: Object.create(null),
   };
 
@@ -57,6 +76,13 @@
   const GAZE_TURN_GAP_MS = 5200;
   const GAZE_MIN_MS = 20;
   const GAZE_MAX_MS = 50;
+  // 待机层交叉淡入 / 动作层淡出，跟 pet.css 里的 transition 对齐
+  const IDLE_FADE_MS = 200;
+  const ACTION_FADE_MS = 200;
+  // 等首帧的上限：本地 file:// 一般 30-80ms 就有帧，超过这个数就直接放行，别把动作卡死
+  const FIRST_FRAME_MS = 900;
+  // 网页形象多久没喊 ready 就当它坏了，退回 webm
+  const FIGURE_READY_MS = 6000;
 
   // ── 小工具 ─────────────────────────────────────────────────────────────────
 
@@ -101,6 +127,16 @@
     if (!s) return '';
     if (/^(data:|file:|https?:)/i.test(s)) return s;
     if (isLocalPath(s)) return toFileUrl(s);
+    return '';
+  }
+
+  /** 本地路径 → file:// URL；已经是 URL 的原样用。 */
+  function asPageUrl(value) {
+    const s = String(value || '').trim();
+    if (!s) return '';
+    if (/^file:/i.test(s)) return s;
+    if (isLocalPath(s)) return toFileUrl(s);
+    if (/^https?:/i.test(s)) return s;
     return '';
   }
 
@@ -208,11 +244,16 @@
     return Math.max(0, Math.round(H - headFromBottom() - 6));
   }
 
-  /** 第一次要显示气泡时，请主进程把窗口让出固定的那一条（只让一次）。 */
+  /**
+   * 第一次要显示气泡时，请主进程把窗口让出固定的那一条。
+   * 这里以前有个 `if (headroom() >= 64) return;` 的短路——窗口本来就够高时就不申请，
+   * 但主进程是按 bandFor() 算窗口高度的，一旦它那边记的带高是 0，气泡就会被窗口顶边裁掉。
+   * 现在改成：第一次必申请一次（幂等，主进程自己会夹）。只让一次，之后窗口高度不动。
+   */
   function ensureBand() {
     if (state.bandRequested) return;
     state.bandRequested = true;
-    if (headroom() >= 64) return;
+    log(`[bubble] band request band=${PET_BUBBLE_BAND} headroom=${headroom()} innerH=${window.innerHeight || 0}`);
     try { void Promise.resolve(window.orb?.bubbleSpace?.(PET_BUBBLE_BAND)).catch(() => {}); } catch {}
   }
 
@@ -228,7 +269,30 @@
     bubble.style.setProperty('--bubble-max', `${maxH}px`);
   }
 
-  // ── 播放 ───────────────────────────────────────────────────────────────────
+  /** 等这一层真的出了一帧再切 opacity（这就是「不闪」的关键）。 */
+  function whenFirstFrame(video, timeoutMs = FIRST_FRAME_MS) {
+    if (!video) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      let settled = false;
+      let rvfcId = null;
+      let timer = null;
+      const finish = (ok) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        try { if (rvfcId != null && typeof video.cancelVideoFrameCallback === 'function') video.cancelVideoFrameCallback(rvfcId); } catch {}
+        resolve(ok);
+      };
+      timer = setTimeout(() => finish(video.readyState >= 2), Math.max(120, timeoutMs));
+      if (typeof video.requestVideoFrameCallback === 'function') {
+        try { rvfcId = video.requestVideoFrameCallback(() => finish(true)); } catch { rvfcId = null; }
+      } else if (video.readyState >= 2) {
+        finish(true);
+      }
+    });
+  }
+
+  // ── 播放：三层模型 ─────────────────────────────────────────────────────────
 
   /** 角色身高 = 窗口高度 - 头顶气泡带；pet.css 按这个值把整帧放大（--pet-size）。 */
   function setSize(px) {
@@ -287,78 +351,169 @@
     }, wait);
   }
 
-  /** 播一个动作；播完由 onEnded 回 idle 并重新排随机动作。 */
-  function play(name, options = {}) {
+  /**
+   * 待机垫底：两路常驻循环交叉淡入。
+   * 顺序是「装载 → play() → 等首帧 → 再淡入新的 → 淡出旧的」，
+   * 中间任何一步都不动可见层，所以看起来一直是同一个她在呼吸。
+   */
+  async function playIdle(name, options = {}) {
+    if (state.packKind === 'figure') return false;
     const url = state.files.get(name);
-    if (!url) { scheduleIdle(); return false; }
-    const nextIdx = 1 - state.active;
-    const next = vids[nextIdx];
-    const cur = vids[state.active];
+    if (!url) { logOnce(`no-idle:${name}`, `待机素材缺失：${name}`); scheduleIdle(); return false; }
+    const cur = idleVids[state.idleActive];
+    // 同一条还在台上循环：不重播（重播才会闪回初始帧）
+    if (state.idleName === name && cur && cur.classList.contains('on')) {
+      if (state.paused) { try { void cur.play(); } catch {} }
+      return true;
+    }
+    const prevIdx = state.idleActive;
+    const nextIdx = 1 - prevIdx;
+    const next = idleVids[nextIdx];
+    const prev = idleVids[prevIdx];
     if (!next) return false;
-    if (state.timer) { clearTimeout(state.timer); state.timer = null; }
-    state.busy = true;
-    state.chain += 1;
-    state.playing = { name, kind: options.kind || 'idle' };
+    const token = ++state.idleToken;
     try {
-      next.loop = options.loop === true;
+      next.loop = true;
+      next.muted = true;
+      next.classList.toggle('flip', options.mirror === true);
       if (next.getAttribute('data-src') !== url) {
         next.src = url;
         next.setAttribute('data-src', url);
+        try { next.currentTime = 0; } catch {}
+      } else if (!next.classList.contains('on')) {
+        // 只有「不在台上的那一层」才允许重置时间轴，可见中的层一律不动
+        try { next.currentTime = 0; } catch {}
       }
-      next.currentTime = 0;
       const started = next.play();
       if (started && typeof started.catch === 'function') {
         started.catch((error) => {
           state.failCount += 1;
-          log(`播放失败 ${name}: ${error?.message || error}`);
+          log(`待机播放失败 ${name}: ${error?.message || error}`);
+        });
+      }
+    } catch (error) {
+      log(`待机播放异常 ${name}: ${error?.message || error}`);
+      scheduleIdle();
+      return false;
+    }
+    await whenFirstFrame(next);
+    if (token !== state.idleToken) return false;
+    next.classList.add('on');
+    state.idleActive = nextIdx;
+    state.idleName = name;
+    log(`[layer] idle ${name} (${next.id})`);
+    // 旧的跟新的同时淡出（两边都在 transition 里，才是真正的交叉淡入）；
+    // 别等新层完全不透明了再摘旧的，那样中间会「两只并排」闪一下。
+    // 等淡出走完再暂停，期间它还留着最后一帧兜底。
+    if (prev && prev !== next) {
+      prev.classList.remove('on');
+      setTimeout(() => {
+        if (prev.classList.contains('on')) return; // 这期间它又被换回来了，别暂停可见层
+        try { prev.pause(); } catch {}
+      }, IDLE_FADE_MS + 60);
+    }
+    hideFallbackAvatar();
+    return true;
+  }
+
+  /**
+   * 动作层：盖在最上面播一遍。同样等首帧再淡入；
+   * 播完先淡出（露出底下一直在跑的待机），淡完再把 src 卸掉。
+   */
+  async function playActionLayer(name, options = {}) {
+    if (state.packKind === 'figure') return figureAction(name);
+    const url = state.files.get(name);
+    if (!url) { logOnce(`no-file:${name}`, `动作素材缺失：${name}`); scheduleIdle(); return false; }
+    if (!actionVid) return false;
+    if (state.timer) { clearTimeout(state.timer); state.timer = null; }
+    const token = ++state.actionToken;
+    state.busy = true;
+    state.chain += 1;
+    state.actionName = name;
+    state.playing = { name, kind: options.kind || 'idle' };
+    const loop = options.loop === true;
+    try {
+      actionVid.loop = loop;
+      actionVid.muted = true;
+      actionVid.classList.toggle('flip', options.mirror === true);
+      if (actionVid.getAttribute('data-src') !== url) {
+        actionVid.src = url;
+        actionVid.setAttribute('data-src', url);
+        try { actionVid.currentTime = 0; } catch {}
+      }
+      const started = actionVid.play();
+      if (started && typeof started.catch === 'function') {
+        started.catch((error) => {
+          state.failCount += 1;
+          log(`动作播放失败 ${name}: ${error?.message || error}`);
           if (state.failCount > 4) logOnce('play-fail', '连续播放失败，可能是素材路径失效');
         });
       }
     } catch (error) {
-      log(`播放异常 ${name}: ${error?.message || error}`);
+      log(`动作播放异常 ${name}: ${error?.message || error}`);
       state.busy = false;
       scheduleIdle();
       return false;
     }
     // 兜底：webm 偶尔会有「播完了但不发 ended」的情况（切后台、解码卡一下），
     // 不补这一下她就永远停在一个动作上、也不再随机换动作了。
-    armWatchdog(next, name, options.loop === true);
-    // 镜像：素材默认朝左，需要时整体翻转（文字类动作不能翻，否则反字）
-    if (stageInner) stageInner.classList.toggle('mirror', options.mirror === true);
-    next.classList.add('on');
-    if (cur) cur.classList.remove('on');
-    state.active = nextIdx;
+    armWatchdog(actionVid, name, loop, token);
+    await whenFirstFrame(actionVid);
+    if (token !== state.actionToken) return true;
+    actionVid.classList.add('on');
+    log(`[layer] action ${name} kind=${state.playing?.kind || ''}`);
     hideFallbackAvatar();
     return true;
   }
 
-  function onEnded(event) {
-    const idx = vids.indexOf(event.currentTarget);
-    if (idx !== state.active) return; // 旧视频迟到的 ended，不算
+  /** 动作层收尾：淡出 → 露回待机 → 卸载 src。 */
+  function finishAction(reason) {
     if (state.watchdog) { clearTimeout(state.watchdog); state.watchdog = null; }
+    const wasBusy = state.busy;
     state.busy = false;
+    state.playing = null;
+    state.actionToken += 1; // 让还没落地的淡入作废
+    const vid = actionVid;
+    if (vid) {
+      vid.classList.remove('on'); // CSS transition 200ms 淡出，底下待机一直在
+      setTimeout(() => {
+        if (state.busy) return; // 这期间又开了新动作，别把新源卸了
+        if (vid.classList.contains('on')) return;
+        try { vid.pause(); } catch {}
+        vid.removeAttribute('data-src');
+        try { vid.removeAttribute('src'); vid.load(); } catch {}
+      }, ACTION_FADE_MS + 60);
+    }
+    if (reason !== 'silent') log(`[layer] action done (${reason})`);
+    if (!wasBusy) { /* 没在播也会进来：照样排下一次 */ }
     if (!state.ready) return;
-    const idle = pick(idleList());
-    if (idle) play(idle, { kind: 'idle' });
     scheduleIdle();
   }
 
-  function armWatchdog(video, name, loop) {
+  function armWatchdog(video, name, loop, token) {
     if (state.watchdog) { clearTimeout(state.watchdog); state.watchdog = null; }
-    if (loop) return; // 循环 idle 本来就不该结束
+    if (loop) return; // 循环待机本来就不该结束
     const arm = () => {
+      if (token !== state.actionToken) return;
       if (state.playing && state.playing.name !== name) return;
       const seconds = Number.isFinite(Number(video.duration)) && Number(video.duration) > 0 ? Number(video.duration) : 6;
       state.watchdog = setTimeout(() => {
         state.watchdog = null;
         if (!state.ready || state.paused) return;
+        if (token !== state.actionToken) return;
         if (!state.playing || state.playing.name !== name) return;
         log(`动作 ${name} 没有正常结束，按播完处理`);
-        onEnded({ currentTarget: video });
+        finishAction('watchdog');
       }, Math.max(1500, Math.round(seconds * 1000) + 1500));
     };
     if (video.readyState >= 1) arm();
     else video.addEventListener('loadedmetadata', arm, { once: true });
+  }
+
+  function onActionEnded(event) {
+    if (event.currentTarget !== actionVid) return;
+    if (state.paused) return;
+    finishAction('ended');
   }
 
   function nextIdle() {
@@ -369,7 +524,13 @@
 
   function playAction(action) {
     if (action.kind === 'move') return walk(action);
-    return play(action.name, { mirror: action.mirror === true, kind: action.kind });
+    // 待机类动作（idle）走垫底层循环；其它（turn / 分类动作）走动作层播一遍
+    if (action.kind === 'idle') {
+      void playIdle(action.name, { mirror: action.mirror === true });
+      scheduleIdle();
+      return true;
+    }
+    return playActionLayer(action.name, { mirror: action.mirror === true, kind: action.kind });
   }
 
   /**
@@ -386,7 +547,7 @@
     const dist = Math.round(minDist + Math.random() * (maxDist - minDist));
     const dir = state.moveBias || (Math.random() < 0.5 ? -1 : 1);
     const ms = Math.max(400, Math.round((leadSec + tailSec) * 1000));
-    const playing = play(action.name, { mirror: dir > 0 ? !ART_FACES_LEFT : ART_FACES_LEFT, kind: 'move' });
+    const playing = playActionLayer(action.name, { mirror: dir > 0 ? !ART_FACES_LEFT : ART_FACES_LEFT, kind: 'move' });
     if (!playing) return false;
     const move = window.orb?.petMove;
     if (typeof move !== 'function') {
@@ -402,6 +563,96 @@
     }
     return true;
   }
+
+  // ── 网页形象（figure）通道 ─────────────────────────────────────────────────
+
+  function figureUrl(entry) {
+    return asPageUrl(entry);
+  }
+
+  function postFigure(payload) {
+    if (state.packKind !== 'figure' || !figureFrame) return false;
+    const win = figureFrame.contentWindow;
+    if (!win) return false;
+    try { win.postMessage(payload, '*'); return true; } catch { return false; }
+  }
+
+  /** figure 包的动作名：优先用形象自己登记的那批，其次用清单里的。 */
+  function figureActionPool() {
+    if (state.figureActions.length) return state.figureActions;
+    return manifestActions(state.manifest);
+  }
+
+  function figureAction(name) {
+    const key = String(name || '').trim();
+    if (!key) return false;
+    if (!state.figureReady) {
+      logOnce('figure-not-ready', '网页形象还没 ready，动作先不发');
+      return false;
+    }
+    const ok = postFigure({ type: 'pet:action', name: key });
+    if (ok) log(`[figure] action ${key}`);
+    return ok;
+  }
+
+  /**
+   * 打开 iframe 并等它喊 figure:ready。
+   * 6 秒还没 ready 就当这个包坏了：返回 false，调用方退回 webm / 静态头像。
+   */
+  function startFigure(entry) {
+    if (!figureFrame) return Promise.resolve(false);
+    const url = figureUrl(entry);
+    if (!url) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      state.figureReady = false;
+      state.figureActions = [];
+      let settled = false;
+      const done = (ok) => {
+        if (settled) return;
+        settled = true;
+        if (state.figureResolve === done) state.figureResolve = null;
+        clearTimeout(timer);
+        resolve(ok);
+      };
+      state.figureResolve = done;
+      const timer = setTimeout(() => {
+        log(`网页形象 ${FIGURE_READY_MS}ms 内没有 ready，退回 webm`);
+        done(false);
+      }, FIGURE_READY_MS);
+      stage?.classList.remove('fallback');
+      stage?.classList.add('figure');
+      stage?.classList.remove('hidden');
+      figureFrame.classList.remove('hidden');
+      try { figureFrame.src = url; } catch (error) {
+        log(`网页形象打不开：${error?.message || error}`);
+        done(false);
+      }
+    });
+  }
+
+  function closeFigure() {
+    if (!figureFrame) return;
+    figureFrame.classList.add('hidden');
+    try { figureFrame.removeAttribute('src'); } catch {}
+    stage?.classList.remove('figure');
+    state.figureReady = false;
+    state.figureResolve = null;
+    state.figureActions = [];
+  }
+
+  window.addEventListener('message', (event) => {
+    if (!figureFrame || event.source !== figureFrame.contentWindow) return;
+    const data = event.data && typeof event.data === 'object' ? event.data : null;
+    if (!data || typeof data.type !== 'string') return;
+    if (data.type === 'figure:ready') {
+      state.figureReady = true;
+      state.figureActions = strList(data.actions);
+      log(`[figure] ready actions=${state.figureActions.length}`);
+      if (typeof state.figureResolve === 'function') state.figureResolve(true);
+    } else if (data.type === 'figure:error') {
+      log(`[figure] 形象报错：${String(data.error || data.message || '').slice(0, 120)}`);
+    }
+  });
 
   // ── 注视 ───────────────────────────────────────────────────────────────────
   //
@@ -445,12 +696,22 @@
 
   function applyGaze(g) {
     state.gaze = g;
-    if (!stageInner) return;
-    if (!g || g.dir === 'center') {
-      stageInner.style.setProperty('--gaze-shift', '0px');
-      return;
+    if (stageInner) {
+      stageInner.style.setProperty('--gaze-shift', g && g.dir !== 'center' ? `${g.shiftPx || 0}px` : '0px');
     }
-    stageInner.style.setProperty('--gaze-shift', `${g.shiftPx || 0}px`);
+    // 网页形象：方向和偏移一起发过去，让它自己决定怎么转
+    if (state.packKind === 'figure' && state.figureReady) {
+      const now = Date.now();
+      if (now - state.figureGazeAt >= 120) {
+        state.figureGazeAt = now;
+        postFigure({
+          type: 'pet:gaze',
+          dx: g ? Math.round(num(g.dx, 0)) : 0,
+          dy: g ? Math.round(num(g.dy, 0)) : 0,
+          dir: g ? g.dir : 'center',
+        });
+      }
+    }
   }
 
   /** 她所在的屏幕中心（窗口坐标 → 屏幕坐标）。 */
@@ -502,10 +763,17 @@
         // 她「注意到」光标换方向的瞬间，偶尔真的扭头（东张西望），但别太频繁。
         const now = Date.now();
         if (g.dir === 'center' || g.near) return;
-        if (state.busy || !turnList().length) return;
+        if (state.busy) return;
+        // 网页形象没有 webm 清单，动作名要问形象自己登记的那一包
+        const turnName = state.packKind === 'figure' ? figurePick('turn') : pick(turnList());
+        if (!turnName) return;
         if (now - state.lastTurnAt < GAZE_TURN_GAP_MS) return;
         state.lastTurnAt = now;
-        play(pick(turnList()), { mirror: g.mirror, kind: 'turn' });
+        if (state.packKind === 'figure') {
+          void figureAction(turnName);
+          return;
+        }
+        void playActionLayer(turnName, { mirror: g.mirror, kind: 'turn' });
       } finally {
         inflight = false;
       }
@@ -571,10 +839,16 @@
   }
 
   function bindVideoEvents() {
+    if (!actionVid || actionVid.__surfPetBound) return;
+    actionVid.__surfPetBound = true;
+    // 垫底两路是 loop=true，永远不会 ended；只有动作层需要这条
+    actionVid.addEventListener('ended', onActionEnded);
+  }
+
+  function bindVideoErrors() {
     for (const v of vids) {
-      if (!v || v.__surfPetBound) continue;
-      v.__surfPetBound = true;
-      v.addEventListener('ended', onEnded);
+      if (!v || v.__surfPetErr) continue;
+      v.__surfPetErr = true;
       v.addEventListener('error', () => log(`video 加载失败 ${v.getAttribute('data-src') || v.src}`));
     }
   }
@@ -590,18 +864,38 @@
   function applyConfig(cfg) {
     const pet = cfg?.pet || null;
     state.cfg = pet;
-    state.manifest = normalizeManifest(pet?.manifest);
+    // 没有 manifest 就存 null（figure 包就是这样）：存成「空归一化对象」会让
+    // startConfigWatch 的 null 对照永远不相等，4 秒重载一次 iframe。
+    state.manifest = pet?.manifest ? normalizeManifest(pet.manifest) : null;
     const baseH = num(cfg?.base?.height, 0);
     // 角色身高 = 窗口高度 - 头顶气泡带；窗口比宠物高出的那一条就是气泡带。
     const petSize = baseH > PET_BUBBLE_BAND ? baseH - PET_BUBBLE_BAND : num(pet?.size, 200);
     setSize(petSize);
   }
 
+  /** 从配置里读「这个包是不是网页形象」，拿不到就一律当 webm。 */
+  function readPackKind(pet) {
+    const kind = String(pet?.packKind || pet?.kind || '').trim().toLowerCase();
+    // 主进程字段名还没完全定死，这里把几种叫法都认了（packEntry 优先，其次 entryUrl/entry）。
+    const entry = String(pet?.packEntry || pet?.packEntryUrl || pet?.figureEntry || pet?.entryUrl || pet?.entry || '').trim();
+    if (kind !== 'figure' || !entry) return { kind: 'webm', entry: '' };
+    // 主进程可能给绝对路径，也可能只给包内相对入口（index.html）：相对的就按包目录拼。
+    let full = entry;
+    if (!isLocalPath(entry) && !/^https?:/i.test(entry)) {
+      const dir = String(pet?.dir || '').replace(/[\\/]+$/, '');
+      if (dir) full = `${dir}/${entry.replace(/^[\\/]+/, '')}`;
+    }
+    return { kind: 'figure', entry: full };
+  }
+
   async function init() {
     // orb.js 在页面加载完后也会调一次 init()，这里别把已经在播的宠物重开一遍。
     if (state.ready) {
       const again = await readPetConfig();
-      if (again?.pet && String(again.pet.dir || '') === String(state.cfg?.dir || '')) {
+      const sameDir = String(again?.pet?.dir || '') === String(state.cfg?.dir || '');
+      const nextPack = readPackKind(again?.pet);
+      const samePack = nextPack.kind === state.packKind && nextPack.entry === state.figureEntry;
+      if (again?.pet && sameDir && samePack) {
         applyConfig(again);
         startConfigWatch();
         return true;
@@ -627,6 +921,31 @@
     }
     applyConfig(cfg);
     state.bandRequested = false;
+
+    // ① 网页形象优先：team 约定 packKind==='figure' 且给了 packEntry 才走 iframe
+    const pack = readPackKind(pet);
+    state.packKind = pack.kind;
+    state.figureEntry = pack.entry;
+    if (pack.kind === 'figure') {
+      log(`网页形象：${pack.entry}`);
+      const ok = await startFigure(pack.entry);
+      if (ok) {
+        stage?.classList.remove('hidden');
+        hideFallbackAvatar();
+        bindVideoErrors();
+        state.ready = true;
+        scheduleIdle();
+        startGaze();
+        placeBubble();
+        log(`桌宠就绪（figure）：${state.figureActions.length} 个动作，尺寸 ${petSizePx()}，包 ${pet.packId || pet.dir || ''}`);
+        return true;
+      }
+      closeFigure();
+      state.packKind = 'webm';
+      state.figureEntry = '';
+    }
+
+    // ② webm 通道
     const count = registerFiles(pet.dir);
     const usable = count > 0 && state.manifest && manifestActions(state.manifest).some((n) => state.files.has(n));
     if (!usable) {
@@ -645,13 +964,11 @@
     stage?.classList.remove('hidden');
     hideFallbackAvatar();
     bindVideoEvents();
+    bindVideoErrors();
     state.ready = true;
-    // 先播一段循环 idle 垫底，随机动作播完都会回到它
+    // 先播一段循环 idle 垫底，动作层播完都会回到它（它一直在跑，所以不会闪）
     const first = pick(idleList()) || pick([...state.files.keys()]);
-    if (first) {
-      if (idleList().length) play(first, { loop: true, kind: 'idle' });
-      else play(first, { loop: true, kind: 'idle' });
-    }
+    if (first) void playIdle(first, { mirror: true });
     scheduleIdle();
     startGaze();
     placeBubble();
@@ -664,15 +981,22 @@
     const cfg = await readPetConfig();
     const prevDir = String(state.cfg?.dir || '');
     const nextDir = String(cfg?.pet?.dir || '');
-    const prevSig = JSON.stringify(state.manifest || null);
-    const nextSig = JSON.stringify(normalizeManifest(cfg?.pet?.manifest));
-    if (prevDir === nextDir && prevSig === nextSig) {
+    const prevSig = JSON.stringify(state.manifest ? normalizeManifest(state.manifest) : null);
+    const nextSig = JSON.stringify(cfg?.pet?.manifest ? normalizeManifest(cfg.pet.manifest) : null);
+    const nextPack = readPackKind(cfg?.pet);
+    const packChanged = nextPack.kind !== state.packKind || nextPack.entry !== state.figureEntry;
+    if (prevDir === nextDir && prevSig === nextSig && !packChanged) {
       applyConfig(cfg); // 大小 / 注视 / 走位这类开关仍然可以即时生效
       startGaze();
       return false;
     }
     stop();
-    for (const v of vids) { if (v) { v.removeAttribute('data-src'); try { v.removeAttribute('src'); } catch {} } }
+    closeFigure();
+    for (const v of vids) {
+      v.classList.remove('on');
+      v.removeAttribute('data-src');
+      try { v.removeAttribute('src'); v.load(); } catch {}
+    }
     state.ready = false;
     const ok = await init();
     return ok;
@@ -691,11 +1015,15 @@
         if (!cfg?.pet) return;
         const prevDir = String(state.cfg?.dir || '');
         const nextDir = String(cfg.pet.dir || '');
-        const prevSig = JSON.stringify(state.manifest || null);
-        const nextSig = JSON.stringify(normalizeManifest(cfg.pet.manifest));
-        if (prevDir !== nextDir || prevSig !== nextSig) {
+        const prevSig = JSON.stringify(state.manifest ? normalizeManifest(state.manifest) : null);
+        // figure 包没有 manifest：两边都按「没有」处理，否则每 4 秒都会判成「包变了」重载一次
+        const nextSig = JSON.stringify(cfg.pet.manifest ? normalizeManifest(cfg.pet.manifest) : null);
+        const nextPack = readPackKind(cfg.pet);
+        const packChanged = nextPack.kind !== state.packKind || nextPack.entry !== state.figureEntry;
+        if (prevDir !== nextDir || prevSig !== nextSig || packChanged) {
           log('检测到动画包变化，正在重载');
           stop();
+          closeFigure();
           state.ready = false;
           await init();
         } else {
@@ -719,24 +1047,41 @@
   // ── 交互 ───────────────────────────────────────────────────────────────────
 
   /** 点击反应（主人在宠物身上点一下）。 */
+  /** 网页形象里挑一个语义对的上的动作名（形象自己登记的动作集不一定和 webm 清单同名）。 */
+  function figurePick(...names) {
+    const pool = figureActionPool();
+    for (const want of names) {
+      const hit = pool.find((x) => String(x).toLowerCase() === want);
+      if (hit) return hit;
+    }
+    return '';
+  }
+
   function react() {
     if (!state.ready) return false;
+    if (state.packKind === 'figure') return figureAction(figurePick('clicks', 'click', 'pet', 'turn'));
     const name = pick(state.manifest?.clicks || []);
     if (!name) return false;
-    return play(name, { kind: 'click' });
+    return playActionLayer(name, { kind: 'click' });
   }
 
   /** 拖起来的时候播拖拽动作。 */
   function drag() {
     if (!state.ready) return false;
+    if (state.packKind === 'figure') return figureAction(figurePick('drag', 'turn'));
     const name = pick(state.manifest?.drag || []);
     if (!name) return false;
-    return play(name, { loop: true, kind: 'drag' });
+    return playActionLayer(name, { loop: true, kind: 'drag' });
   }
 
   /** 随机换个动作（右键菜单「换个动作」）。 */
   function shuffle() {
     if (!state.ready) return false;
+    if (state.packKind === 'figure') {
+      // 别拿 gaze / idle 当「换了个动作」交差，那看起来像没反应
+      const pool = figureActionPool().filter((x) => !/^(gaze|idle)$/i.test(String(x)));
+      return figureAction(pick(pool) || figurePick('turn', 'blink', 'clicks'));
+    }
     return nextIdle();
   }
 
@@ -744,39 +1089,43 @@
   function action(name, options = {}) {
     if (!state.ready) return false;
     const key = String(name || '').trim();
-    if (!key || !state.files.has(key)) return false;
+    if (!key) return false;
+    if (state.packKind === 'figure') return figureAction(key);
+    if (!state.files.has(key)) return false;
     // 走位动作要顺带搬窗口；「走两步」被关掉时手动点播也照样走一次。
     const mv = (state.manifest?.moves || []).find((item) => item && item.name === key);
     if (mv) return walk({ name: key, params: mv.params || {} });
-    return play(key, { mirror: options.mirror !== false, loop: false, kind: 'preview' });
+    return playActionLayer(key, { mirror: options.mirror !== false, loop: false, kind: 'preview' });
   }
 
   /** 预览某个动画包里的一段（包还没启用也能看）。 */
   function preview(name, options = {}) {
     const key = String(name || '').trim();
     if (!key) return false;
+    if (state.packKind === 'figure') return figureAction(key);
     const dir = String(options.dir || state.cfg?.dir || '').replace(/[\\/]+$/, '');
     if (!dir) return false;
     if (!state.files.has(key)) state.files.set(key, toFileUrl(`${dir}/webm/${key}.webm`));
     state.ready = true;
     stage?.classList.remove('hidden');
-    return play(key, { mirror: options.mirror !== false, loop: false, kind: 'preview' });
+    return playActionLayer(key, { mirror: options.mirror !== false, loop: false, kind: 'preview' });
   }
 
   // ── 气泡 ───────────────────────────────────────────────────────────────────
 
   /**
    * 头顶气泡：显示她刚说的话（面板收起时才需要）。可带一张小图（图文一体）。
-   * 注意：这里不再改窗口高度，气泡只是窗口里的一层浮层。
+   * 注意：这里不再改窗口高度，气泡只是窗口里的一层浮层；
+   * 只有第一次显示时会向主进程申请一次固定的气泡带（ensureBand）。
    */
   function showBubble(text, options = {}) {
-    if (!bubble) return false;
+    if (!bubble) { log('[bubble] skip reason=no-bubble-el'); return false; }
     const kind = options.kind || 'her';
     const body = String(text ?? '').trim();
     const picSrc = asImageUrl(options.image);
-    if (!body && !picSrc) return false;
+    if (!body && !picSrc) { log('[bubble] skip reason=empty'); return false; }
+    log(`[bubble] show kind=${kind} chars=${body.length} pic=${picSrc ? 'yes' : 'no'} innerH=${window.innerHeight || 0}`);
     ensureBand();
-    state.bandRequested = true;
 
     const textEl = document.getElementById('bubbleText');
     const pic = document.getElementById('bubblePic');
@@ -796,6 +1145,7 @@
           // 图被删了 / 路径失效：整块图收起来，气泡只剩文字（不留破图）。
           pic.classList.add('hidden', 'missing');
           pic.removeAttribute('src');
+          log('[bubble] pic load failed');
           placeBubble();
         };
         pic.onload = () => placeBubble();
@@ -816,6 +1166,18 @@
     // 气泡显示时窗口顶上那一截要能点（点气泡＝开面板），主进程按这个标记决定穿透
     try { void window.orb?.bubbleShown?.(true); } catch {}
     placeBubble();
+    // 申请气泡带会让窗口变高，尺寸变化后再摆一次，免得第一帧位置是旧窗口算的。
+    // 顺手把落点量出来写进日志：气泡「没出现」时，看这一行就知道是被裁到窗口外、
+    // 还是根本没进到 showBubble（那句会是 [bubble] skip reason=…）。
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => {
+        placeBubble();
+        try {
+          const r = bubble.getBoundingClientRect();
+          log(`[bubble] rect top=${Math.round(r.top)} left=${Math.round(r.left)} w=${Math.round(r.width)} h=${Math.round(r.height)} win=${window.innerWidth}x${window.innerHeight} cls=${bubble.className}`);
+        } catch {}
+      });
+    }
     bubble.onclick = () => {
       const handler = state.bubbleClick;
       hideBubble();
@@ -831,9 +1193,13 @@
   }
 
   function hideBubble() {
-    const wasShown = Boolean(bubble && !bubble.classList.contains('hidden'));
-    bubble?.classList.add('hidden');
-    if (wasShown) { try { void window.orb?.bubbleShown?.(false); } catch {} }
+    if (!bubble) return;
+    const wasShown = !bubble.classList.contains('hidden');
+    bubble.classList.add('hidden');
+    if (wasShown) {
+      log('[bubble] hide');
+      try { void window.orb?.bubbleShown?.(false); } catch {}
+    }
     if (state.bubbleTimer) { clearTimeout(state.bubbleTimer); state.bubbleTimer = null; }
     state.bubbleClick = null;
     const textEl = document.getElementById('bubbleText');
@@ -847,18 +1213,23 @@
   function stop() {
     if (state.timer) { clearTimeout(state.timer); state.timer = null; }
     if (state.watchdog) { clearTimeout(state.watchdog); state.watchdog = null; }
+    state.actionToken += 1;
+    state.idleToken += 1;
     stopGaze();
     for (const v of vids) { try { v.pause(); } catch {} }
     state.playing = null;
     state.busy = false;
+    state.actionName = '';
   }
 
   /** 展开面板时暂停播放（省 CPU，也避免和面板动画抢帧）；收起再恢复，不重载 src。 */
   function pause() {
     state.paused = true;
     if (state.watchdog) { clearTimeout(state.watchdog); state.watchdog = null; }
+    state.actionToken += 1;
     stopGaze();
     for (const v of vids) { try { v.pause(); } catch {} }
+    postFigure({ type: 'pet:pause' });
   }
 
   function resume() {
@@ -867,9 +1238,15 @@
     state.timer = null;
     for (const v of vids) {
       if (v && v.classList.contains('on')) {
-        try { v.play()?.catch(() => {}); } catch {}
+        try { void v.play(); } catch {}
       }
     }
+    // 动作层可能已经被淡出卸载了：重新起一段待机就够
+    if (state.packKind === 'webm' && state.ready && !state.idleName) {
+      const first = pick(idleList());
+      if (first) void playIdle(first, { mirror: true });
+    }
+    postFigure({ type: 'pet:resume' });
     scheduleIdle();
     startGaze();
     placeBubble();
@@ -903,9 +1280,13 @@
     setSize,
     // 气泡带高度（主进程按它算窗口预留的那一条）——固定值，不再随内容变
     bubbleBand: () => PET_BUBBLE_BAND,
+    // 这个包是 webm 还是网页形象（orb.js 用来决定菜单里显示什么）
+    packKind: () => state.packKind,
     get ready() { return state.ready; },
     get element() { return stage; },
     get gaze() { return state.gaze; },
+    get playing() { return state.playing ? state.playing.name : ''; },
+    get idle() { return state.idleName; },
   };
 
   // 窗口尺寸变了（右键改大小、展开/收起）气泡也得跟着回到头顶

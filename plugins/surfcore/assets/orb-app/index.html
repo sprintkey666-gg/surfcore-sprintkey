@@ -2,18 +2,22 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: file:; media-src 'self' file:; style-src 'self' 'unsafe-inline'; script-src 'self'" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: file: blob:; media-src 'self' file: blob:; frame-src 'self' file:; style-src 'self' 'unsafe-inline'; script-src 'self'" />
   <title>SurfCore 悬浮窗</title>
   <link rel="stylesheet" href="orb.css" />
   <link rel="stylesheet" href="pet.css" />
 </head>
 <body>
   <div id="root" class="collapsed">
-    <!-- 桌宠（dsh-pet 素材）：双 video 交叉淡入，避免动作切换时黑一下 -->
+    <!-- 桌宠（dsh-pet 素材）三层：idle A/B 常驻循环交叉淡入垫底，动作层盖在最上面。
+         任何一层都只在「首帧解码好」之后才切 opacity，所以换动作不会闪黑、也不会闪回初始帧。 -->
     <div id="pet" class="pet hidden">
       <div class="petStage">
-        <video class="pv" id="pvA" muted playsinline preload="auto"></video>
-        <video class="pv" id="pvB" muted playsinline preload="auto"></video>
+        <video class="pv pvBase" id="pvA" muted playsinline preload="auto"></video>
+        <video class="pv pvBase" id="pvIdleB" muted playsinline preload="auto"></video>
+        <video class="pv pvAction" id="pvAction" muted playsinline preload="auto"></video>
+        <!-- 网页形象（figure 包）：video 全部藏起来，改成 iframe 撑满宠物区 -->
+        <iframe id="petFigure" class="petFigure hidden" sandbox="allow-scripts" referrerpolicy="no-referrer" title="宠物形象"></iframe>
       </div>
       <div id="bubble" class="bubble hidden"><img id="bubblePic" class="bubblePic hidden" alt=""><span id="bubbleText"></span></div>
     </div>
@@ -22,6 +26,31 @@
     <div id="ctxmenu" class="ctxmenu hidden" role="menu">
       <button class="ctxitem" id="ctxOpen" data-act="open">打开会话</button>
       <button class="ctxitem" id="ctxAction" data-act="action">换个动作</button>
+      <button class="ctxitem" id="ctxBubbleTest" data-act="bubble">试一下气泡</button>
+      <button class="ctxitem" id="ctxSkinToggle" data-act="skin" aria-expanded="false">皮肤<span class="ctxchev">›</span></button>
+      <div id="ctxSkin" class="ctxsub hidden">
+        <div id="ctxSkinList" class="ctxskinlist"></div>
+        <div class="ctxrow">
+          <input id="ctxSkinPath" class="ctxinput" type="text" placeholder="皮肤文件夹路径" spellcheck="false" />
+          <button id="ctxSkinImport" class="ctxmini" type="button">导入</button>
+        </div>
+        <button class="ctxitem child" id="ctxSkinBrowse" type="button">导入 .tgz…</button>
+        <button class="ctxitem child" id="ctxSkinDir" type="button">打开皮肤文件夹</button>
+      </div>
+      <button class="ctxitem" id="ctxMonitorToggle" data-act="monitor" aria-expanded="false">监测<span class="ctxchev">›</span></button>
+      <div id="ctxMonitor" class="ctxsub hidden">
+        <label class="ctxcheck"><input id="ctxMonWindow" type="checkbox" /> 在用窗口</label>
+        <label class="ctxcheck"><input id="ctxMonFiles" type="checkbox" /> 在改文件</label>
+        <label class="ctxcheck"><input id="ctxMonMedia" type="checkbox" /> 在听音乐</label>
+        <div class="ctxrange"><span>多久说一次</span>
+          <select id="ctxMonGap" class="ctxselect">
+            <option value="5">5 分钟</option>
+            <option value="10">10 分钟</option>
+            <option value="30">30 分钟</option>
+          </select>
+        </div>
+        <button class="ctxitem sub" id="ctxMonPeek" type="button">现在看一眼</button>
+      </div>
       <button class="ctxitem" id="ctxSizeToggle" data-act="size">大小<span class="ctxchev">›</span></button>
       <div id="ctxSize" class="ctxsize hidden">
         <input id="ctxSizeRange" class="szrange" type="range" min="0" max="100" step="1" value="40" />
@@ -34,6 +63,9 @@
         <label class="ctxcheck"><input id="ctxCompContext" type="checkbox" /> 上下文字幕</label>
       </div>
     </div>
+
+    <!-- 操作回执（切皮肤 / 导入 / 监测开关）：只冒一下就散 -->
+    <div id="petToast" class="pet-toast hidden" role="status"></div>
 
     <!-- 小球（素材没装时的后备形象） -->
     <div id="ball" title="点一下展开；中键滚轮调大小；拖动换位置">

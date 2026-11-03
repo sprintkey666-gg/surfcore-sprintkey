@@ -19,8 +19,10 @@ export const INTEROP_DEFAULTS = Object.freeze({
   bili: true,
   identity: true,
   recent: true,
-  recentLines: 12,
-  recentHours: 24,
+  // 2026-11-03：主人对暗号那次，约定的那轮对话在 6 小时前、约 100 条消息之前，
+  // 12 行 / 24 小时的窗口根本够不着。默认放宽到 30 行 / 48 小时。
+  recentLines: 30,
+  recentHours: 48,
   personaMaxChars: 12000,
   memoryMaxChars: 8000,
 });

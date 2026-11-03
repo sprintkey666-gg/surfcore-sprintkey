@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "packs": [
+    {
+      "id": "dsh-pet",
+      "name": "dsh-pet（小鲸鱼）",
+      "kind": "webm",
+      "version": "0.4.1",
+      "license": "MIT",
+      "author": "PC2005-cloud",
+      "description": "内置动画素材包：一百多段 VP9-alpha webm，点击「下载」时从 npm 按需获取（约 52MB），不随仓库分发。",
+      "npm": "dsh-pet@0.4.1"
+    },
+    {
+      "id": "sprintkey-fish",
+      "name": "小鲸鱼（Q 版）",
+      "kind": "figure",
+      "version": "1.0.0",
+      "license": "MIT",
+      "author": "sprintkey",
+      "description": "自绘网页形象包：圆滚滚的 Q 版小鲸鱼，会呼吸、会眨眼、被点会弹一下，纯前端无依赖，随仓库直接入库。",
+      "bundled": "sprintkey-fish"
+    }
+  ]
+}
