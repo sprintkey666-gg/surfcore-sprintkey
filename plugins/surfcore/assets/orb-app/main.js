@@ -49,6 +49,15 @@ let prefs = { ballSize: COLLAPSED, x: null, y: null, panelWidth: EXPANDED.width,
 // 头顶给气泡留多高：随气泡内容放大（0 = 用默认值），收起时复位。
 // 窗口向上长，她脚底不动，所以长高不会把她挪位置。
 let bubbleBand = 0;
+// 气泡申请的额外宽度（0 = 只给宠物本身那么宽）。见 bubbleWidthFor()。
+let bubbleWidth = 0;
+
+/** 当前窗口所在屏幕的点：没窗口时退回 prefs 里记的位置。 */
+function prefsPoint() {
+  const b = win && !win.isDestroyed() ? win.getBounds() : null;
+  if (b) return { x: b.x + Math.round(b.width / 2), y: b.y + Math.round(b.height / 2) };
+  return { x: Number(prefs.x) || 0, y: Number(prefs.y) || 0 };
+}
 // 右键「隐藏到托盘」：窗口 hide，但进程继续跑；托盘/快捷键/二次启动都能叫回来。
 let tray = null;
 const WAKE_ACCELERATOR = 'CommandOrControl+Alt+Shift+H';
@@ -66,6 +75,42 @@ function bandFor() {
   return Math.max(PET_BUBBLE_SPACE, Math.round(Number(bubbleBand) || 0));
 }
 
+/** 桌宠窗口最小宽度：宠物本体 + 左右透明边。 */
+function petMinWidth() {
+  const pet = readPet();
+  const wanted = Number(prefs.petSize) || Number(pet && pet.size) || 200;
+  const size = Math.min(Math.max(Math.round(wanted), PET_MIN), PET_MAX);
+  return size + PET_SIDE_SPACE;
+}
+
+/**
+ * 气泡允许把窗口加宽到多少。
+ * 以前窗口宽永远等于「宠物宽 + 40」，气泡只能拿到 150px 左右，长句被折成每行两三个字
+ * （主人 2026-11-03 截图：「她看到：…」整块压在鲸鱼身上）。现在气泡可以申请更宽的窗口，
+ * 宠物本体居中、水平中心不动，所以视觉上她不会挪位置。
+ */
+const PET_BUBBLE_MAX_W = 560;
+
+function bubbleWidthFor(area) {
+  const want = Math.round(Number(bubbleWidth) || 0);
+  if (!want) return petMinWidth();
+  const cap = Math.min(PET_BUBBLE_MAX_W, Math.max(petMinWidth(), Math.round((area?.width || 1920) - 24)));
+  return Math.min(Math.max(want, petMinWidth()), cap);
+}
+
+/**
+ * 当前窗口所在屏幕的工作区。
+ * `screen` 只能在 app ready 之后用，而 baseSize() 在建窗阶段就会被调；拿不到就返回 null，
+ * 让 bubbleWidthFor() 用默认上限——不然启动瞬间会直接抛异常。
+ */
+function currentWorkArea() {
+  try {
+    return screen.getDisplayNearestPoint(prefsPoint()).workArea;
+  } catch {
+    return null;
+  }
+}
+
 /** 收起状态下的窗口尺寸：桌宠是「宠物 + 头顶气泡 + 一点余量」，球就是球。 */
 function baseSize() {
   const pet = readPet();
@@ -73,7 +118,9 @@ function baseSize() {
   if (pet && pet.mode === 'pet' && (pet.manifest || pet.packKind === 'figure')) {
     const wanted = Number(prefs.petSize) || Number(pet.size) || 200;
     const size = Math.min(Math.max(Math.round(wanted), PET_MIN), PET_MAX);
-    return { width: size + PET_SIDE_SPACE, height: size + bandFor(), pet: true };
+    // 气泡显示时窗口可以更宽：宠物 video 在窗口里居中，中心不动她就没动。
+    const width = Math.max(size + PET_SIDE_SPACE, bubbleWidthFor(currentWorkArea()));
+    return { width, height: size + bandFor(), pet: true };
   }
   const size = Math.min(Math.max(Math.round(prefs.ballSize || COLLAPSED), MIN_BALL), MAX_BALL);
   return { width: size, height: size, pet: false };
@@ -188,7 +235,10 @@ function clampForMode(x, y, width, height) {
   // 窗口上半截是「头顶气泡带」，宠物身体贴底。用整窗高去夹上边，等于气泡带先顶到屏幕边，
   // 她就卡在半空拖不上去了（主人 2026-11-01 说的「明明上面还有那么大空间」）。
   // 所以上边界只夹宠物实体，允许气泡带跑到屏幕外。
-  const bodyH = Math.min(height, Math.max(64, Math.round(width - PET_SIDE_SPACE)));
+  // 窗口宽度会被「气泡加宽」撑大，所以宠物高度只能从尺寸推，不能拿窗口宽反算。
+  const petNow = readPet();
+  const bodySize = Math.min(Math.max(Math.round(Number(prefs.petSize) || Number(petNow && petNow.size) || 200), PET_MIN), PET_MAX);
+  const bodyH = Math.min(height, bodySize);
   const minX = area.x - keepX;
   const maxX = area.x + area.width - width + keepX;
   // 上边不额外留 keepY：头顶正好贴屏幕顶就停，再往上她会缺一块（主人要的是「能到最上面」，不是「能被屏幕吃掉」）
@@ -527,6 +577,7 @@ async function setExpanded(on) {
   pendingExpand = null;
   // 开/收面板一律把头顶气泡带复位：面板态用不上它，收起时也不会留下一个「长高版」的窗口。
   bubbleBand = 0;
+  bubbleWidth = 0;
   if (!want) {
     // 收起 = 回到「主人把桌宠放在哪」那个位置（ballRect），**不跟着面板走**。
     // 之前这里把 ballRect 改到面板右下角，结果一开一收桌宠就自己挪窝了（主人明确要求位置只由他决定）。
@@ -605,6 +656,7 @@ async function hideWindow() {
   expanded = false;
   displayMode = 'collapsed';
   bubbleBand = 0;
+  bubbleWidth = 0;
   hiddenByUser = true;
   // 字幕窗也要一起藏：以前只 win.hide()，陪伴模式下字幕条还留在桌面上。
   if (companionWin && !companionWin.isDestroyed()) {
@@ -1142,13 +1194,19 @@ function setClickThrough(flag) {
   catch (error) { log('[orb] 鼠标穿透切换失败', String(error?.message ?? error)); }
 }
 
-/** 宠物实体在窗口坐标里的矩形：video 贴底、身体占底部 size 高、水平居中、约 0.86 宽。 */
+/**
+ * 宠物实体在窗口坐标里的矩形。
+ * 必须和渲染端 `petBodyHit()` 同一套算法，否则「能看见她的地方点不到」：
+ * 渲染端按 `bodyH = min(stageH - bubbleBand, size*1.22)`、`bodyW = min(stageW-24, bodyH*1.6)` 居中算，
+ * 这里照抄一份（窗口被气泡撑宽后左右透明边不算她）。
+ */
 function bodyRectInWindow(bounds) {
   const pet = readPet();
   const wanted = Number(prefs.petSize) || Number(pet && pet.size) || 200;
   const size = Math.min(Math.max(Math.round(wanted), PET_MIN), PET_MAX);
-  const w = Math.max(48, Math.round(size * 0.86));
-  const h = Math.min(bounds.height, Math.max(48, Math.round(size * 0.98)));
+  const stageH = Math.max(0, bounds.height - bandFor());
+  const h = Math.max(48, Math.min(stageH, Math.round(size * 1.22)));
+  const w = Math.max(48, Math.min(Math.max(48, bounds.width - 24), Math.round(h * 1.6)));
   return { x: Math.round((bounds.width - w) / 2), y: bounds.height - h, width: w, height: h };
 }
 
@@ -1275,28 +1333,46 @@ ipcMain.handle('orb:resize', (_event, payload = {}) => {
   return { ok: true, size: applied };
 });
 
-ipcMain.handle('orb:prefs', () => ({ ...prefs, expanded, ball: ballRect, bubbleBand: bandFor() }));
+ipcMain.handle('orb:prefs', () => ({ ...prefs, expanded, ball: ballRect, bubbleBand: bandFor(), bubbleWidth: baseSize().width }));
 
 /**
- * 头顶气泡带高度：气泡内容多高，窗口就往上长多高（脚底不动）。
- * 传 { px } —— 0 表示复位；传数字则夹在 [PET_BUBBLE_SPACE, 工作区高 - 宠物高 - 80]。
+ * 头顶气泡占的地方：传 { band, width }（老调用 bubbleSpace(110) 也认）。
+ * band 让窗口往上长（脚底不动），width 让窗口左右变宽（**宠物水平中心不动**，
+ * 所以视觉上她不会跟着窗口挪）。传 { band: 0, width: 0 } 复位成最小尺寸。
  */
 ipcMain.handle('orb:bubble-space', (_event, payload = {}) => {
-  if (!win || win.isDestroyed()) return { ok: false, band: bandFor() };
+  const empty = { ok: false, band: bandFor(), width: baseSize().width };
+  if (!win || win.isDestroyed()) return empty;
   const pet = readPet();
   // figure（网页形象）包没有 manifest，但它同样有头顶气泡 —— 别因为没 manifest 就拒绝申请。
   const figurePack = String(pet?.packKind || '') === 'figure';
-  if (!pet || pet.mode !== 'pet' || (!pet.manifest && !figurePack)) return { ok: false, band: bandFor() };
-  if (displayMode === 'expanded') return { ok: false, band: bandFor() };
-  const area = screen.getDisplayNearestPoint(win.getBounds()).workArea;
+  if (!pet || pet.mode !== 'pet' || (!pet.manifest && !figurePack)) return empty;
+  if (displayMode === 'expanded') return empty;
+  const cur = win.getBounds();
+  const area = screen.getDisplayNearestPoint(cur).workArea;
   const size = Math.min(Math.max(Math.round(Number(prefs.petSize) || Number(pet.size) || 200), PET_MIN), PET_MAX);
   const maxBand = Math.max(PET_BUBBLE_SPACE, Math.min(600, Math.round(area.height - size - 80)));
-  const want = Math.round(Number(payload.px) || 0);
-  const next = want <= 0 ? PET_BUBBLE_SPACE : Math.min(maxBand, Math.max(PET_BUBBLE_SPACE, want));
-  if (next === bandFor()) return { ok: true, band: next, unchanged: true };
-  bubbleBand = next === PET_BUBBLE_SPACE ? 0 : next;
-  applyBounds(null, 'bubble-space');
-  return { ok: true, band: bandFor() };
+  const want = payload && typeof payload === 'object' ? payload : { band: Number(payload) || 0 };
+  const wantBand = Math.round(Number(want.band ?? want.px) || 0);
+  const nextBand = wantBand <= 0 ? PET_BUBBLE_SPACE : Math.min(maxBand, Math.max(PET_BUBBLE_SPACE, wantBand));
+  const wantedWidth = Math.round(Number(want.width) || 0);
+  const nextWidth = wantedWidth <= 0
+    ? size + PET_SIDE_SPACE
+    : Math.min(Math.max(wantedWidth, size + PET_SIDE_SPACE), Math.min(PET_BUBBLE_MAX_W, Math.max(size + PET_SIDE_SPACE, area.width - 24)));
+
+  bubbleBand = nextBand === PET_BUBBLE_SPACE ? 0 : nextBand;
+  bubbleWidth = nextWidth <= size + PET_SIDE_SPACE ? 0 : nextWidth;
+  const next = baseSize();
+  if (next.width === cur.width && next.height === cur.height) {
+    return { ok: true, band: bandFor(), width: next.width, unchanged: true };
+  }
+  // 脚底（y+height）不动、水平中心（x+width/2）不动：窗口只会往上/往两边长。
+  const cx = cur.x + cur.width / 2;
+  const bottom = cur.y + cur.height;
+  const x = Math.round(cx - next.width / 2);
+  const y = Math.round(bottom - next.height);
+  const final = applyBounds({ x, y, width: next.width, height: next.height }, 'bubble-space');
+  return { ok: true, band: bandFor(), width: next.width, bounds: final };
 });
 
 // ---- 面板边缘拖拽缩放 ----------------------------------------------------

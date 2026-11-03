@@ -45,7 +45,10 @@
     watchdog: null,
     bubbleClick: null,
     busy: false,
-    bandRequested: false,
+    bubbleBody: null,    // .bubbleBody：正文的限高/滚动层（运行时包出来的）
+    bubbleBand: 0,       // 主进程当前给的气泡带高度（0 = 还没申请过）
+    bubbleWidth: 0,      // 主进程当前给的窗口宽度
+    bubbleFitToken: 0,   // 两趟测量的代次：迟到的测量结果作废
     moveBias: 0,        // 撞到屏幕边以后反过来走
     lastTurnAt: 0,
     gaze: null,
@@ -68,9 +71,26 @@
   const PET_HEAD_RATIO = 0.152;
   // pet.css 里 video 的显示高度 = --pet-size * 1.22，两处必须一致。
   const PET_VIDEO_RATIO = 1.22;
-  // main.js 里 PET_BUBBLE_SPACE：窗口比宠物高出的那一条固定高度。
+  // main.js 里 PET_BUBBLE_SPACE：窗口比宠物高出的那一条最小高度。
   const PET_BUBBLE_BAND = 110;
-  // 节点里最多塞这么多字，再长就 line-clamp 折叠，点气泡开面板看全文。
+  // 气泡底边离宠物头顶的距离（参考实现 bubble_rect_for_anchor 的 gap = 12）
+  const BUBBLE_GAP = 10;
+  // 气泡带上沿再留一点，别贴着窗口顶边
+  const BUBBLE_TOP_PAD = 8;
+  // 窗口左右给气泡留的透明边（气泡不会贴死窗口边缘）
+  const BUBBLE_EDGE_PAD = 12;
+  // 再窄就变成竖条了：用户实测被窗口 174px 卡成每行两三个字
+  const BUBBLE_MIN_W = 240;
+  // 参考实现的列宽：短句 248px，超过 60 字开始放宽，再长 100 字到 360px 封顶
+  const BUBBLE_COLUMN = 248;
+  const BUBBLE_COLUMN_MAX = 360;
+  const BUBBLE_COLUMN_GROWTH_CHARS = 60;
+  const BUBBLE_COLUMN_GROWTH_SPAN = 100;
+  // 主进程那边的带高上限（跟 main.js 的 600 对齐）
+  const BUBBLE_BAND_MAX = 600;
+  // 尾巴尖离气泡圆角边缘的最小距离
+  const BUBBLE_TAIL_PAD = 16;
+  // 节点里最多塞这么多字，再长就折叠，点气泡开面板看全文。
   const BUBBLE_MAX_CHARS = 240;
   const BUBBLE_DEFAULT_TTL = 9000;
   // 素材（dsh-pet 小鲸鱼）默认朝左；往右走要整体镜像。
@@ -242,11 +262,17 @@
 
   // ── 气泡摆放 ───────────────────────────────────────────────────────────────
   //
-  // 老做法：量出气泡全文高度 → 让主进程把窗口往上长 → 收起时再缩回去。
-  // 结果是窗口一高一缩、气泡还糊着一层 backdrop-filter，丑且抖。
+  // 用户实测的坏样子：窗口只有 174px 宽，气泡被卡成一条竖着的白条，每行两三个字，
+  // 而且压在鲸鱼身上。所以气泡的几何必须分两步走：
   //
-  // 新做法：气泡是窗口里的一层浮层，位置只由「宠物头顶在哪」决定；
-  // 窗口高度只在第一次需要气泡时让一次（固定 110px 的 band），之后再也不改。
+  //   ① 量（fitBubble）：按目标宽度先排一遍，量出正文高度 → 请主进程把窗口
+  //      往上长（band）和左右加宽（width）。主进程保证「脚底不动、水平中心不动」，
+  //      所以她不会因为气泡变大而挪位置。
+  //   ② 摆（placeBubble）：气泡底边 = 头顶 + BUBBLE_GAP，最高不超过头顶以上的
+  //      空间（band - 12），装不下就在气泡内部滚动，绝不允许往下压到她身上。
+  //
+  // 参考 dsh-pet-indesktop 的 bubble_rect_for_anchor：气泡与身体留 12px 空隙、
+  // 水平居中在身体上、优先放头顶上方；列宽 248px 起、长文案最多放宽到 360px。
 
   function petSizePx() {
     return Math.max(60, num(state.sizePx, 200));
@@ -260,32 +286,143 @@
   /** 从头到窗口顶的真实余量，气泡最多能长这么高。 */
   function headroom() {
     const H = window.innerHeight || 0;
-    return Math.max(0, Math.round(H - headFromBottom() - 6));
+    return Math.max(0, Math.round(H - headFromBottom() - BUBBLE_GAP));
+  }
+
+  /** 正文的目标列宽：短句 248，超过 60 字开始放宽，到 360 封顶（参考实现同口径）。 */
+  function bubbleTargetWidth(chars, hasPic) {
+    const n = Math.max(0, Number(chars) || 0);
+    const grow = clamp((n - BUBBLE_COLUMN_GROWTH_CHARS) / BUBBLE_COLUMN_GROWTH_SPAN, 0, 1);
+    const column = Math.round(BUBBLE_COLUMN + (BUBBLE_COLUMN_MAX - BUBBLE_COLUMN) * grow);
+    // 带图的卡至少也和短句一样宽，不然图被挤成一小块
+    const want = Math.max(BUBBLE_MIN_W, hasPic ? Math.max(column, BUBBLE_MIN_W) : column);
+    return Math.min(want, BUBBLE_COLUMN_MAX);
   }
 
   /**
-   * 第一次要显示气泡时，请主进程把窗口让出固定的那一条。
-   * 这里以前有个 `if (headroom() >= 64) return;` 的短路——窗口本来就够高时就不申请，
-   * 但主进程是按 bandFor() 算窗口高度的，一旦它那边记的带高是 0，气泡就会被窗口顶边裁掉。
-   * 现在改成：第一次必申请一次（幂等，主进程自己会夹）。只让一次，之后窗口高度不动。
+   * 正文的限高/滚动层。`#bubble` 必须留着 `overflow: visible` 才能画出框外那条
+   * 尾巴尖角（overflow-y:auto 会把 ::after 一起裁掉），所以这里在运行时把内容
+   * 包进一层 `.bubbleBody`，限高和滚动都落在它身上（index.html 不用改）。
    */
-  function ensureBand() {
-    if (state.bandRequested) return;
-    state.bandRequested = true;
-    log(`[bubble] band request band=${PET_BUBBLE_BAND} headroom=${headroom()} innerH=${window.innerHeight || 0}`);
-    try { void Promise.resolve(window.orb?.bubbleSpace?.(PET_BUBBLE_BAND)).catch(() => {}); } catch {}
+  function ensureBubbleBody() {
+    if (!bubble) return null;
+    if (state.bubbleBody && bubble.contains(state.bubbleBody)) return state.bubbleBody;
+    let body = document.getElementById('bubbleBody');
+    if (!body) {
+      body = document.createElement('div');
+      body.id = 'bubbleBody';
+      body.className = 'bubbleBody';
+      while (bubble.firstChild) body.appendChild(bubble.firstChild);
+      bubble.appendChild(body);
+    }
+    state.bubbleBody = body;
+    return body;
+  }
+
+  /** 请主进程给窗口让出气泡带与宽度（老参数 `bubbleSpace(110)` 也兼容）。 */
+  function requestBubbleSpace(opts) {
+    try {
+      const fn = window.orb?.bubbleSpace;
+      if (typeof fn !== 'function') return Promise.resolve(null);
+      return Promise.resolve(fn(opts)).catch(() => null);
+    } catch {
+      return Promise.resolve(null);
+    }
+  }
+
+  /** 等窗口真的按新尺寸重排两帧（applyBounds 之后的 innerWidth/innerHeight 才会变）。 */
+  function settleFrames() {
+    return new Promise((resolve) => {
+      if (typeof requestAnimationFrame !== 'function') { setTimeout(resolve, 0); return; }
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    });
+  }
+
+  /**
+   * 两趟测量：按目标宽度量高度 → 申请 band/width → 等窗口变完 → 若宽度被
+   * 工作区夹小了就按夹后的宽度再量一次（正文更高，带高跟着涨）→ 摆位。
+   * 代次 token 保证连点「试一下气泡」时只有最后一次算数。
+   */
+  async function fitBubble() {
+    if (!bubble || bubble.classList.contains('hidden')) return false;
+    const body = ensureBubbleBody();
+    if (!body) return false;
+    const token = (state.bubbleFitToken += 1);
+    const textEl = document.getElementById('bubbleText');
+    const pic = document.getElementById('bubblePic');
+    const chars = (textEl?.textContent || '').length;
+    const hasPic = !!(pic && !pic.classList.contains('hidden'));
+    const screenW = Math.max(320, Math.round(Number(window.screen?.availWidth) || 1920));
+    let colW = Math.min(bubbleTargetWidth(chars, hasPic), screenW - 2 * BUBBLE_EDGE_PAD);
+    for (let pass = 0; pass < 2; pass += 1) {
+      // 量之前必须放开限高，量到的才是全文高度
+      bubble.style.width = `${Math.round(colW)}px`;
+      bubble.style.setProperty('--bubble-max', 'none');
+      if (state.bubbleBody) state.bubbleBody.style.maxHeight = 'none';
+      const contentH = Math.max(24, Math.ceil(bubble.scrollHeight));
+      if (token !== state.bubbleFitToken) return false;
+      const needBand = Math.max(PET_BUBBLE_BAND, Math.min(BUBBLE_BAND_MAX, contentH + BUBBLE_GAP + BUBBLE_TOP_PAD));
+      const needWidth = Math.max(BUBBLE_MIN_W + 2 * BUBBLE_EDGE_PAD, Math.round(colW) + 2 * BUBBLE_EDGE_PAD);
+      const res = await requestBubbleSpace({ band: needBand, width: needWidth });
+      if (token !== state.bubbleFitToken) return false;
+      const gotBand = Math.round(Number(res?.band) || 0);
+      const gotWidth = Math.round(Number(res?.width) || 0);
+      state.bubbleBand = gotBand || needBand;
+      state.bubbleWidth = gotWidth || needWidth;
+      const clamped = gotWidth > 0 && gotWidth + 4 < needWidth;
+      log(`[bubble] fit pass=${pass + 1} chars=${chars} colW=${Math.round(colW)} contentH=${contentH} -> band=${state.bubbleBand} width=${state.bubbleWidth}${clamped ? '（width 被工作区夹小）' : ''}${res ? '' : '（bubbleSpace 不可用）'}`);
+      if (!res) log('[bubble] space api 没生效：preload/main 没有回 band/width');
+      await settleFrames();
+      if (token !== state.bubbleFitToken) return false;
+      // 窗口宽度可能没长到我们要的那么多：按真实可用宽度重排一次，第二趟把带高补够
+      const realW = Math.max(120, Math.round((window.innerWidth || 0) - 2 * BUBBLE_EDGE_PAD));
+      if (pass === 0 && realW < Math.round(colW) - 2) {
+        colW = Math.min(colW, realW);
+        continue;
+      }
+      break;
+    }
+    placeBubble();
+    return true;
   }
 
   function placeBubble() {
     if (!bubble) return;
     const H = window.innerHeight || 0;
-    const room = headroom();
-    // 头顶上方 6px 处是气泡底边；窗口太矮时把气泡整体往下压，保证顶边不出窗口。
-    const bottom = Math.max(6, Math.min(Math.round(headFromBottom() + 6), Math.max(6, H - 56 - 6)));
-    const maxH = Math.max(40, Math.min(room, H - bottom - 6));
+    const W = window.innerWidth || 0;
+    // 气泡底边固定在头顶上方 BUBBLE_GAP 处；她往下压不到——气泡只往上长，不往下压
+    const bottom = Math.max(6, Math.round(headFromBottom() + BUBBLE_GAP));
+    // 最高不超带高 - 12：超出来的部分在正文里滚动，不会盖到她脑袋上
+    const bandLimit = Math.max(48, (state.bubbleBand || PET_BUBBLE_BAND) - 12);
+    const room = Math.max(48, Math.min(bandLimit, H - bottom - 4));
     bubble.style.top = 'auto';
     bubble.style.bottom = `${bottom}px`;
-    bubble.style.setProperty('--bubble-max', `${maxH}px`);
+    bubble.style.setProperty('--bubble-max', `${Math.round(room)}px`);
+    // 正文那一层的限高要把内边距和描边扣掉，否则正文会溢出框外压到她身上
+    const body = state.bubbleBody;
+    if (body) {
+      let chrome = 37;
+      try {
+        const cs = getComputedStyle(bubble);
+        const px = (v) => parseFloat(v) || 0;
+        chrome = px(cs.paddingTop) + px(cs.paddingBottom) + px(cs.borderTopWidth) + px(cs.borderBottomWidth);
+      } catch {}
+      body.style.maxHeight = `${Math.max(40, Math.round(room - chrome))}px`;
+    }
+    // 尾巴尖指向宠物头顶中心：视频在窗口里水平居中，注视只会让她来回偏几像素
+    try {
+      const rect = bubble.getBoundingClientRect();
+      const bw = Math.round(rect.width);
+      let gaze = 0;
+      if (stageInner) {
+        const shift = parseFloat(getComputedStyle(stageInner).getPropertyValue('--gaze-shift'));
+        if (Number.isFinite(shift)) gaze = shift;
+      }
+      const petCx = (W || window.innerWidth || 0) / 2 + gaze;
+      const tailX = clamp(petCx - rect.left, BUBBLE_TAIL_PAD, Math.max(BUBBLE_TAIL_PAD, bw - BUBBLE_TAIL_PAD));
+      bubble.style.setProperty('--tail-x', `${Math.round(tailX)}px`);
+      bubble.style.setProperty('--bubble-tail-x', `${Math.round(tailX)}px`);
+    } catch {}
   }
 
   /** 等这一层真的出了一帧再切 opacity（这就是「不闪」的关键）。 */
@@ -1035,7 +1172,10 @@
       return false;
     }
     applyConfig(cfg);
-    state.bandRequested = false;
+    // 换包/换尺寸后重新量气泡（下一次 showBubble 会重新申请 band/width）
+    state.bubbleBand = 0;
+    state.bubbleWidth = 0;
+    if (bubble) { bubble.style.width = ''; bubble.style.setProperty('--bubble-max', 'none'); }
 
     // ① 网页形象优先：team 约定 packKind==='figure' 且给了 packEntry 才走 iframe
     const pack = readPackKind(pet);
@@ -1232,8 +1372,8 @@
 
   /**
    * 头顶气泡：显示她刚说的话（面板收起时才需要）。可带一张小图（图文一体）。
-   * 注意：这里不再改窗口高度，气泡只是窗口里的一层浮层；
-   * 只有第一次显示时会向主进程申请一次固定的气泡带（ensureBand）。
+   * 几何走 fitBubble() 的两趟测量：先量正文高度，请主进程把窗口往上长（band）
+   * 和左右加宽（width），再按新窗口重排，保证气泡永远在她头顶上方、不压住她。
    */
   function showBubble(text, options = {}) {
     if (!bubble) { log('[bubble] skip reason=no-bubble-el'); return false; }
@@ -1241,8 +1381,8 @@
     const body = String(text ?? '').trim();
     const picSrc = asImageUrl(options.image);
     if (!body && !picSrc) { log('[bubble] skip reason=empty'); return false; }
-    log(`[bubble] show kind=${kind} chars=${body.length} pic=${picSrc ? 'yes' : 'no'} innerH=${window.innerHeight || 0}`);
-    ensureBand();
+    log(`[bubble] show kind=${kind} chars=${body.length} pic=${picSrc ? 'yes' : 'no'} innerH=${window.innerHeight || 0} innerW=${window.innerWidth || 0}`);
+    ensureBubbleBody();
 
     const textEl = document.getElementById('bubbleText');
     const pic = document.getElementById('bubblePic');
@@ -1285,10 +1425,12 @@
     bubble.classList.remove('hidden');
     // 气泡显示时窗口顶上那一截要能点（点气泡＝开面板），主进程按这个标记决定穿透
     try { void window.orb?.bubbleShown?.(true); } catch {}
+    // 先按当前窗口摆一次（别等 IPC 回来才画），再走两趟测量把窗口让够
     placeBubble();
-    // 申请气泡带会让窗口变高，尺寸变化后再摆一次，免得第一帧位置是旧窗口算的。
-    // 顺手把落点量出来写进日志：气泡「没出现」时，看这一行就知道是被裁到窗口外、
-    // 还是根本没进到 showBubble（那句会是 [bubble] skip reason=…）。
+    void fitBubble().catch((error) => {
+      log(`[bubble] fit 失败：${String(error?.message || error)}`);
+    });
+    // 落点日志：气泡「没出现 / 被裁」时看这一行（还是根本没进 showBubble，那句是 skip reason）
     if (typeof requestAnimationFrame === 'function') {
       requestAnimationFrame(() => {
         placeBubble();
@@ -1404,8 +1546,13 @@
     stop,
     placeBubble,
     setSize,
-    // 气泡带高度（主进程按它算窗口预留的那一条）——固定值，不再随内容变
-    bubbleBand: () => PET_BUBBLE_BAND,
+    // 气泡带高度（主进程按它算窗口顶上预留的那一条）——现在是动态的：
+    // 气泡多高就申请多高的带；orb.js 用它算「哪一块算宠物本体」。
+    bubbleBand: () => Math.max(PET_BUBBLE_BAND, Math.round(state.bubbleBand || PET_BUBBLE_BAND)),
+    // 当前窗口宽度（气泡撑宽以后 orb.js 的命中区也跟着变）
+    bubbleWidth: () => Math.round(state.bubbleWidth || window.innerWidth || 0),
+    // 手动重排气泡（窗口尺寸变了 / 真机验证时调）
+    fitBubble,
     // 这个包是 webm 还是网页形象（orb.js 用来决定菜单里显示什么）
     packKind: () => state.packKind,
     get ready() { return state.ready; },

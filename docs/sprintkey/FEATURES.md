@@ -188,7 +188,7 @@
 
 ## 16. MCP 三行自愈（补丁被冲掉就补回来）
 
-- **做什么**：DSH 有时会把 `C:\Users\sprintkey\.dsh\profiles\desktop\cordis.patch.yml` 重写掉，丢掉 `mcp-snowluma` / `mcp-snowluma-host` / `mcp-web-search-safe` 三条，于是所有 `mcp__snowluma__*` 工具变成 `unknown tool`。桥接启动时检查并补回。
+- **做什么**：DSH 有时会把 `~/.dsh/profiles/desktop/cordis.patch.yml` 重写掉，丢掉 `mcp-snowluma` / `mcp-snowluma-host` / `mcp-web-search-safe` 三条，于是所有 `mcp__snowluma__*` 工具变成 `unknown tool`。桥接启动时检查并补回。
 - **主要代码**：`src/bridge.js` 的 `ensureMcpEntries()`（启动时执行）、`scripts/setup-dsh.mjs`（`MANAGED_MCP_IDS` / `mcpEntries()`，同一套条目定义）。
 - **注意**：补丁块靠 `# === qq-bridge MCP BEGIN/END ===` 标记识别；写入前留 `.bak-*` 备份；改完要重启 DSH 才会加载 MCP 进程。
 - **验证**：`mcp__snowluma-host__snowluma_status` 返回 `{"reachable":true,"online":true,...}`。
@@ -585,6 +585,30 @@
 **许可边界**：dsh-pet（MIT）、big-blue-fish 的 assets（MIT）可以用；**Coopanion（AGPL-3.0-or-later）与 dsh-pet-indesktop 的角色形象（CC BY-NC-SA 类）不入库、不打包**，只允许用户自己导入自用。
 
 **验证**：`node plugins/surfcore/scripts/test-pet-packs.mjs`（18 项）、`test-orb-activity.mjs`（21 项）、`test-orb-files.mjs`；真机 `POST /orb/activity/test` 后看 `[bubble] show kind=event`。
+
+## 33. 气泡浮在头顶上方、按内容变宽；只有左键按住才拖得动（0.12.19）
+
+**触发**：主人 m03607–m03609 附截图——气泡是一张 150px 的窄长白卡，每行两三个字，还直接压在鲸鱼身上；同时鼠标只要从她身边划过，窗口就跟着光标跑。
+
+**气泡为什么压在身上（三层）**：
+1. 窗口宽度被锁死在「宠物宽 + 40」（`baseSize()`），气泡只能拿到 ~150px，长句折成竖条，视觉上就像一坨压在头上；
+2. `ensureBand()` 只申请**高度**，不申请宽度；`orb:bubble-space` 也只认 `{px}`；
+3. 正文高度预算没扣内边距与描边（实测 39px），超长正文会溢出 `.bubbleBody` 的框，压到她身上。
+
+**修法**：
+- 主进程 `orb:bubble-space` 改成 `{ band, width }`：band 让窗口往上长（**脚底** `y+height` 不动），width 让窗口左右变宽（**水平中心** `x+width/2` 不动），所以窗口变大时她不会挪位；`PET_BUBBLE_MAX_W=560`，且不超过工作区 - 24。`preload.bubbleSpace(opts)` 同步支持对象与老的 `px` 数字。
+- `clampForMode()` 的 `bodyH` 不再用「窗口宽 - PET_SIDE_SPACE」反算（窗口会被气泡撑宽），改用 `prefs.petSize || pet.size`，否则加宽后她能拖到比屏幕还高。
+- 渲染端 `fitBubble()` 两趟：先按目标列宽测 `scrollHeight`，再 `bubbleSpace({band: contentH+18, width: colW+24})`，然后用返回尺寸 `placeBubble()` 重排；列宽照 dsh-pet-indesktop 的换行宽度：短句 248px，超过 60 字渐进放宽到 360px 封顶，最小 240px。
+- `placeBubble()` 底边 = `headFromBottom() + 10`，最高 `band - 12`；正文 `max-height = room - chrome`（chrome 用 `getComputedStyle` 量，兜底 37），超出在 `.bubbleBody` 内部滚动；`--tail-x` 按 `--gaze-shift` 算，尾巴尖始终指向头顶中心。
+- 命中矩形统一：`main.js` 的 `bodyRectInWindow()` 与渲染端 `petBodyHit()` 同一套算法（`bodyH = min(stageH - band, size*1.22)`、`bodyW = min(stageW-24, bodyH*1.6)` 居中），气泡撑宽后的左右透明边不再算她。
+
+**鼠标划过就搬窗口（真因）**：`orb.js` 里 `let drag` 被小球与 `petStage` 的 mousedown **共用**，而小球那条 `window mousemove` 直接 `window.orb.move(drag.wx + dx, …)`，**完全不看 `ev.buttons`**；再叠加 `orb:hit` 每帧强制关穿透 + 90ms 穿透轮询偶尔吞掉 `mouseup`，`drag` 就一直清不掉 → 之后任何 mousemove 都在搬窗口。
+
+**修法**：拆成 `ballDrag` / `petDrag` 两个独立状态；`mousemove` 先判 `if (!(ev.buttons & 1)) { endPetDrag(); endBallDrag(); return; }`；按下后 6px（`DRAG_MIN_PX`）内不算拖动，越过阈值才 `petdragging` + 播拖拽动画 + 跟手；`mouseup` / `blur` / `pointercancel` / `document mouseleave` / `visibilitychange(hidden)` / `Esc` 全部收尾；拖动中不弹右键菜单、不触发 click/react。
+
+**顺手**：右键里那条屏幕提示 `她看到：…` 缩成 1~2 句（`在用 …` / `在听 …` 各 ≤18 字），不再把整串拼进气泡。
+
+**验证**：`node --check` 三个渲染端文件 + `main.js`/`preload.js`；`node scripts/test-orb.mjs`（67 + 328 项，新增 14 条：列宽 240/248→360、`fitBubble` 两趟与 `bubbleFitToken`、底边 `headFromBottom() + BUBBLE_GAP`、`--tail-x`、`petBodyHit` 按身体矩形、`ballDrag`/`petDrag` 双状态 + 无旧 `let drag`、`ev.buttons & 1`、`DRAG_MIN_PX = 6`、四种收尾监听、toast 截断）；`scripts/test-orb-window-state.mjs` 28 项。真机看 `[bubble] fit pass=… -> band=… width=…` 两行，确认没有被工作区夹小。
 
 ## 新增功能时按这个格式补一条
 

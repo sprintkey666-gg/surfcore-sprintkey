@@ -384,9 +384,10 @@ ok('设置页有「聊天外观」段与清头像缓存', orbHas(clientJs, '聊�
   ok('松手才真改窗口（拖动中只更新数字）', changeAt > inputAt && inputAt >= 0 && !/petSize/.test(orbSrc.slice(inputAt, changeAt)));
   ok('滑条改完同步角色尺寸', h(orbSrc, 'window.SurfPet?.setSize?.(size)') && h(petJs, 'function setSize(', 'setSize,'));
 
-  // ── 0.12.15：气泡改浮层 + 4 行折叠（窗口不再跟着气泡改高）────────────────
+  // ── 0.12.15：气泡改浮层（窗口不再跟着气泡改高）；task-8 起正文不裁字，改成内部滚动 ──
   const bubbleRule = (petCss.match(/#bubble \{[^}]*\}/) || [''])[0];
-  ok('气泡框不再裁剪小尾巴', !/overflow:\s*hidden/.test(bubbleRule) && h(petCss, '#bubbleText', '-webkit-line-clamp: 4', 'overflow: hidden'));
+  ok('气泡框不再裁剪小尾巴', !/overflow:\s*hidden/.test(bubbleRule) && h(petCss, '.bubbleBody', 'overflow-y: auto', 'max-height: var(--bubble-max'));
+  ok('气泡正文不再按行数截字', !/-webkit-line-clamp/.test(petCss) && h(petCss, '#bubbleText', 'white-space: pre-wrap', 'overflow-wrap: anywhere'));
   ok('气泡文字走里层 span', h(htmlSrc, '<span id="bubbleText"></span>') && h(petJs, "document.getElementById('bubbleText')"));
   // 三层视频各自带 z-index（1/3），气泡必须比它们高，否则会被待机层整个盖住。
   const bubbleZ = Number((bubbleRule.match(/z-index:\s*(\d+)/) || [, '0'])[1]) || 0;
@@ -441,7 +442,7 @@ ok('设置页有「聊天外观」段与清头像缓存', orbHas(clientJs, '聊�
   ok('气泡收起时窗口不回落', !/bubbleSpace\?\.\(0\)/.test(petSrc) && h(petSrc, '不需要 bubbleSpace(0) 复位'));
   ok('主进程能吃气泡带高度', h(mainSrc, "ipcMain.handle('orb:bubble-space'", 'function bandFor()', 'bubbleBand'));
   ok('窗口按带高向上长', h(mainSrc, 'size + bandFor()'));
-  ok('preload 暴露 bubbleSpace', h(preload, 'bubbleSpace: (px)'));
+  ok('preload 暴露 bubbleSpace（支持 band/width 对象）', h(preload, 'bubbleSpace: (opts)', 'band: Number(opts.band)', 'width: Number(opts.width)'));
   ok('命中判定跟着动态带高', h(orbSrc, 'window.SurfPet?.bubbleBand?.()'));
   // C. 已读水位：后端照旧记录（面板里看过就上报），但气泡发布门不再用它
   ok('状态文件记住已读水位', h(orbLibSrc, 'readSeenId', 'markSeen(', 'seenId'));
@@ -457,6 +458,28 @@ ok('设置页有「聊天外观」段与清头像缓存', orbHas(clientJs, '聊�
   ok('面板展开时新消息延后冒而不是丢', h(orbSrc, 'function queueDeferredBubble(', 'panel-expanded-defer', '}, 600);'));
   ok('面板收起时补冒延后那条', h(orbSrc, 'function flushDeferredBubble(', "bubbleFor(state?.messages, 'collapse')"));
   ok('展开时收到消息也不丢（收起后补）', h(orbSrc, "if (expanded) { bubbleSkip('panel-expanded-defer'); queueDeferredBubble(list); return; }"));
+  // C3. task-8 真机反馈：气泡压在宠物身上 / 鼠标划过就搬窗口
+  ok('气泡有 240px 宽度下限，列宽 248→360', h(petJs, 'const BUBBLE_MIN_W = 240', 'const BUBBLE_COLUMN = 248', 'const BUBBLE_COLUMN_MAX = 360'));
+  ok('气泡两趟测量后请主进程让 band / width', h(petJs, 'async function fitBubble(', 'band: needBand', 'width: needWidth', 'state.bubbleFitToken'));
+  ok('气泡底边钉在头顶上方 10px', h(petJs, 'const BUBBLE_GAP = 10', 'headFromBottom() + BUBBLE_GAP'));
+  ok('气泡带按内容动态申请（不再写死 110）', h(petJs, 'state.bubbleBand = gotBand || needBand', '[bubble] fit pass=', 'function requestBubbleSpace('));
+  ok('气泡尾巴尖指向头顶中心', h(petJs, "setProperty('--tail-x'") && h(petCss, 'var(--tail-x, var(--bubble-tail-x, 50%))'));
+  ok('命中区按真实身体算（气泡撑宽的透明边不算她）', h(orbSrc, 'Number(window.SurfPet?.size) || 200', 'const bodyW =', 'window.SurfPet?.bubbleBand?.()'));
+  ok('小球与桌宠各自独立的拖动状态', h(orbSrc, 'let ballDrag = null', 'let petDrag = null') && !/\blet drag = null\b/.test(orbSrc));
+  ok('拖动只在左键按住时生效', h(orbSrc, 'if (!(ev.buttons & 1)) { endPetDrag(); return; }', 'if (!(ev.buttons & 1)) { endBallDrag(); return; }'));
+  ok('移动超过 6px 才算拖（划过只算 hover）', h(orbSrc, 'const DRAG_MIN_PX = 6', 'petDrag.moved = true'));
+  ok('按下鼠标不立刻播拖动动画', (() => {
+    const start = orbSrc.indexOf("petStage.addEventListener('mousedown'");
+    const blk = start >= 0 ? orbSrc.slice(start, start + 800) : '';
+    return start >= 0 && /petDrag = \{/.test(blk) && !/SurfPet\?\.drag\(\)/.test(blk);
+  })());
+  ok('松手 / 失焦 / 指针取消都收尾', h(orbSrc,
+    "window.addEventListener('mouseup', () => { endPetDrag(); endBallDrag(); })",
+    "window.addEventListener('blur', () => { endPetDrag(); endBallDrag(); })",
+    "window.addEventListener('pointercancel', () => { endPetDrag(); endBallDrag(); })"));
+  ok('Esc 也把拖动状态收掉', h(orbSrc, "if (ev.key !== 'Escape') return;", 'endPetDrag();', 'endBallDrag();'));
+  ok('拖动中不弹右键菜单', h(orbSrc, 'if (petDrag) { ev.preventDefault(); return; }'));
+  ok('「现在看一眼」只报一两句短的', h(orbSrc, 'const clip = (value, max = 18)', '在用 ${clip(app)}', '在听 ${clip(track)}'));
   // D. 双击图片看大图
   ok('双击图片打开查看器', h(orbSrc, "addEventListener('dblclick'", 'openViewer('));
   ok('查看器滚轮缩放', h(orbSrc, "addEventListener('wheel'", 'Math.exp(-Number(ev.deltaY || 0) * 0.0015)'));

@@ -887,29 +887,39 @@
   window.addEventListener('mouseup', () => { middleHeld = false; });
 
   // 拖动：按住球拖，松手贴边。
-  let drag = null;
+  // 注意：小球和桌宠是**两个独立状态**（ballDrag / petDrag）。以前共用一个 drag，
+  // 桌宠的 mousedown 会把小球的拖动状态覆盖掉；再叠加 orb:hit 每帧改穿透，
+  // mouseup 经常送不到渲染进程，drag 就永远清不掉 → 之后鼠标一动窗口就跑（task-8）。
+  let ballDrag = null;
   let lastDragMoved = false;
-  ball.addEventListener('mousedown', (ev) => {
-    if (ev.button !== 0) return;
-    drag = { sx: ev.screenX, sy: ev.screenY, moved: false, wx: window.screenX, wy: window.screenY };
-    ball.classList.add('dragging');
-  });
-  window.addEventListener('mousemove', (ev) => {
-    if (!drag) return;
-    const dx = ev.screenX - drag.sx;
-    const dy = ev.screenY - drag.sy;
-    if (!drag.moved && Math.hypot(dx, dy) < 4) return;
-    drag.moved = true;
-    window.orb?.move(drag.wx + dx, drag.wy + dy);
-  });
-  window.addEventListener('mouseup', () => {
-    if (!drag) return;
-    const moved = drag.moved;
-    drag = null;
+  // 拖动超过这个距离才算「拖」，以下算点击
+  const DRAG_MIN_PX = 6;
+
+  function endBallDrag() {
+    if (!ballDrag) return;
+    const moved = ballDrag.moved;
+    ballDrag = null;
     lastDragMoved = moved;
     ball.classList.remove('dragging');
     if (moved) window.orb?.dock();
+  }
+
+  ball.addEventListener('mousedown', (ev) => {
+    if (ev.button !== 0) return;
+    ballDrag = { sx: ev.screenX, sy: ev.screenY, moved: false, wx: window.screenX, wy: window.screenY };
+    ball.classList.add('dragging');
   });
+  window.addEventListener('mousemove', (ev) => {
+    if (!ballDrag) return;
+    // 左键已经松开（或根本没按）：立刻收尾，绝不继续搬窗口
+    if (!(ev.buttons & 1)) { endBallDrag(); return; }
+    const dx = ev.screenX - ballDrag.sx;
+    const dy = ev.screenY - ballDrag.sy;
+    if (!ballDrag.moved && Math.hypot(dx, dy) < DRAG_MIN_PX) return;
+    ballDrag.moved = true;
+    window.orb?.move(ballDrag.wx + dx, ballDrag.wy + dy);
+  });
+  window.addEventListener('mouseup', () => endBallDrag());
 
   // 右键：退出（面板里的两个按钮已经够用，不做菜单了）
   ball.addEventListener('contextmenu', (ev) => { ev.preventDefault(); window.orb?.quit(); });
@@ -1097,9 +1107,16 @@
     // 动态带高：气泡长高多少，顶上就让出多少；兜底 110（PET_BUBBLE_SPACE）
     const bandRaw = Number(window.SurfPet?.bubbleBand?.()) || Math.min(110, Math.round(stage.height * 0.42));
     const bubbleBand = Math.min(Math.round(stage.height * 0.8), Math.max(0, Math.round(bandRaw)));
-    const sidePad = Math.min(12, Math.round(stage.width * 0.08));
-    const inside = ev.clientX >= stage.left + sidePad && ev.clientX <= stage.right - sidePad
-      && ev.clientY >= stage.top + bubbleBand - 6 && ev.clientY <= stage.bottom;
+    // 她的身体 = 窗口底部、高 pet-size*1.22（跟 pet.css 的 video 高度一致）、水平居中。
+    // 气泡会把窗口撑宽（最多 560），左右两侧全是透明的——不能整块都算「在她身上」，
+    // 否则鼠标在空白处晃一下就被判成命中，窗口跟着跑（task-8 的 B2）。
+    const sizePx = Math.max(60, Number(window.SurfPet?.size) || 200);
+    const bodyH = Math.max(80, Math.min(Math.round(stage.height - bubbleBand), Math.round(sizePx * 1.22)));
+    const bodyW = Math.max(80, Math.min(Math.round(stage.width - 24), Math.round(bodyH * 1.6)));
+    const cx = stage.left + stage.width / 2;
+    const bodyTop = stage.bottom - bodyH;
+    const inside = ev.clientX >= cx - bodyW / 2 && ev.clientX <= cx + bodyW / 2
+      && ev.clientY >= bodyTop + 4 && ev.clientY <= stage.bottom;
     if (inside) return true;
     // 气泡露出来时，点气泡也能开会话
     if (bubbleEl && !bubbleEl.classList.contains('hidden')) {
@@ -1108,9 +1125,44 @@
     }
     return false;
   };
+  // ── 桌宠拖动状态（跟小球的 ballDrag 完全独立）────────────────────────────────
+  // 规则：只有「在她身上左键按住、并且真的移动了 >6px」才搬窗口。
+  // 松开鼠标 / 窗口失焦 / 指针离开 / pointercancel / Esc 一律立刻收尾；
+  // 拖动过程中绝不再调 orb.hit()（那会改穿透，mouseup 送不到渲染进程，
+  // 状态就永远清不掉——这正是用户看到的「鼠标划过她就跟着跑」）。
+  let petDrag = null;
+  function endPetDrag() {
+    if (!petDrag) return;
+    lastDragMoved = petDrag.moved;
+    petDrag = null;
+    root.classList.remove('petdragging');
+  }
+
   window.addEventListener('mousemove', (ev) => {
+    if (petDrag) {
+      // 左键已经松了却还收到 mousemove（mouseup 被穿透/焦点切换吞掉）：立刻放弃
+      if (!(ev.buttons & 1)) { endPetDrag(); return; }
+      const dx = ev.screenX - petDrag.sx;
+      const dy = ev.screenY - petDrag.sy;
+      if (!petDrag.moved && Math.hypot(dx, dy) < DRAG_MIN_PX) return;
+      if (!petDrag.moved) {
+        petDrag.moved = true;
+        root.classList.add('petdragging');
+        // 真的开始拖了才播拖动动画（单纯点一下不播）
+        window.SurfPet?.drag();
+      }
+      window.orb?.move(petDrag.wx + dx, petDrag.wy + dy);
+      return;
+    }
     if (!petMode || expanded) return;
     window.orb?.hit?.(petBodyHit(ev));
+  });
+  window.addEventListener('mouseup', () => { endPetDrag(); endBallDrag(); });
+  window.addEventListener('blur', () => { endPetDrag(); endBallDrag(); });
+  window.addEventListener('pointercancel', () => { endPetDrag(); endBallDrag(); });
+  document.addEventListener('mouseleave', () => { endPetDrag(); endBallDrag(); });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { endPetDrag(); endBallDrag(); }
   });
 
   async function initPet() {
@@ -1127,8 +1179,10 @@
       if (ev.button !== 0 || expanded) return;
       // 窗口比宠物大（左右透明边 + 头顶气泡带），只有真的按在她身上才算拖她。
       if (!petBodyHit(ev)) return;
-      drag = { sx: ev.screenX, sy: ev.screenY, moved: false, wx: window.screenX, wy: window.screenY };
-      window.SurfPet?.drag();
+      if (petDrag) return;
+      petDrag = { sx: ev.screenX, sy: ev.screenY, moved: false, wx: window.screenX, wy: window.screenY };
+      // 按下就把命中钉住：拖动期间穿透轮询若把窗口切成穿透，mouseup 就收不到了
+      try { window.orb?.hit?.(true); } catch {}
     });
     petStage.addEventListener('click', () => {
       if (lastDragMoved) { lastDragMoved = false; return; }
@@ -1142,6 +1196,8 @@
     });
     // 右键 = 菜单（打开会话 / 换个动作 / 大小 / 隐藏），菜单画在窗口内部，不改窗口尺寸
     petStage.addEventListener('contextmenu', (ev) => {
+      // 正在拖她的时候弹菜单会打断拖动（右键也常常顺手按），直接吞掉
+      if (petDrag) { ev.preventDefault(); return; }
       if (!petBodyHit(ev)) return;
       ev.preventDefault();
       openCtxMenu(ev);
@@ -1619,14 +1675,25 @@
       toast(api ? '她这会儿没抓到窗口' : '监测还没接上，等主进程补上 activityConfig');
       return;
     }
+    // 只报一两句短的：窗口名 / 歌名各截到 18 字，别把整条浏览器标题怼到 toast 里
+    const clip = (value, max = 18) => {
+      const text = String(value || '').replace(/\s+/g, ' ').trim();
+      return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+    };
     const bits = [];
-    if (sample.active) bits.push(String(sample.active.app || sample.active.title || sample.active.project || '在忙'));
-    else bits.push('没看到窗口');
-    if (sample.media && (sample.media.title || sample.media.app)) {
-      const t = [sample.media.title, sample.media.artist].filter(Boolean).join(' - ');
-      bits.push(`在听 ${t || sample.media.app}`);
+    if (sample.active) {
+      const app = sample.active.app || sample.active.project || sample.active.title || '在忙';
+      bits.push(`在用 ${clip(app)}`);
+    } else {
+      bits.push('没看到窗口');
     }
-    toast(`她看到：${bits.filter(Boolean).join(' · ').slice(0, 80)}`);
+    if (sample.media && (sample.media.title || sample.media.app)) {
+      const track = sample.media.title
+        ? `${sample.media.title}${sample.media.artist ? ` - ${sample.media.artist}` : ''}`
+        : sample.media.app;
+      bits.push(`在听 ${clip(track)}`);
+    }
+    toast(`她看到：${bits.join(' · ')}`);
   }
 
   async function toggleMonitorMenu() {
@@ -1854,7 +1921,13 @@
   }, true);
   // 点到桌面/别的窗口时 orb 会失焦，也把菜单收掉；只收菜单，不改变面板展开状态。
   window.addEventListener('blur', () => { if (ctxOpenState) closeCtxMenu(); });
-  window.addEventListener('keydown', (ev) => { if (ev.key === 'Escape' && ctxOpenState) closeCtxMenu(); });
+  // Esc：先把「正在拖」的状态收掉（拖到一半按键，窗口不能再跟着鼠标走），再收菜单
+  window.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Escape') return;
+    endPetDrag();
+    endBallDrag();
+    if (ctxOpenState) closeCtxMenu();
+  });
 
   // ==== 面板：左侧七个域 + 右侧页面 =====================================
   const pageNav = document.getElementById('panelNav');

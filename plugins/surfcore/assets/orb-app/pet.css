@@ -140,6 +140,9 @@
   top: auto;
   bottom: 200px;
   max-width: min(420px, calc(100% - 24px));
+  /* 兜底：正文层 .bubbleBody 才是真正滚动的地方，这里跟着同一个变量夹一次，
+     保证气泡框永远不会长到把宠物顶下去。 */
+  max-height: var(--bubble-max);
   min-width: 48px;
   /* 这里不要裁剪溢出——尖角是 ::after 画在框外的，会被一起切掉。
      限高挪到里层的 #bubbleText 上。 */
@@ -170,22 +173,32 @@
   to { opacity: 1; transform: none; }
 }
 
-/* 预览只留 4 行（全文在面板里）；限高裁切只作用于文字本身，
-   这样气泡框和下面的小尾巴都不会被裁。--bubble-max 由 pet.js 按头顶余量算。 */
+/* 正文不按行数裁字了：气泡多高，pet.js 就向主进程申请多高的窗口带（band），
+   一次能看全（正文上限 240 字）。真的超过可用空间时，滚动发生在下面的
+   .bubbleBody 里，而不是把字截掉或者把气泡往下压到宠物身上。 */
 #bubbleText {
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 4;
-  max-height: var(--bubble-max, 96px);
-  overflow: hidden;
+  display: block;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
-/* 带图时图在文字上方（40px 圆角缩略图），文字再收一点，保证整块不超过头顶预留的带 */
+/* 正文的限高/滚动层：pet.js 运行时把内容包进 .bubbleBody。
+   #bubble 必须留 overflow: visible 才能画出框外那个尖角（overflow-y:auto 会把
+   ::after 一起裁掉），所以限高只放在这一层，滚动条也不会顶到尾巴上。 */
+.bubbleBody {
+  max-height: var(--bubble-max, 96px);
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(80, 96, 152, 0.32) transparent;
+  overscroll-behavior: contain;
+}
+.bubbleBody::-webkit-scrollbar { width: 6px; }
+.bubbleBody::-webkit-scrollbar-thumb { background: rgba(80, 96, 152, 0.28); border-radius: 3px; }
+.bubbleBody::-webkit-scrollbar-track { background: transparent; }
+
+/* 带图时图在文字上方（40px 圆角缩略图） */
 #bubble.haspic #bubbleText {
-  -webkit-line-clamp: 2;
-  max-height: calc(var(--bubble-max, 96px) * 0.55);
   margin-top: 5px;
 }
 
@@ -216,7 +229,8 @@
 #bubble::after {
   content: '';
   position: absolute;
-  left: var(--bubble-tail-x, 50%);
+  /* --tail-x 由 pet.js 按「宠物头顶中心」实时算（px）；旧名 --bubble-tail-x 保留兼容 */
+  left: var(--tail-x, var(--bubble-tail-x, 50%));
   bottom: -4.5px;
   width: 12px;
   height: 12px;
@@ -471,6 +485,9 @@
 
 /* 菜单里出现滑条时，宠物淡一点，免得挡住 */
 #root.ctxopen #pet { opacity: 0.85; }
+
+/* 真的在拖她（左键按住并移动过 6px）才给个抓手光标，划过不算 */
+#root.petdragging, #root.petdragging .petStage { cursor: grabbing; }
 
 /* ── 操作回执（切皮肤 / 导入 / 监测开关）─────────────────────────────────── */
 .pet-toast {
