@@ -610,6 +610,25 @@
 
 **验证**：`node --check` 三个渲染端文件 + `main.js`/`preload.js`；`node scripts/test-orb.mjs`（67 + 328 项，新增 14 条：列宽 240/248→360、`fitBubble` 两趟与 `bubbleFitToken`、底边 `headFromBottom() + BUBBLE_GAP`、`--tail-x`、`petBodyHit` 按身体矩形、`ballDrag`/`petDrag` 双状态 + 无旧 `let drag`、`ev.buttons & 1`、`DRAG_MIN_PX = 6`、四种收尾监听、toast 截断）；`scripts/test-orb-window-state.mjs` 28 项。真机看 `[bubble] fit pass=… -> band=… width=…` 两行，确认没有被工作区夹小。
 
+## 34. 监测提示改用气泡、长按才拖、走位不撞墙、原版会话改走 DSH HTTP（0.12.20）
+
+**做什么**
+
+1. **监测/屏幕提示不再是压在桌上的那条 `#petToast`**：`toast()` 在桌宠模式下直接走 `window.SurfPet.showBubble(...)`，复用气泡那套 `fitBubble()`（头顶上方、按内容变宽、脚底不动），面板模式才落回 `petToastEl`。以前那张卡是桌宠窗口里的固定 DIV，窗口只有 181×248，长句既压在她身上又被窗口边界裁掉（主人：「消息被背景截断没有完全显示」）。
+2. **只有按住左键 ≥180ms 再拖才搬窗口**：`mousedown` 时记 `armAt = Date.now() + PET_DRAG_HOLD_MS(180)`；`mousemove` 里 `if (Date.now() < petDrag.armAt) return;` 才进入拖动判定。单击 / 双击 / 右键 / 从她身边划过都不动窗口。
+3. **走位不再撞墙**：`walk()` 走之前按 `screen.availWidth - screenX - innerWidth`（向左则 `screenX`）量出剩余空间，`dist = min(随机距离, 余量-8)`，至少 8px。以前一路走到屏幕外、被主进程夹回来，看起来像「一走就出大 bug」。
+4. **原版会话改走 DSH 的 HTTP API**：`orb-agent.js` 不再用 `ctx.sessionController.prompt`（它只认活着的 Agent，DSH 一重启会话变冷就抛 `session/agent-busy: prompt rejected`，于是每轮静默退回直连——history 里永远没有 `agentTurns`，用户看到的就是「根本没开会话」）。现在和 QQ 桥接同款：`NodeApiClient` → `sessions.create({cwd})` → `events.mux` + `follow(sessionId)` → `sessions.prompt` → 收 `turn/end` 文本；失败时丢掉映射、下一轮重建。
+
+**入口 / 配置**：无需新配置。`orb.chat.reply.mode = 'legacy'`（默认）就走这条 DSH 会话；`fast` 仍走直连。会话 cwd 在 `~/.dsh/surfcore/orb/agent`（`pet` 宿主是 `.../pet/agent`）。
+
+**注意（踩过的坑）**
+
+- `unwrap()` 要的是 DSH 的 `{result:{ok,value}}` 信封，假客户端测试里也要按信封返回。
+- `sessions.create` 之后的 `events.mux` 必须**先 follow 再 prompt**；DSH 偶尔在 `turn/end` 后立刻关掉 follow 流，所以驱动器还留了「最后一条 assistant 文本」兜底。
+- 超时下限 500ms（测试用得到），默认 180s；超时会 `AbortController.abort()`，不会把下一次请求卡死。
+
+**验证**：`node scripts/test-orb-agent.mjs`（建档/复用/失败重建/超时/并发 busy/forget + 4 条 pet-chat 源码断言）；真机看 `plugin.log` 里 `[pet-chat] 原版会话 ok session=… total=…`，失败时日志带 `data={"reason":"…"}`。
+
 ## 新增功能时按这个格式补一条
 
 1. 在总表加一行（功能 / 入口 / 代码 / 配置键）；

@@ -232,7 +232,7 @@ export function apply(ctx) {
     },
   });
   // 桌宠对话与「目的机制」的桌宠载体：和 QQ / B站 共用当前角色的人格卡、记忆卡、目的状态。
-  const petChat = createPetChatService({ ctx, stateDir: STATE_DIR, pluginLog, tokenBudget, archiveMessage: desktopArchive.record, readRecent: desktopArchive.recent });
+  const petChat = createPetChatService({ ctx, stateDir: STATE_DIR, pluginLog, tokenBudget, archiveMessage: desktopArchive.record, readRecent: desktopArchive.recent, dshBaseUrl: currentDshUrl });
   const petPurpose = createPetPurposeService({ chat: petChat, tokenBudget, pluginLog, callBridge });
   const petApi = createPetApiService({
     chat: petChat,
@@ -310,7 +310,7 @@ export function apply(ctx) {
     pluginLog('[orb] 启动互动监测失败：', String(error?.message ?? error));
   }
   // 悬浮球对话：同一个人格卡 / 记忆卡 / 模型，历史单独放（profile='orb'）。
-  const orbChat = createPetChatService({ ctx, stateDir: STATE_DIR, pluginLog, tokenBudget, profile: 'orb', archiveMessage: desktopArchive.record, readRecent: desktopArchive.recent });
+  const orbChat = createPetChatService({ ctx, stateDir: STATE_DIR, pluginLog, tokenBudget, profile: 'orb', archiveMessage: desktopArchive.record, readRecent: desktopArchive.recent, dshBaseUrl: currentDshUrl });
   const orbApi = createOrbApiService({
     orb: orbService,
     chat: orbChat,

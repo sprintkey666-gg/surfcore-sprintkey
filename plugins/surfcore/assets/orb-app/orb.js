@@ -1131,6 +1131,9 @@
   // 拖动过程中绝不再调 orb.hit()（那会改穿透，mouseup 送不到渲染进程，
   // 状态就永远清不掉——这正是用户看到的「鼠标划过她就跟着跑」）。
   let petDrag = null;
+  // 长按才算拖：主人明确要求「只有在她身上按住左键停一下再拖」才搬窗口。
+  // 以前按下就能拖，手一抖（点击时移动 6px）她就被拖走，看起来像「鼠标靠近就位移」。
+  const PET_DRAG_HOLD_MS = 180;
   function endPetDrag() {
     if (!petDrag) return;
     lastDragMoved = petDrag.moved;
@@ -1142,6 +1145,8 @@
     if (petDrag) {
       // 左键已经松了却还收到 mousemove（mouseup 被穿透/焦点切换吞掉）：立刻放弃
       if (!(ev.buttons & 1)) { endPetDrag(); return; }
+      // 没按够时长：动得再多也不算拖（这样单击、双击、右键都还是原样）
+      if (Date.now() < petDrag.armAt) return;
       const dx = ev.screenX - petDrag.sx;
       const dy = ev.screenY - petDrag.sy;
       if (!petDrag.moved && Math.hypot(dx, dy) < DRAG_MIN_PX) return;
@@ -1180,7 +1185,14 @@
       // 窗口比宠物大（左右透明边 + 头顶气泡带），只有真的按在她身上才算拖她。
       if (!petBodyHit(ev)) return;
       if (petDrag) return;
-      petDrag = { sx: ev.screenX, sy: ev.screenY, moved: false, wx: window.screenX, wy: window.screenY };
+      petDrag = {
+        sx: ev.screenX,
+        sy: ev.screenY,
+        moved: false,
+        wx: window.screenX,
+        wy: window.screenY,
+        armAt: Date.now() + PET_DRAG_HOLD_MS,
+      };
       // 按下就把命中钉住：拖动期间穿透轮询若把窗口切成穿透，mouseup 就收不到了
       try { window.orb?.hit?.(true); } catch {}
     });
@@ -1263,6 +1275,18 @@
     const msg = String(text ?? '').trim();
     if (!msg) return;
     plog(`toast ${msg}`);
+    // 2026-11-04 真机事故：桌宠模式下 toast 是**窗口里一个固定 DIV**，直接压在宠物身上，
+    // 而且窗口只有宠物宽（181px），长句被裁掉一半（主人截图「消息被背景截断」）。
+    // 桌宠模式一律改走宠物气泡：头顶上方、按内容变宽、不再挡住她。
+    if (petMode && typeof window.SurfPet?.showBubble === 'function') {
+      try {
+        window.SurfPet.showBubble(msg, {
+          kind: bad === true ? 'error' : 'notice',
+          ttlMs: Math.max(2600, Math.min(9000, msg.length * 140)),
+        });
+        return;
+      } catch { /* 气泡不可用就退回下面的 DOM toast */ }
+    }
     if (!petToastEl) {
       try { showHintBriefly?.(msg); } catch {}
       return;

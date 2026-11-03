@@ -757,8 +757,24 @@
     const maxDist = Math.max(minDist, clamp(num(p.maxDist, Math.max(120, minDist * 2)), minDist, 3000));
     const leadSec = clamp(num(p.leadSec, 0), 0, 30);
     const tailSec = clamp(num(p.tailSec, 4.8), 0, 60);
-    const dist = Math.round(minDist + Math.random() * (maxDist - minDist));
-    const dir = state.moveBias || (Math.random() < 0.5 ? -1 : 1);
+    const dist0 = Math.round(minDist + Math.random() * (maxDist - minDist));
+    const dir0 = state.moveBias || (Math.random() < 0.5 ? -1 : 1);
+    // 走之前先量一下离屏幕边还有多远：以前一路走到墙外，窗口被夹住后她整个人贴在边上
+    // （用户说的「一走就出大 bug」），现在最多走到离边 8px 就停。
+    let room = Infinity;
+    try {
+      const availW = Number(window.screen?.availWidth) || 0;
+      const availH = Number(window.screen?.availHeight) || 0;
+      if (availW > 0) {
+        room = dir0 > 0
+          ? availW - (Number(window.screenX) || 0) - (Number(window.innerWidth) || 0)
+          : Number(window.screenX) || 0;
+      }
+      if (availH > 0 && Number(window.screenY) < 0) room = 0;
+    } catch { /* ignore */ }
+    const roomEdge = Number.isFinite(room) ? Math.max(0, room - 8) : dist0;
+    const dist = Math.max(8, Math.min(dist0, roomEdge));
+    const dir = dir0;
     const ms = Math.max(400, Math.round((leadSec + tailSec) * 1000));
     const playing = playActionLayer(action.name, { mirror: dir > 0 ? !ART_FACES_LEFT : ART_FACES_LEFT, kind: 'move' });
     if (!playing) return false;

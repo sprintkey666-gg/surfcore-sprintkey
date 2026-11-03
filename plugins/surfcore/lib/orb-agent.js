@@ -1,173 +1,166 @@
-// 「原版」回复速度：走真正的 DSH 会话（和 QQ 那边同款 agent 回合），而不是一次直连调用。
+// 悬浮窗 / 字幕「原版」回复：真的在 DSH 里开一个会话，把一轮 prompt 发进去，收 turn/end 的最终文本。
 //
-// 为什么需要它：主人 2026-11-03 要求悬浮窗会话/陪伴字幕「就像插件 qq 聊天一样专门开一个会话
-// 来进行聊天（注入记忆和人设）（接收问题和回复）」。直连 `ctx.get('llm').stream()` 每次都是
-// 单轮无工具，多步上下文的体验和 QQ 差一截；这里改成用 sessionController 驱动一个专属会话：
-//   · 会话 id 固定 → 上下文连续（越聊越熟练，也越聊越慢 = 「原版」的代价）
-//   · 每轮都把「人设 + 记忆卡 + 跨端最近对话 + 这一句」拼成一条 prompt 推进去
-//   · 回合结束用 turn/end 事件收最终文本（assistant/chunk 不收，避免重复）
-//
-// 「快回复」不走这里，仍旧直连 llm（见 pet-chat.js 的 fast 分支）。
-
-import path from 'node:path';
-import { applySessionPermission } from './scheduler.js';
-
-const DEFAULT_TIMEOUT_MS = 180_000;
+// 为什么不用 ctx.sessionController.prompt（2026-11-03 的真机事故）：
+//   DSH 的 sessionController.prompt 只接受「活着」的 Agent。DSH 一重启，磁盘上的会话就是冷的，
+//   prompt 会抛 RemoteError('session/agent-busy', 'prompt rejected', { reason: '...' })，
+//   于是每一轮都退回直连、history 里永远不出现 agentTurns —— 用户看到的「根本没开会话」。
+//   桥接（QQ）那边走的是 DSH 的 HTTP API（sessions.create → events.mux → events.follow → sessions.prompt），
+//   冷会话由服务端按需恢复，而且它本来就是「QQ 聊天」那条链路的同款回合。
+//   所以这里也走同一条路：和 `src/self-test.js` 一样，create 一条真会话、订阅事件、prompt、等 turn/end。
+import { NodeApiClient, unwrap, createTurnCollector } from '../../../src/dsh-client.js';
 
 /**
- * 收集一次 turn 的 assistant 文本。和 src/dsh-client.js 里那份同构，
- * 但不从那边 import：插件不该依赖桥接进程的 HTTP/WS 客户端。
+ * @param {object} options
+ * @param {{ current?: () => string }} [options.baseUrl] 当前 DSH 的 HTTP 地址（插件里传 currentDshUrl）
+ * @param {(line: string, detail?: string) => void} [options.pluginLog]
+ * @param {string} [options.cwd] 新会话的工作目录（默认 ~/.dsh/surfcore/orb-agent）
  */
-export function createTurnCollector() {
-  const turns = new Map();
-  return {
-    push(event) {
-      if (!event || typeof event !== 'object') return null;
-      if (event.type === 'turn/start') {
-        turns.set(event.data?.turn, { text: '' });
-        return null;
-      }
-      if (event.type === 'assistant/chunk') return null;
-      if (event.type === 'assistant/message') {
-        const t = turns.get(event.data?.turn);
-        if (!t) return null;
-        for (const block of event.data?.message?.content ?? []) {
-          if (block?.type === 'text' && typeof block.text === 'string') t.text += block.text;
-        }
-        return null;
-      }
-      if (event.type === 'turn/end') {
-        const t = turns.get(event.data?.turn);
-        turns.delete(event.data?.turn);
-        if (!t) return null;
-        return { turn: event.data?.turn, reason: event.data?.reason, text: t.text };
-      }
-      return null;
-    },
-    size() { return turns.size; },
-  };
-}
+export function createOrbAgent({ baseUrl = null, pluginLog = () => {}, cwd = '', clientFactory = null } = {}) {
+  /** 逻辑会话（orb-chat-<角色>-<代数>）→ DSH 真实 sessionId */
+  const sessions = new Map();
+  /** 正在跑的轮次：逻辑 id → { controller, timer } */
+  const running = new Map();
+  let client = null;
+  let clientBase = '';
 
-/**
- * 一个会话驱动器的工厂。同一个实例可以被悬浮窗会话和陪伴字幕共用：
- * 两边传不同的 sessionId 就是两个独立上下文（历史不串）。
- */
-export function createOrbAgent({ ctx, stateDir, pluginLog = () => {}, cwd = '', profile = 'orb' }) {
-  const root = String(cwd || path.join(String(stateDir || '.'), 'orb-agent'));
-  const pending = new Map(); // sessionId -> { collector, resolve, reject, timer }
-  const ready = new Set();
-  let off = null;
-
-  function controller() {
-    try { return ctx?.sessionController; } catch { return undefined; }
+  function log(...parts) {
+    try { pluginLog(...parts); } catch { /* ignore */ }
   }
 
-  function fail(message) {
-    const error = new Error(message);
-    error.code = 'ORB_AGENT';
-    return error;
+  function resolveBase() {
+    const raw = typeof baseUrl === 'function' ? baseUrl() : baseUrl;
+    return String(raw || '').replace(/\/+$/, '');
   }
 
-  function onEvent(session, event) {
-    const sessionId = String(session?.id || session?.sessionId || '');
-    if (!sessionId) return;
-    const waiter = pending.get(sessionId);
-    if (!waiter) return;
-    const ended = waiter.collector.push(event);
-    if (ended) waiter.settle(ended);
+  function api() {
+    const base = resolveBase();
+    if (!base) throw new Error('还不知道 DSH 地址（webServer 还没起来）');
+    if (!client || clientBase !== base) {
+      client = typeof clientFactory === 'function' ? clientFactory(base) : new NodeApiClient(base);
+      clientBase = base;
+    }
+    return client;
   }
 
-  /** 订阅 session/event。由插件在启动时调一次；幂等。 */
-  function attach() {
-    if (off || typeof ctx?.on !== 'function') return;
-    try { off = ctx.on('session/event', onEvent); } catch { off = null; }
-  }
-
-  async function ensureSession(sessionId) {
-    const sc = controller();
-    if (!sc) throw fail('DSH 会话服务还没就绪（sessionController 不可用）');
-    if (ready.has(sessionId)) return;
-    try {
-      if (typeof sc.inspect === 'function') {
-        await sc.inspect(sessionId);
-        ready.add(sessionId);
-        applySessionPermission(ctx, sessionId, 'danger-full-access', pluginLog);
-        return;
-      }
-    } catch { /* 不存在 → 往下 create */ }
-    // create 对已存在的非空会话会新建一个空壳，所以上面必须先 inspect。
-    await sc.create({ sessionId, cwd: root });
-    ready.add(sessionId);
-    applySessionPermission(ctx, sessionId, 'danger-full-access', pluginLog);
+  function dsSession(logical, create = true) {
+    const key = String(logical || 'orb');
+    const known = sessions.get(key);
+    if (known) return known;
+    if (!create) return '';
+    return '';
   }
 
   /**
-   * 跑一轮：把 text 推进会话，等这一轮结束拿最终文本。
-   * @returns {Promise<{ok:boolean, text:string, reason:object|null, sessionId:string}>}
+   * 跑一轮。成功返回 `{ ok:true, text, dsSessionId }`；失败返回 `{ ok:false, reason }`，
+   * 由调用方决定退回直连（这里不抛，保证她永远还能回话）。
    */
-  async function run({ sessionId, text = '', content = null, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
-    const sid = String(sessionId || '').trim();
-    const body = String(text || '').trim();
-    const parts = Array.isArray(content) && content.length ? content : [{ type: 'text', text: body }];
-    if (!sid) throw fail('缺少 sessionId');
-    if (!body && !(Array.isArray(content) && content.length)) return { ok: true, text: '', reason: null, sessionId: sid };
-    attach();
-    const sc = controller();
-    if (!sc?.prompt) throw fail('DSH 会话服务还没就绪（sessionController.prompt 不可用）');
-    if (pending.has(sid)) throw fail('这个会话上一轮还没结束');
-    await ensureSession(sid);
+  async function run({ sessionId, content, timeoutMs = 180_000 } = {}) {
+    const key = String(sessionId || 'orb');
+    if (running.has(key)) return { ok: false, reason: { kind: 'busy' } };
+    const controller = new AbortController();
+    const state = { controller };
+    running.set(key, state);
+    const timer = setTimeout(() => {
+      try { controller.abort(); } catch { /* ignore */ }
+    }, Math.max(500, Number(timeoutMs) || 180_000));
+    state.timer = timer;
 
-    const result = await new Promise((resolve, reject) => {
+    let ds = dsSession(key);
+    let created = false;
+    try {
+      const client0 = api();
+      if (!ds) {
+        const created0 = unwrap(await client0.sessions.create({ cwd: cwd || undefined }), 'session.create');
+        ds = String(created0?.sessionId || '');
+        if (!ds) throw new Error('session.create 没返回 sessionId');
+        sessions.set(key, ds);
+        created = true;
+        log(`[orb-agent] 新会话 ${key} → ${ds}`);
+      }
+
       const collector = createTurnCollector();
-      // ⚠️ 2026-11-03 真机事故：DSH 的 sessionController.prompt(args, signal) 内部会无条件调
-      //    signal.throwIfAborted()，不传 signal 就直接抛
-      //    `Cannot read properties of undefined (reading 'throwIfAborted')`
-      //    → 每轮都在 30ms 内退回直连，看起来「原版会话实现了但从没跑过」。
-      //    所以这里必须显式造一个 AbortController，超时/取消时 abort 掉。
-      const abort = new AbortController();
-      const timer = setTimeout(() => {
-        pending.delete(sid);
-        try { abort.abort(); } catch { /* ignore */ }
-        try { sc.cancel?.({ sessionId: sid }); } catch { /* 取消失败也不拦着报错 */ }
-        reject(fail(`这一轮超过 ${Math.round(timeoutMs / 1000)} 秒还没结束`));
-      }, Math.max(5000, Number(timeoutMs) || DEFAULT_TIMEOUT_MS));
-      const settle = (ended) => {
-        clearTimeout(timer);
-        pending.delete(sid);
-        resolve({ ok: true, text: String(ended.text || '').trim(), reason: ended.reason ?? null, sessionId: sid });
+      const stream = client0.events.mux({}, controller.signal, () => {});
+      stream.follow(ds);
+
+      let lastText = '';
+
+      const parts = Array.isArray(content) ? content : [{ type: 'text', text: String(content ?? '') }];
+      const done = (async () => {
+        for await (const envelope of stream) {
+          const frame = envelope?.payload;
+          if (!frame) continue;
+          if (frame.type === 'session/event' && String(frame.sessionId) === ds) {
+            const evt = frame.event;
+            // 兜底：DSH 有时在 turn/end 之后立刻把这条 follow 流关掉，或干脆只发 assistant/message。
+            // 把最后一条完整 assistant 文本记下来，流提前结束时还能用它，不至于白等一轮。
+            if (evt?.type === 'assistant/message') {
+              const textBlocks = (evt.data?.message?.content || [])
+                .filter((part) => part?.type === 'text')
+                .map((part) => String(part.text || ''));
+              if (textBlocks.length) lastText = textBlocks.join('');
+            }
+            const ended = collector.push(evt);
+            if (ended) return ended;
+          }
+          if (frame.type === 'stream/error') throw new Error(`事件流错误: ${JSON.stringify(frame.error)}`);
+        }
+        if (lastText) return { text: lastText, reason: { kind: 'stream-closed' } };
+        throw new Error('事件流结束');
+      })();
+
+      unwrap(await client0.sessions.prompt({ sessionId: ds, mode: 'queue', content: parts }), 'session.prompt');
+      const ended = await done;
+      try { await stream.return?.(); } catch { /* ignore */ }
+      try { controller.abort(); } catch { /* ignore */ }
+      const text = String(ended?.text || '').trim();
+      if (!text) return { ok: false, reason: { kind: ended?.reason?.kind || 'empty' }, dsSessionId: ds };
+      return { ok: true, text, dsSessionId: ds };
+    } catch (error) {
+      // 失败就把这个逻辑会话的映射扔掉，下一轮重新 create（冷会话 / 被归档 / DSH 重启都走这里）
+      if (created || ds) sessions.delete(key);
+      const reason = {
+        kind: error?.code || 'error',
+        message: String(error?.data?.reason || error?.message || error),
       };
-      pending.set(sid, { collector, resolve, reject, timer, settle, abort });
-      Promise.resolve()
-        .then(() => sc.prompt({ sessionId: sid, mode: 'queue', content: parts }, abort.signal))
-        .catch((error) => {
-          clearTimeout(timer);
-          pending.delete(sid);
-          reject(error);
-        });
-    });
-    return result;
+      log(`[orb-agent] ${key} 失败：`, reason.message.slice(0, 200));
+      return { ok: false, reason, dsSessionId: ds };
+    } finally {
+      clearTimeout(timer);
+      running.delete(key);
+    }
   }
 
   async function cancel(sessionId) {
-    const sid = String(sessionId || '');
-    const waiter = pending.get(sid);
-    if (waiter) {
-      clearTimeout(waiter.timer);
-      pending.delete(sid);
-      try { waiter.abort?.abort(); } catch { /* ignore */ }
+    const key = String(sessionId || '');
+    const state = running.get(key);
+    if (state) {
+      try { state.controller.abort(); } catch { /* ignore */ }
+      running.delete(key);
     }
-    try { await controller()?.cancel?.({ sessionId: sid }); } catch { /* ignore */ }
+  }
+
+  /** 忘掉逻辑会话的映射（调用方换代重试时用）。 */
+  function forget(sessionId) {
+    const key = String(sessionId || '');
+    if (key) sessions.delete(key);
   }
 
   function dispose() {
-    for (const waiter of pending.values()) {
-      try { clearTimeout(waiter.timer); } catch {}
-      try { waiter.abort?.abort(); } catch {}
+    for (const state of running.values()) {
+      try { clearTimeout(state.timer); } catch { /* ignore */ }
+      try { state.controller.abort(); } catch { /* ignore */ }
     }
-    pending.clear();
-    try { off?.(); } catch {}
-    off = null;
+    running.clear();
+    sessions.clear();
   }
 
-  return { attach, run, cancel, dispose, profile, root };
+  /** 只读状态（测试与设置页用）。 */
+  function status() {
+    return {
+      sessions: [...sessions.entries()].map(([logical, ds]) => ({ logical, ds })),
+      running: [...running.keys()],
+    };
+  }
+
+  return { run, cancel, forget, dispose, status };
 }

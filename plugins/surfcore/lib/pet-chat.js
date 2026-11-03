@@ -165,7 +165,7 @@ function tokenHash(text) {
  * @param {object} [opts.tokenBudget]  每日额度服务（可选，冒烟测试可不传）
  * @param {'pet'|'orb'} [opts.profile] 宿主：桌宠（默认）还是桌面悬浮球
  */
-export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, tokenBudget = null, profile = 'pet', archiveMessage = null, readRecent = null } = {}) {
+export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, tokenBudget = null, profile = 'pet', archiveMessage = null, readRecent = null, dshBaseUrl = null } = {}) {
   // profile：'pet' = 桌宠（透明小人），'orb' = 桌面悬浮球。
   // 两个宿主共用人格 / 记忆 / 模型调用，但聊天历史与语音产物必须分开放，
   // 否则悬浮球上的「新对话」会把桌宠的上下文一起清掉。
@@ -178,8 +178,9 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
 
   // 「原版」回复速度：把这一轮交给一个专属 DSH 会话跑（和 QQ 那边同款 agent 回合）。
   // 只有一个实例共用一个 agent——会话 id 不同就是不同上下文，字幕和会话互不串台。
-  const agent = createOrbAgent({ ctx, stateDir, pluginLog, profile });
-  if (isOrb) agent.attach();
+  const agentCwd = path.join(root, 'agent');
+  try { fs.mkdirSync(agentCwd, { recursive: true }); } catch { /* ignore */ }
+  const agent = createOrbAgent({ baseUrl: dshBaseUrl, pluginLog, cwd: agentCwd });
 
   const events = [];
   let eventSeq = 0;
@@ -1050,36 +1051,59 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
       // ① 原版：交给专属 DSH 会话跑一轮（上下文连续，和 QQ 那边同款 agent 回合）。
       //    会话自己的历史在 DSH 里，所以不再把【最近聊天】塞进去，避免同一段话说两遍。
       if (wantMode === 'legacy' && isOrb) {
-        try {
-          const sessionId = agentSessionId(deskChannel);
-          // 人设/记忆卡只在「这个会话代数第一次开口」时整段推一次；后续轮次只补最新的记忆卡摘要，
-          // 否则 N 轮以后上下文里会堆 N 份人设（越聊越慢、还会互相矛盾）。
-          const firstTurn = !agentSystemSent(history, sessionId);
-          const memoryNow = String(memoryBlock() || '').trim();
-          const systemForTurn = firstTurn
-            ? system
-            : [
-              `【提醒】你还是${role.name || '她'}，人设没变（这一条只是一次性提醒）。`,
-              memoryNow ? `【最新的记忆卡】\n${memoryNow}` : '',
-            ].filter(Boolean).join('\n');
-          const where = channel === 'companion' ? '屏幕上的字幕框' : '桌面的悬浮球';
-          const parts = await buildPromptParts({
-            system: systemForTurn,
-            user: `（${owner.name}在${where}里对你说）${say}`,
-            images: chatImages.length ? chatImages : null,
-          });
-          const run = await agent.run({ sessionId, content: parts, timeoutMs: rp.timeoutMs });
-          if (run?.ok && String(run.text || '').trim()) {
-            result = { text: run.text, usage: null, model: 'session' };
-            markAgentSystemSent(history, sessionId);
-            bumpAgentTurns(history, rp.sessionTurns, sessionId);
-            pluginLog(`[pet-chat] 原版会话 ok session=${sessionId} turns=${history.agentTurns} total=${history.agentTotal}`);
-          } else {
-            pluginLog(`[pet-chat] 原版会话这一轮没吐字（${run?.reason?.kind || 'empty'}），退回直连`);
+        // 2026-11-04 真机事故（第二次）：DSH 的 sessionController.prompt 说明写的是
+        // 「Admit one prompt after explicitly resuming its Session」——DSH 重启后，磁盘上那个
+        // 固定 id 的会话是**冷会话**，没有活着的 Agent，prompt 会被判成
+        // `session/agent-busy: prompt rejected`。所以这里失败一次就换代（agentGen+1）重来：
+        // 新 id → create → 活会话 → 正常跑。
+        for (let attempt = 0; attempt < 2 && !result; attempt += 1) {
+          try {
+            const sessionId = agentSessionId(deskChannel);
+            // 人设/记忆卡只在「这个会话代数第一次开口」时整段推一次；后续轮次只补最新的记忆卡摘要，
+            // 否则 N 轮以后上下文里会堆 N 份人设（越聊越慢、还会互相矛盾）。
+            const firstTurn = !agentSystemSent(history, sessionId);
+            const memoryNow = String(memoryBlock() || '').trim();
+            const systemForTurn = firstTurn
+              ? system
+              : [
+                `【提醒】你还是${role.name || '她'}，人设没变（这一条只是一次性提醒）。`,
+                memoryNow ? `【最新的记忆卡】\n${memoryNow}` : '',
+              ].filter(Boolean).join('\n');
+            const where = channel === 'companion' ? '屏幕上的字幕框' : '桌面的悬浮球';
+            const parts = await buildPromptParts({
+              system: systemForTurn,
+              user: `（${owner.name}在${where}里对你说）${say}`,
+              images: chatImages.length ? chatImages : null,
+            });
+            const run = await agent.run({ sessionId, content: parts, timeoutMs: rp.timeoutMs });
+            if (run?.ok && String(run.text || '').trim()) {
+              result = { text: run.text, usage: null, model: 'session' };
+              markAgentSystemSent(history, sessionId);
+              bumpAgentTurns(history, rp.sessionTurns, sessionId);
+              pluginLog(`[pet-chat] 原版会话 ok session=${sessionId} turns=${history.agentTurns} total=${history.agentTotal}`);
+            } else {
+              pluginLog(`[pet-chat] 原版会话这一轮没吐字（${run?.reason?.kind || 'empty'}），退回直连`);
+            }
+          } catch (error) {
+            // 会话服务不可用/超时：不要整段失败，退回快回复那条直连，保证她还能回话。
+            // 2026-11-04：DSH 把真正的失败原因放在 RemoteError 的 data.reason 里，
+            // 只打 message 只能看到「prompt rejected」，排查时等于没信息。
+            let detail = '';
+            try {
+              const data = error?.data ?? error?.details ?? error?.cause ?? null;
+              if (data) detail = ` data=${JSON.stringify(data).slice(0, 320)}`;
+            } catch { /* ignore */ }
+            pluginLog(
+              '[pet-chat] 原版会话失败，退回直连：',
+              `${String(error?.code || '')} ${String(error?.message ?? error).slice(0, 200)}${detail}`.replace(/\s+/g, ' ').trim()
+            );
+            // 冷会话/被占：换一代新的会话 id 再来一次（新 id 会被 create 成活会话）。
+            if (attempt === 0) {
+              history.agentGen = Math.max(0, Number(history.agentGen) || 0) + 1;
+              try { agent.forget?.(agentSessionId(deskChannel)); } catch { /* ignore */ }
+              pluginLog(`[pet-chat] 原版会话换代重试 agentGen=${history.agentGen}`);
+            }
           }
-        } catch (error) {
-          // 会话服务不可用/超时：不要整段失败，退回快回复那条直连，保证她还能回话。
-          pluginLog('[pet-chat] 原版会话失败，退回直连：', String(error?.message ?? error).slice(0, 200));
         }
       }
       // ② 快回复（以及原版失败时的兜底）：直连 llm，单轮。
