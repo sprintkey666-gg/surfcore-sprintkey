@@ -25,7 +25,10 @@ import { memoryCardPromptBlock } from './memory-card.js';
 import { activeMemoryPaths, readCurrentCharacter } from '../../../src/character-persona.js';
 import { adminFromSources } from '../../../src/admin-identity.js';
 import { appendMemoryInboxEvent } from '../../../src/memory-card.js?rev=20261025-pet-memory2';
+import { readRecentChatRecords, chatArchiveRoot } from '../../../src/chat-archive.js';
 import { synthesizeToFile, wavDurationMs } from '../../../src/voice-tts.js';
+import { buildInteropMemory, clampText, formatRecentLines, normalizeInterop } from './interop.js';
+import { createOrbAgent } from './orb-agent.js';
 
 const ONE_SECOND = 1000;
 const MAX_INPUT_CHARS = 1200;
@@ -99,11 +102,15 @@ export function stripStageDirections(text) {
  * 桌宠的一问一答 → 记忆卡 inbox 事件（和 QQ / B站 共用同一张卡、同一条遗忘曲线）。
  * 用户消息和她的回复分开写：插件摄取时会把回复并进最近一条 pet-owner 记录，
  * 形成「主人说 → 她回」的一条记忆。
+ *
+ * channel（2026-11-03 新增的数据类型）：pet = 桌宠本体、orb = 悬浮窗会话、
+ * companion = 陪伴字幕。记忆卡会把它写进标题/标签，注入提示词后能看出这话是在哪儿说的。
  */
-export function buildPetMemoryEvents({ userText = '', replyText = '', at = Date.now(), roleName = '', screenAware = false } = {}) {
+export function buildPetMemoryEvents({ userText = '', replyText = '', at = Date.now(), roleName = '', screenAware = false, channel = 'pet' } = {}) {
   const events = [];
   const say = String(userText ?? '').trim();
   const reply = String(replyText ?? '').trim();
+  const deskChannel = String(channel || 'pet');
   // screenVision：这一轮是「看着屏幕」说的（窗口标题或截图）——记忆照存，但 B站 那边一律不出圈。
   const screenVision = screenAware === true;
   if (say) {
@@ -111,6 +118,7 @@ export function buildPetMemoryEvents({ userText = '', replyText = '', at = Date.
       at: at - 1,
       platform: 'pet',
       kind: 'private',
+      channel: deskChannel,
       sender: '主人',
       isOwner: true,
       private: true,
@@ -125,6 +133,7 @@ export function buildPetMemoryEvents({ userText = '', replyText = '', at = Date.
       at,
       platform: 'pet',
       kind: 'private',
+      channel: deskChannel,
       sender: String(roleName || '角色').slice(0, 40),
       isSelf: true,
       private: true,
@@ -156,7 +165,7 @@ function tokenHash(text) {
  * @param {object} [opts.tokenBudget]  每日额度服务（可选，冒烟测试可不传）
  * @param {'pet'|'orb'} [opts.profile] 宿主：桌宠（默认）还是桌面悬浮球
  */
-export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, tokenBudget = null, profile = 'pet', archiveMessage = null } = {}) {
+export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, tokenBudget = null, profile = 'pet', archiveMessage = null, readRecent = null } = {}) {
   // profile：'pet' = 桌宠（透明小人），'orb' = 桌面悬浮球。
   // 两个宿主共用人格 / 记忆 / 模型调用，但聊天历史与语音产物必须分开放，
   // 否则悬浮球上的「新对话」会把桌宠的上下文一起清掉。
@@ -166,6 +175,11 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
   const voiceDir = path.join(root, 'voice');
   const tokenFile = path.join(root, 'host-token');
   const focusFile = path.join(root, 'focus.json');
+
+  // 「原版」回复速度：把这一轮交给一个专属 DSH 会话跑（和 QQ 那边同款 agent 回合）。
+  // 只有一个实例共用一个 agent——会话 id 不同就是不同上下文，字幕和会话互不串台。
+  const agent = createOrbAgent({ ctx, stateDir, pluginLog, profile });
+  if (isOrb) agent.attach();
 
   const events = [];
   let eventSeq = 0;
@@ -235,6 +249,19 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
     };
   }
 
+  /** 回复速度：原版 = 走真 DSH 会话（上下文连续，越聊越慢）；快回复 = 直连 llm 单轮。 */
+  function replySettings(raw, fallbackMode = 'legacy') {
+    const src = raw && typeof raw === 'object' ? raw : {};
+    const mode = src.mode === 'fast' ? 'fast' : (src.mode === 'legacy' ? 'legacy' : fallbackMode);
+    return {
+      mode,
+      timeoutMs: clampInt(src.timeoutMs, 180000, 30000, 600000),
+      // 0 = 永远不换会话（上下文最连贯，也最容易变慢）；>0 = 每 N 轮换一个新会话。
+      sessionTurns: clampInt(src.sessionTurns, 0, 0, 60),
+      maxTokens: clampInt(src.maxTokens, 800, 200, 4000),
+    };
+  }
+
   function settings() {
     const unified = unifiedConfig();
     const qq = qqConfig();
@@ -254,7 +281,11 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
         reasoningEffort: ['off', 'low', 'high', 'max'].includes(String(chat.reasoningEffort))
           ? String(chat.reasoningEffort)
           : 'low',
+        // 桌宠默认原版；悬浮窗按设置页选的那套。
+        reply: isOrb ? replySettings(orbChat.reply, 'legacy') : replySettings(chat.reply, 'legacy'),
       },
+      // 互通记忆：读 QQ / B站 记忆卡 + 跨端最近对话，以及人设/记忆的注入上限。
+      interop: normalizeInterop(unified?.orb?.interop),
       proactive: {
         carrier: purpose.carrier === 'pet' ? 'pet' : 'qq',
         modality: purpose.petModality === 'voice' ? 'voice' : 'text',
@@ -280,12 +311,47 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
     return { id: cur?.id || '', name, persona, personaFile, hasPersona: Boolean(persona) };
   }
 
+  /** 读一份记忆卡注入块，读不到就当空。 */
+  function promptCard(platform) {
+    try { return String(memoryCardPromptBlock(platform) || '').trim(); } catch { return ''; }
+  }
+
+  /** 跨端最近对话：QQ / 悬浮窗 / 陪伴字幕 都在同一棵树里，读回来当「别处刚聊了什么」。 */
+  function recentInteropText() {
+    const cfg = settings().interop;
+    if (!cfg.recent || typeof readRecent !== 'function') return '';
+    try {
+      const records = readRecent({ limit: cfg.recentLines + 8, hours: cfg.recentHours }) || [];
+      // 桌面这条线自己的话已经在【最近聊天】/会话上下文里了，这里只补「别处」的，免得同一句说两遍。
+      const elsewhere = records.filter((r) => !String(r?.channel || '').startsWith('desktop-orb') && r?.channel !== 'companion' && r?.channel !== 'pet');
+      return formatRecentLines(elsewhere, { limit: cfg.recentLines, hours: cfg.recentHours });
+    } catch { return ''; }
+  }
+
+  /** 她是谁 / 主人是谁——悬浮窗会话以前完全没有这一块，所以「你」指的是谁经常糊。 */
+  function identityBlock() {
+    const cfg = settings().interop;
+    if (!cfg.identity) return '';
+    const owner = ownerInfo();
+    const role = roleInfo();
+    const bits = [`她叫 ${role.name}。`];
+    bits.push(`主人是 ${owner.name}${owner.qq ? `（QQ ${owner.qq}）` : ''}，这台电脑是主人自己的电脑。`);
+    bits.push('这里说的每句话都是主人本人在屏幕前说的，不是在群里。');
+    return bits.join('');
+  }
+
   function memoryBlock() {
     const unified = unifiedConfig();
     if (unified?.memoryCard?.enabled === false) return '';
     // 悬浮窗的「互通记忆」关掉时，读也停：关掉就是这边自己的私聊，不拿卡里的记忆说话。
     if (isOrb && unified?.orb?.chat?.shareMemory === false) return '';
-    try { return String(memoryCardPromptBlock('qq') || '').trim(); } catch { return ''; }
+    const cfg = settings().interop;
+    return buildInteropMemory({
+      qqPrompt: cfg.qq ? promptCard('qq') : '',
+      biliPrompt: cfg.bili ? promptCard('bili') : '',
+      recentText: recentInteropText(),
+      config: cfg,
+    });
   }
 
   function purposeStateFile() {
@@ -321,11 +387,11 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
   // 读看 memoryBlock() 里同一个开关——关掉就整条线断开，不会只关一半。
   // 桌面聊天全量存档（chat-archive 的 channel=desktop-orb）。
   // 只落原文，不影响记忆卡；失败静默，聊天不能因为存档失败而中断。
-  function archiveDesktopMessage(role, text, at, extra = {}) {
+  function archiveDesktopMessage(role, text, at, extra = {}, channel = 'desktop-orb') {
     if (typeof archiveMessage !== 'function') return null;
     try {
       return archiveMessage({
-        channel: 'desktop-orb',
+        channel,
         role,
         text,
         at,
@@ -769,14 +835,21 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
       lines.push(`${owner}会通过桌面上的小气泡和对话窗跟你说话。你现在就用平时聊天的口吻回他。`);
     }
     lines.push('');
+    const identity = identityBlock();
+    if (identity) {
+      lines.push('【你是谁 / 主人在跟谁说话】');
+      lines.push(identity);
+      lines.push('');
+    }
+    // 人设上限跟着互通设置走（默认 12000 字）：以前写死 4200，16KB 的角色卡后半截她根本没见过。
     if (role.persona) {
       lines.push('【人格卡（你就是这个人）】');
-      lines.push(role.persona.slice(0, 4200));
+      lines.push(clampText(role.persona, s.interop.personaMaxChars, '…（角色卡后面省略）'));
       lines.push('');
     }
     if (memory) {
-      lines.push('【记忆卡（你记得的事；越早的事记得越模糊，别把模糊的事说得很确定）】');
-      lines.push(memory.slice(0, 2600));
+      lines.push('【记忆（你记得的事；越早的事记得越模糊，别把模糊的事说得很确定）】');
+      lines.push(memory);
       lines.push('');
     }
     // 桌面上下文：只有主人开了「让她看见」才有。这里只给窗口标题级别的信息，
@@ -848,8 +921,61 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
     return lines.join('\n');
   }
 
+  // ── 原版回复：走专属 DSH 会话 ────────────────────────────────────────────
+  /**
+   * 会话 id：同一角色、同一条链路固定一个（上下文连续才像「专门开一个会话」）。
+   * 设置里配了「每 N 轮换会话」才递增代数——那是为了压住越聊越慢的上下文档位。
+   */
+  function agentSessionId(deskChannel) {
+    const role = roleInfo();
+    const cid = String(role.id || 'default').replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 40);
+    const history = readHistory();
+    const gen = Math.max(0, Number(history.agentGen) || 0);
+    const base = deskChannel === 'companion' ? 'orb-companion' : 'orb-chat';
+    return `${base}-${cid}-${gen}`;
+  }
+
+  /** 把 system + 这一句 + 图 拼成 DSH 会话 prompt 的 content parts。 */
+  async function buildPromptParts({ system, user, images = null }) {
+    const parts = [{
+      type: 'text',
+      text: `${String(system || '').trim()}\n\n${String(user || '').trim()}`.trim(),
+    }];
+    const attachments = (() => { try { return ctx.get('attachments') || null; } catch { return null; } })();
+    for (const img of Array.isArray(images) ? images : []) {
+      if (!img || !img.data) continue;
+      const mediaType = img.mimeType || 'image/jpeg';
+      let part = null;
+      if (attachments?.saveImage) {
+        try {
+          const ref = await attachments.saveImage({ data: Buffer.from(img.data, 'base64'), mediaType });
+          if (ref) part = { type: 'image', attachment: ref };
+        } catch (error) {
+          pluginLog('[pet-chat] 图片入库失败：', String(error?.message ?? error).slice(0, 160));
+        }
+      }
+      if (!part) part = { type: 'image', mimeType: mediaType, data: img.data };
+      parts.push(part);
+    }
+    return parts;
+  }
+
+  /** 记一次「这个会话又聊了一轮」，到点就换下一代会话。 */
+  function bumpAgentTurns(history, turns) {
+    if (!turns || turns <= 0) return;
+    history.agentTurns = (Number(history.agentTurns) || 0) + 1;
+    if (history.agentTurns >= turns) {
+      history.agentTurns = 0;
+      history.agentGen = (Number(history.agentGen) || 0) + 1;
+    }
+  }
+
   // ── 对外：聊天 ──────────────────────────────────────────────────────────
-  async function chat({ text = '', modality = 'text', desktop = null, image = null, images = [], pics = [], screenMode = '', allowPic = false, archive = true, remember = true } = {}) {
+  /**
+   * @param {'desktop-orb'|'companion'|'pet'} [channel] 来源（写记忆卡/存档时当数据类型用）
+   * @param {'legacy'|'fast'} [replyMode] 覆盖设置里的回复速度（陪伴字幕用它）
+   */
+  async function chat({ text = '', modality = 'text', desktop = null, image = null, images = [], pics = [], screenMode = '', allowPic = false, archive = true, remember = true, channel = '', replyMode = '' } = {}) {
     const s = settings();
     if (!s.chat.enabled) {
       return { ok: false, error: isOrb ? '悬浮球对话已关闭（设置 → 悬浮窗 → 互动）' : '桌宠对话已关闭（设置 → 桌宠 → 对话）' };
@@ -867,6 +993,11 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
 
     inFlight += 1;
     const startedAt = Date.now();
+    // 来源：存档/记忆卡里的「数据类型」。字幕自己传 companion，其余都算桌面窗口。
+    const deskChannel = channel === 'companion' ? 'companion' : 'desktop-orb';
+    const memChannel = deskChannel === 'companion' ? 'companion' : (isOrb ? 'orb' : 'pet');
+    const rp = s.chat.reply;
+    const wantMode = replyMode === 'fast' || replyMode === 'legacy' ? replyMode : rp.mode;
     const history = readHistory();
     const role = roleInfo();
     const owner = ownerInfo();
@@ -890,13 +1021,39 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
         ...(Array.isArray(images) ? images : []),
         ...(image ? [image] : []),
       ].filter((item) => item && item.data).slice(-4);
-      const result = await complete({
-        system,
-        user,
-        maxTokens: mode === 'voice' ? 400 : 700,
-        temperature: s.chat.temperature,
-        images: chatImages.length ? chatImages : null,
-      });
+      let result = null;
+      // ① 原版：交给专属 DSH 会话跑一轮（上下文连续，和 QQ 那边同款 agent 回合）。
+      //    会话自己的历史在 DSH 里，所以不再把【最近聊天】塞进去，避免同一段话说两遍。
+      if (wantMode === 'legacy' && isOrb) {
+        try {
+          const sessionId = agentSessionId(deskChannel);
+          const parts = await buildPromptParts({
+            system,
+            user: `（${owner.name}在桌面的悬浮球里对你说）${say}`,
+            images: chatImages.length ? chatImages : null,
+          });
+          const run = await agent.run({ sessionId, content: parts, timeoutMs: rp.timeoutMs });
+          if (run?.ok && String(run.text || '').trim()) {
+            result = { text: run.text, usage: null, model: 'session' };
+            bumpAgentTurns(history, rp.sessionTurns);
+          } else {
+            pluginLog(`[pet-chat] 原版会话这一轮没吐字（${run?.reason?.kind || 'empty'}），退回直连`);
+          }
+        } catch (error) {
+          // 会话服务不可用/超时：不要整段失败，退回快回复那条直连，保证她还能回话。
+          pluginLog('[pet-chat] 原版会话失败，退回直连：', String(error?.message ?? error).slice(0, 200));
+        }
+      }
+      // ② 快回复（以及原版失败时的兜底）：直连 llm，单轮。
+      if (!result) {
+        result = await complete({
+          system,
+          user,
+          maxTokens: mode === 'voice' ? 400 : (rp.maxTokens || 700),
+          temperature: s.chat.temperature,
+          images: chatImages.length ? chatImages : null,
+        });
+      }
       recordUsage(result.usage, result.model);
       let reply = cleanReply(result.text);
       if (!reply) return { ok: false, error: '她这次没说话（模型返回空）' };
@@ -927,11 +1084,11 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
           name: owner.name,
           type: chatImages.length ? 'mixed' : 'text',
           media: archiveMedia,
-        });
+        }, deskChannel);
         archiveDesktopMessage('assistant', historyText, now, {
           id: aiMessage.id,
           name: role.name,
-        });
+        }, deskChannel);
       }
       const remembered = remember === false ? 0 : rememberEvents(buildPetMemoryEvents({
         userText: say,
@@ -939,6 +1096,7 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
         at: now,
         roleName: role.name,
         screenAware: Boolean(desktop) || Boolean(image),
+        channel: memChannel,
       }));
       lastChatAt = now;
       lastError = '';
@@ -987,12 +1145,13 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
       id: message.id,
       name: roleInfo().name,
       proactive: true,
-    });
+    }, 'desktop-orb');
     const remembered = rememberEvents(buildPetMemoryEvents({
       replyText: body,
       at: now,
       roleName: roleInfo().name,
       screenAware: true,
+      channel: isOrb ? 'orb' : 'pet',
     }));
     lastProactiveAt = now;
     emit({
@@ -1043,7 +1202,10 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
         lastAssistantAt: history.lastAssistantAt,
         busy: inFlight > 0,
         lastChatAt,
+        reply: { ...s.chat.reply },
+        agentSession: agentSessionId(isOrb ? 'desktop-orb' : 'pet'),
       },
+      interop: { ...s.interop },
       proactive: {
         ...s.proactive,
         lastProactiveAt: lastProactiveAt || history.lastProactiveAt || 0,

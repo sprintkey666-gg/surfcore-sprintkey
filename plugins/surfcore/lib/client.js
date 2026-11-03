@@ -896,7 +896,7 @@ F("sessionCwd", "会话工作目录", "留空用 surfcore 根目录", "text", { 
       { group: "二代 · 唤醒与潜水", note: "qq_set_wake_config 的边界", fields: [
         F("socialV2.wake.defaultMode", "默认状态", "diving / active", "select", { options: [["diving", "潜水"], ["active", "活跃"]] }),
         F("socialV2.wake.preSleepWaitEnabled", "沉睡前必须观察", "", "switch"),
-        F("socialV2.wake.preSleepWaitMs", "沉睡前观察时长（ms）", "默认 300000", "number", { min: 10000 }),
+        F("socialV2.wake.preSleepWaitMs", "沉睡前观察时长（ms）", "默认 300000，最小 10000；这次观察不会占「连续等待 2 次」的额度", "number", { min: 10000 }),
         F("socialV2.wake.recommendedDefaultInfinite", "推荐无限期潜水", "", "switch"),
         F("socialV2.wake.sleepMinMs", "潜水最短（ms）", "", "number"),
         F("socialV2.wake.sleepMaxMs", "潜水最长（ms；0=无限）", "", "number"),
@@ -5848,6 +5848,9 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
       const identCfg = chatCfg.ident || {};
       const screenCfg = draft.screen || {};
       const compCfg = draft.companion || {};
+      const interopCfg = draft.interop || {};
+      const chatReply = chatCfg.reply || {};
+      const compReply = compCfg.reply || {};
       // 运行态（含 model visionOk），配置态在上面 draft.screen
       const screenState = st?.screen || {};
     // 下拉框必须跟草稿走：跟运行态走的话，set() 只改草稿，受控 select 会立刻弹回旧值。
@@ -5898,7 +5901,7 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
             h("select", { className: "qbw-input", value: ballCfg.mode ?? "pet", onChange: (e) => set("ball.mode", e.target.value) },
               h("option", { value: "pet" }, "桌宠（dsh-pet 素材）"), h("option", { value: "ball" }, "悬浮球"))),
           petMode === "pet"
-            ? h("div", { style: { marginTop: "6px" } },
+            ? h("div", { "data-pet-box": "1", style: { marginTop: "6px" } },
                 h("div", { className: "qbw-hint" },
                   petState?.mode === "pet"
                     ? `素材已就绪：${petState?.assets?.webmCount || 0} 个动作 / ${Math.round((petState?.assets?.bytes || 0) / 1048576)}MB`
@@ -5907,8 +5910,58 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
                   h(Btn, { kind: "qbw-btn2", onClick: () => act("pet-assets", { action: "install" }, "✓ 桌宠素材已就绪"), disabled: !!busy }, busy === "pet-assets" ? "下载中…" : "下载桌宠素材"),
                   h(Btn, { kind: "qbw-btn2", onClick: () => act("pet-assets", { action: "verify" }, "✓ 校验完成"), disabled: !!busy }, "校验素材"),
                   h(Btn, { kind: "qbw-btn2", onClick: () => act("pet-assets", { action: "remove" }, "✓ 已移除"), disabled: !!busy }, "移除素材")),
-                h("div", { className: "qbw-kv" }, h("span", null, "桌宠大小"), h("span", null, `${ballCfg.petSize ?? 200} px`)),
+
+                h("div", { className: "qbw-kv", style: { marginTop: "10px" } }, h("span", null, "形象包"),
+                  h("span", null, petState?.assets?.activePackName || "内置 · dsh-pet（小鲸鱼）")),
+                h("div", { className: "qbw-hint" }, "形象包 = 一套动作素材（webm/）+ 一份动作清单（config.jsonc 或 pack.json）。内置包来自 dsh-pet（MIT），换皮就是切到别的包。"),
+                h("div", { style: { display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center", marginTop: "6px" } },
+                  h("select", { className: "qbw-input", "data-pet-pack": "1", defaultValue: petState?.assets?.activePackId || "dsh-pet", style: { maxWidth: "320px" } },
+                    ...(petState?.assets?.packs || []).map((p) => h("option", { key: p.id, value: p.id },
+                      `${p.name || p.id} · ${p.webmCount || 0} 个动作${p.builtin ? "（内置）" : ""}`))),
+                  h(Btn, { kind: "qbw-btn2", disabled: !!busy, onClick: (e) => {
+                    const id = e.currentTarget.closest("[data-pet-box]")?.querySelector("[data-pet-pack]")?.value || "";
+                    return act("pet-packs", { action: "activate", id }, "✓ 已切换形象包，球会自己重载");
+                  } }, busy === "pet-packs" ? "切换中…" : "启用这个包")),
+                h("div", { style: { display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center", marginTop: "6px" } },
+                  h("input", { className: "qbw-input", "data-pet-path": "1", placeholder: "动画包路径：文件夹或 .tgz（绝对路径）", style: { maxWidth: "360px" } }),
+                  h(Btn, { kind: "qbw-btn2", disabled: !!busy, onClick: (e) => {
+                    const path = String(e.currentTarget.closest("[data-pet-box]")?.querySelector("[data-pet-path]")?.value || "").trim();
+                    if (!path) { toast("先填动画包路径"); return; }
+                    return act("pet-packs", { action: "import", path }, "✓ 动画包已导入");
+                  } }, busy === "pet-packs" ? "导入中…" : "导入动画包")),
+                h("div", { className: "qbw-hint" },
+                  `包目录：${petState?.assets?.activePackDir || petState?.assets?.dir || "（还没装）"}`,
+                  petState?.assets?.packs?.length > 1 ? ` · 共 ${petState.assets.packs.length} 个包` : ""),
+
+                h("div", { className: "qbw-kv", style: { marginTop: "10px" } }, h("span", null, "动作测试"), h("span", null, "点一下就在桌宠身上播")),
+                h("div", { style: { display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" } },
+                  h("select", { className: "qbw-input", "data-pet-action": "1", defaultValue: "", style: { maxWidth: "320px" } },
+                    h("option", { value: "" }, "选一个动作…"),
+                    ...(() => {
+                      const m = petState?.manifest || {};
+                      const rows = [];
+                      const push = (arr, tag) => { for (const n of arr || []) rows.push(h("option", { key: `${tag}:${n}`, value: n }, `${tag} · ${n}`)); };
+                      push(m.idle, "待机");
+                      push(m.turn, "东张西望");
+                      push(m.clicks, "点击");
+                      push(m.drag, "拖拽");
+                      for (const mv of m.moves || []) rows.push(h("option", { key: `走位:${mv.name}`, value: mv.name }, `走位 · ${mv.name}`));
+                      for (const c of m.categories || []) push(c.actions, c.id || "小动作");
+                      return rows;
+                    })()),
+                  h(Btn, { kind: "qbw-btn2", disabled: !!busy, onClick: (e) => {
+                    const name = e.currentTarget.closest("[data-pet-box]")?.querySelector("[data-pet-action]")?.value || "";
+                    if (!name) { toast("先选一个动作"); return; }
+                    return act("pet-packs", { action: "preview", name }, "✓ 已经让她演了一遍");
+                  } }, "试播")),
+
+                h("div", { className: "qbw-kv", style: { marginTop: "10px" } }, h("span", null, "桌宠大小"), h("span", null, `${ballCfg.petSize ?? 200} px`)),
                 slider(ballCfg.petSize ?? 200, 120, 320, 10, (v) => set("ball.petSize", v)),
+
+                h(Row, { label: "眼睛跟着光标", hint: "她会朝鼠标所在的方向看；光标靠近时偶尔扭头（东张西望）。关掉就只播待机。" },
+                  h("input", { className: "qbw-switch", type: "checkbox", checked: petCfg.gaze?.enabled !== false, onChange: (e) => set("pet.gaze.enabled", e.target.checked) })),
+                h(Row, { label: "让她自己走两步", hint: "待机时会随机走位（会撞到屏幕边就掉头）。不想要就走动动作权重=0。" },
+                  h("input", { className: "qbw-switch", type: "checkbox", checked: petCfg.wander?.enabled !== false, onChange: (e) => set("pet.wander.enabled", e.target.checked) })),
                 h(Row, { label: "单击就开会话", hint: "默认单击只是逗她一下，双击才开会话。" },
                   h("input", { className: "qbw-switch", type: "checkbox", checked: petCfg.singleClickOpens === true, onChange: (e) => set("pet.singleClickOpens", e.target.checked) })))
             : null,
@@ -6008,6 +6061,44 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
           h(Row, { label: "上下文字幕", hint: "保留一问一答，字幕里最多同时显示 3 条；关掉就只显示最新一句。", badge: compCfg.contextSubtitles === true ? "开" : "关" },
             h("input", { className: "qbw-switch", type: "checkbox", checked: compCfg.contextSubtitles === true, onChange: (e) => set("companion.contextSubtitles", e.target.checked) })),
           h("div", { className: "qbw-hint" }, "点字幕回她；按住 Ctrl+Alt 展开历史，松开收回。桌宠会在陪伴期间自动隐藏，关闭后回来。")),
+
+        h(Section, { title: "记忆互通（和 QQ / B站）", defaultOpen: false, note: "开了就是「同一个她」：悬浮窗会话、陪伴字幕、桌宠与 QQ、B站 共用同一张记忆卡，还能看到彼此最近说过的话。以前只有「互通记忆」一个总闸，现在是这几项细分。" },
+          h(Row, { label: "互通 QQ", hint: "读 QQ 那边的记忆卡（她记得 QQ 里聊过什么）；这边聊的也写进同一张卡。关掉 = 这边只记得自己说过的话。", badge: interopCfg.qq !== false ? "开" : "关" },
+            h("input", { className: "qbw-switch", type: "checkbox", checked: interopCfg.qq !== false, onChange: (e) => set("interop.qq", e.target.checked) })),
+          h(Row, { label: "互通 B站", hint: "读 B站 那边的记忆卡。B站 卡本来就只放公开内容，隐私的不会漏过来。", badge: interopCfg.bili !== false ? "开" : "关" },
+            h("input", { className: "qbw-switch", type: "checkbox", checked: interopCfg.bili !== false, onChange: (e) => set("interop.bili", e.target.checked) })),
+          h(Row, { label: "注入身份", hint: "告诉她「她叫什么、主人是谁、这台电脑是主人的、现在不是群里说话」——不注入的话她有时会当成在群里。", badge: interopCfg.identity !== false ? "开" : "关" },
+            h("input", { className: "qbw-switch", type: "checkbox", checked: interopCfg.identity !== false, onChange: (e) => set("interop.identity", e.target.checked) })),
+          h(Row, { label: "带上别处最近的对话", hint: "把 QQ / 悬浮窗 / 字幕 最近聊过的几句一起塞进去，她就知道刚才在别处说到哪了。", badge: interopCfg.recent !== false ? "开" : "关" },
+            h("input", { className: "qbw-switch", type: "checkbox", checked: interopCfg.recent !== false, onChange: (e) => set("interop.recent", e.target.checked) })),
+          h(Row, { label: "最近对话行数", hint: "带上几条（4~40）。太多会把记忆卡挤掉。", badge: `${interopCfg.recentLines ?? 12} 行` },
+            h("input", { className: "qbw-input", type: "number", min: 4, max: 40, value: interopCfg.recentLines ?? 12, style: { maxWidth: "110px" }, onChange: (e) => set("interop.recentLines", Number(e.target.value)) })),
+          h(Row, { label: "最近对话时间窗", hint: "只带这么多小时内的（1~168 小时）。", badge: `${interopCfg.recentHours ?? 24} 小时` },
+            h("input", { className: "qbw-input", type: "number", min: 1, max: 168, value: interopCfg.recentHours ?? 24, style: { maxWidth: "110px" }, onChange: (e) => set("interop.recentHours", Number(e.target.value)) })),
+          h(Row, { label: "人格卡上限", hint: "整张角色卡最多注入多少字。以前写死 4200 字，16KB 的角色卡后半截她根本没见过。", badge: `${Math.round((interopCfg.personaMaxChars ?? 12000) / 1000)}k 字` },
+            h("input", { className: "qbw-input", type: "number", min: 4000, max: 30000, step: 500, value: interopCfg.personaMaxChars ?? 12000, style: { maxWidth: "120px" }, onChange: (e) => set("interop.personaMaxChars", Number(e.target.value)) })),
+          h(Row, { label: "记忆注入上限", hint: "记忆卡整块最多注入多少字；超了从后面砍。", badge: `${Math.round((interopCfg.memoryMaxChars ?? 8000) / 1000)}k 字` },
+            h("input", { className: "qbw-input", type: "number", min: 2000, max: 20000, step: 500, value: interopCfg.memoryMaxChars ?? 8000, style: { maxWidth: "120px" }, onChange: (e) => set("interop.memoryMaxChars", Number(e.target.value)) })),
+          h("div", { className: "qbw-hint" }, "下面两套「回复速度」各自独立，互不影响；改完保存即生效（悬浮窗下一次说话就按新的走）。")),
+
+        h(Section, { title: "回复速度（会话 / 字幕）", defaultOpen: false, note: "原版 = 专门开一个 DSH 会话跑（上下文连续，和 QQ 那边同款回合，越聊越慢）；快回复 = 直连模型单轮（快，每句都从记忆卡重建上下文）。" },
+          h(Row, { label: "会话用哪套", hint: "悬浮窗里打字聊天走哪条路。", badge: chatReply.mode === "fast" ? "快回复" : "原版" },
+            h("select", { className: "qbw-select", value: chatReply.mode === "fast" ? "fast" : "legacy", onChange: (e) => set("chat.reply.mode", e.target.value) },
+              h("option", { value: "legacy" }, "原版（专属会话）"),
+              h("option", { value: "fast" }, "快回复（直连单轮）"))),
+          h(Row, { label: "单轮超时", hint: "原版一回合最多等多久；超时会退回快回复，不让她彻底哑掉。", badge: `${Math.round((chatReply.timeoutMs ?? 180000) / 1000)} 秒` },
+            h("input", { className: "qbw-input", type: "number", min: 30, max: 600, value: Math.round((chatReply.timeoutMs ?? 180000) / 1000), style: { maxWidth: "110px" }, onChange: (e) => set("chat.reply.timeoutMs", Number(e.target.value) * 1000) })),
+          h(Row, { label: "每几轮换会话", hint: "0 = 永远不换（上下文最连贯，也最容易越聊越慢）；填 8 = 每 8 轮换一个新会话。", badge: (chatReply.sessionTurns ?? 0) > 0 ? `每 ${chatReply.sessionTurns} 轮` : "不换" },
+            h("input", { className: "qbw-input", type: "number", min: 0, max: 60, value: chatReply.sessionTurns ?? 0, style: { maxWidth: "110px" }, onChange: (e) => set("chat.reply.sessionTurns", Number(e.target.value)) })),
+          h(Row, { label: "字幕用哪套", hint: "陪伴模式字幕每看一眼都可能说话，默认快回复；想让她连着聊就切原版。", badge: compReply.mode === "legacy" ? "原版" : "快回复" },
+            h("select", { className: "qbw-select", value: compReply.mode === "legacy" ? "legacy" : "fast", onChange: (e) => set("companion.reply.mode", e.target.value) },
+              h("option", { value: "fast" }, "快回复（直连单轮）"),
+              h("option", { value: "legacy" }, "原版（专属会话）"))),
+          h(Row, { label: "字幕也写记忆", hint: "字幕里说过的话写进记忆卡（带「字幕」标记）。关掉 = 只是屏幕上飘一句，不进记忆。", badge: compCfg.remember !== false ? "开" : "关" },
+            h("input", { className: "qbw-switch", type: "checkbox", checked: compCfg.remember !== false, onChange: (e) => set("companion.remember", e.target.checked) })),
+          h(Row, { label: "字幕也进聊天存档", hint: "字幕对话存进「聊天全量存档」（companion-subtitle），和 QQ 一样能翻。", badge: compCfg.archive !== false ? "开" : "关" },
+            h("input", { className: "qbw-switch", type: "checkbox", checked: compCfg.archive !== false, onChange: (e) => set("companion.archive", e.target.checked) }))),
+
 
         h(Section, { title: "悬浮窗发图", defaultOpen: false, note: "只影响这个悬浮窗里的「图」按钮。和 QQ 那边的「发图」总开关是两套：那边关了这边照样能发，这边不开不影响 QQ。" },
           h(Row, { label: "允许在悬浮窗发图", hint: "开了面板顶部才出现「图」按钮。点了会按「QQ 表情 → 本地图库 → 现场生图」的顺序自己找一张。", badge: picCfg.enabled === true ? "开" : "关" },

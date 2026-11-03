@@ -131,7 +131,7 @@ await asyncCheck('reply 发布主人消息并回一句', async () => {
   t.service.stop();
 });
 
-await asyncCheck('字幕消息交给存档回调，内部模型调用不重复存档', async () => {
+await asyncCheck('字幕消息交给存档回调，内部模型调用按配置存档', async () => {
   const seen = [];
   let archiveOption = null;
   const t = await setup({
@@ -141,10 +141,21 @@ await asyncCheck('字幕消息交给存档回调，内部模型调用不重复�
   await t.service.start({ sessionId: 'arch' });
   const result = await t.service.reply('在吗');
   assert.equal(result.ok, true);
+  // 1.1.0 起字幕对话默认也进聊天存档/记忆卡（主人在 2026-11-03 要的「记忆互通」）；
+  // 关掉的话仍然只走 onMessage 那条回调，不重复写。
+  assert.equal(archiveOption, true);
+  assert.equal(t.service.status().archive, true);
+  const t2 = await setup({
+    onMessage: () => {},
+    chat: { chat: async (opts) => { archiveOption = opts.archive; return { ok: true, reply: { text: '接上了' } }; } },
+  });
+  t2.setConfig({ screen: { enabled: true, deleteAfterRead: false }, companion: { enabled: true, intervalSec: 20, archive: false, remember: false } });
+  await t2.service.start({ sessionId: 'arch2' });
+  await t2.service.reply('在吗');
   assert.equal(archiveOption, false);
   assert.ok(seen.some((m) => m.channel === 'companion' && m.role === 'user' && m.text === '在吗'));
-  assert.ok(seen.some((m) => m.channel === 'companion' && m.role === 'assistant' && m.text === '接上了'));
   t.service.stop();
+  t2.service.stop();
 });
 
 await asyncCheck('连续截图失败只降级不自动停', async () => {

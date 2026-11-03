@@ -2,7 +2,7 @@
 //
 // 它们不走 QQ 的 sendMessagesV2，也不该把桌宠消息伪造成 QQ 消息；这里复用
 // chat-archive 的目录/滚动/去重逻辑，用 channel 区分来源，kind 固定 private。
-import { createChatArchiveWriter, classifyType } from '../../../src/chat-archive.js';
+import { createChatArchiveWriter, classifyType, readRecentChatRecords, chatArchiveRoot } from '../../../src/chat-archive.js';
 import { defaultBackupDir } from '../../../src/memory-backup.js';
 
 export const DESKTOP_CHANNELS = Object.freeze(['desktop-orb', 'companion']);
@@ -88,5 +88,25 @@ export function createDesktopArchive({ dshHome = '', readConfig, getCharacterId,
     });
   }
 
-  return { record, status: writer.status, writer };
+  // 存档根目录：和写入口完全同一套解析，读的时候才不会读错地方。
+  function root() {
+    const cfg = config();
+    const dir = String(cfg.dir || '').trim();
+    const baseDir = dir || defaultBackupDir(dshHome, charId());
+    return baseDir ? chatArchiveRoot({ baseDir, characterId: charId() }) : '';
+  }
+
+  /**
+   * 读跨端最近对话（QQ / 悬浮窗 / 陪伴字幕 全在同一棵树下）——
+   * 给悬浮窗会话和陪伴字幕当「别处刚聊了什么」的上下文。
+   */
+  function recent({ limit = 12, hours = 24, nowMs = now() } = {}) {
+    const dir = root();
+    if (!dir) return [];
+    try {
+      return readRecentChatRecords(dir, { sinceMs: nowMs - Math.max(1, hours) * 3600_000, limit });
+    } catch { return []; }
+  }
+
+  return { record, status: writer.status, writer, root, recent };
 }

@@ -99,6 +99,32 @@ const SOURCE_PLATFORM = {
   system: 'shared',
 };
 
+/**
+ * 桌面链路的「数据类型」：platform 都是 pet，靠 channel 区分是谁在说话。
+ *   pet = 桌宠本体、orb = 悬浮窗会话、companion = 陪伴字幕。
+ * 记忆卡标题/标签会带上这个标记，注入提示词后她也知道「这话是在字幕里说的」。
+ */
+export const DESK_CHANNELS = Object.freeze(['pet', 'orb', 'companion', 'desktop']);
+export const DESK_CHANNEL_LABEL = Object.freeze({
+  pet: '桌宠',
+  orb: '悬浮窗',
+  companion: '字幕',
+  desktop: '桌面',
+});
+
+export function normalizeDeskChannel(value) {
+  const s = String(value || '').trim().toLowerCase();
+  if (s === 'desktop-orb' || s === 'orb') return 'orb';
+  if (s === 'companion' || s === 'subtitle') return 'companion';
+  if (s === 'pet') return 'pet';
+  if (s === 'desktop') return 'desktop';
+  return '';
+}
+
+export function deskChannelLabel(value) {
+  return DESK_CHANNEL_LABEL[normalizeDeskChannel(value)] || DESK_CHANNEL_LABEL.pet;
+}
+
 // 情绪浓度：决定「重不重要」的主要信号之一。
 const EMOTION_STRONG_RE = /喜欢|想念|想你|舍不得|难过|委屈|哭|心疼|感动|害怕|孤单|抱歉|对不起|谢谢|抱抱|亲亲|陪伴|永远|最爱|在乎|重要/g;
 const EMOTION_MEDIUM_RE = /开心|高兴|笑死|可爱|温柔|生气|烦|郁闷|害羞|讨厌|夸|凶|累|困|饿|紧张|激动|委屈/g;
@@ -1210,6 +1236,9 @@ function makeRecord(input, config, now) {
     botReply: String(input.botReply ?? '').slice(0, 600),
     isSelf: input.isSelf === true,
     conversationKey: String(input.conversationKey ?? ''),
+    // 桌面三条链路（桌宠 / 悬浮窗会话 / 陪伴字幕）共用 platform='pet'，
+    // 用 channel 记住这句话到底是在哪儿说的，注入提示词时能带上来源。
+    channel: String(input.channel ?? ''),
     initialTier: '',
     initialProbability: 0,
     isInitial: false,
@@ -1310,6 +1339,10 @@ export function ingestInboxLines(card, lines, config = {}, now = Date.now()) {
     //   · 主人的话 → pet-owner；她紧接着的回复并进 botReply，形成一问一答；
     //   · 没有对应主人的主动搭话 → pet-self（重要度低一点，避免挤掉 QQ 的私聊）。
     if (String(item.platform ?? '').toLowerCase() === 'pet') {
+      // 「数据类型」：桌宠 / 悬浮窗会话 / 陪伴字幕 三条桌面链路都算 platform='pet'，
+      // 靠 item.channel 再用子类型分开写，标题和标签都带上来源，注入提示词后能看出这话在哪说的。
+      const deskChannel = normalizeDeskChannel(item.channel) || 'pet';
+      const deskLabel = deskChannelLabel(deskChannel);
       if (item.isSelf === true) {
         const cutoff = 30 * 60 * 1000;
         const recent = card.records
@@ -1330,8 +1363,9 @@ export function ingestInboxLines(card, lines, config = {}, now = Date.now()) {
           sourceId: '',
           platform: 'pet',
           scope: 'pet',
+          channel: deskChannel,
           text,
-          title: `桌宠 · ${speaker}主动说：${short(text, 22)}`,
+          title: `${deskLabel} · ${speaker}主动说：${short(text, 22)}`,
           isSelf: true,
           isPrivate: true,
           direct: true,
@@ -1340,7 +1374,7 @@ export function ingestInboxLines(card, lines, config = {}, now = Date.now()) {
           speaker,
           private: true,
           conversationKey: 'pet',
-          tags: ['pet', 'self'],
+          tags: ['pet', 'self', deskChannel],
           // 没带标记的来源一律按「看屏幕」处理（fail closed）：宁可少记一条 B站 素材，
           // 也不把「复述主人屏幕」的东西带出去。新代码会显式传 true/false。
           screenSeen: item.screenVision !== false,
@@ -1358,8 +1392,9 @@ export function ingestInboxLines(card, lines, config = {}, now = Date.now()) {
         sourceId: '',
         platform: 'pet',
         scope: 'pet',
+        channel: deskChannel,
         text,
-        title: `桌宠 · 和主人：${short(text, 22)}`,
+        title: `${deskLabel} · 和主人：${short(text, 22)}`,
         isOwner: true,
         isPrivate: true,
         direct: true,
@@ -1368,7 +1403,7 @@ export function ingestInboxLines(card, lines, config = {}, now = Date.now()) {
         speaker: '主人',
         private: true,
         conversationKey: 'pet',
-        tags: ['pet', 'owner'],
+        tags: ['pet', 'owner', deskChannel],
         screenSeen: item.screenVision !== false,
       }, cfg, now);
       if (result.added) {

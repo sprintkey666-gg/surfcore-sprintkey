@@ -231,7 +231,7 @@ export function apply(ctx) {
     },
   });
   // 桌宠对话与「目的机制」的桌宠载体：和 QQ / B站 共用当前角色的人格卡、记忆卡、目的状态。
-  const petChat = createPetChatService({ ctx, stateDir: STATE_DIR, pluginLog, tokenBudget, archiveMessage: desktopArchive.record });
+  const petChat = createPetChatService({ ctx, stateDir: STATE_DIR, pluginLog, tokenBudget, archiveMessage: desktopArchive.record, readRecent: desktopArchive.recent });
   const petPurpose = createPetPurposeService({ chat: petChat, tokenBudget, pluginLog, callBridge });
   const petApi = createPetApiService({
     chat: petChat,
@@ -293,7 +293,7 @@ export function apply(ctx) {
     archiveMessage: desktopArchive.record,
   });
   // 悬浮球对话：同一个人格卡 / 记忆卡 / 模型，历史单独放（profile='orb'）。
-  const orbChat = createPetChatService({ ctx, stateDir: STATE_DIR, pluginLog, tokenBudget, profile: 'orb', archiveMessage: desktopArchive.record });
+  const orbChat = createPetChatService({ ctx, stateDir: STATE_DIR, pluginLog, tokenBudget, profile: 'orb', archiveMessage: desktopArchive.record, readRecent: desktopArchive.recent });
   const orbApi = createOrbApiService({
     orb: orbService,
     chat: orbChat,
@@ -2287,6 +2287,19 @@ if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output 
       if (method !== 'POST') { json(res, 405, { ok: false, error: '只支持 POST' }); return; }
       const body = JSON.parse((await readBody(req)) || '{}');
       // 桌宠素材：下载 / 移除 / 校验（52MB，按需下，不进 git）
+      if (suffix === '/pet-packs') {
+        // 换皮：packs 目录、导入 .tgz/文件夹、切换、试播、删除。逻辑全在 pet-packs.js，
+        // 这里只负责「切完之后把 host.json 刷一遍」——不刷的话桌面端永远用旧包。
+        const result = await orbService.petAssets.packs.handleAction(body || {});
+        const action = String(body?.action || '').trim();
+        if (action === 'activate' || action === 'import' || action === 'remove') {
+          try { orbApi.writeHostFile(true); } catch (error) {
+            pluginLog('[orb] 换包后刷新 host.json 失败：', String(error?.message ?? error));
+          }
+        }
+        json(res, 200, result);
+        return;
+      }
       if (suffix === '/pet-assets') {
         const action = String(body.action || '').trim();
         if (action === 'install') {

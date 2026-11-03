@@ -58,6 +58,9 @@ let companionActive = false;
 let petHiddenByCompanion = false;
 let hiddenByUser = false;
 let companionDrag = null;
+// 字幕窗状态去重：内容没变就不往渲染端发，避免每 3 秒全量重绘一次（闪的第二个来源）。
+let companionSig = '';
+let lastCompanionState = null;
 
 function bandFor() {
   return Math.max(PET_BUBBLE_SPACE, Math.round(Number(bubbleBand) || 0));
@@ -195,6 +198,75 @@ function clampForMode(x, y, width, height) {
     y: Math.min(Math.max(y, minY), Math.max(minY, maxY)),
   };
 }
+
+// #region pure-window-state
+// 这一段只放「不依赖 Electron 的纯函数」：scripts/test-orb-window-state.mjs 会把两条标记
+// 之间的代码抽出来直接跑断言。改逻辑时只用参数、别碰全局，否则测试和主进程会各说各话。
+//
+// 为什么单独抽出来：窗口状态机（隐藏/显示/陪伴）、宽度容差、高度网格、底边锚定这几件事
+// 以前散在 IPC 回调和轮询里，每处各写一份判断、互相打架——「隐藏了又被拉回来」
+// 「每 3 秒纠一次宽」「高度一变顶边就跳」都是这么来的。
+
+/** 字幕窗该不该显示：只有陪伴生效、且用户没主动隐藏时才允许 showInactive。 */
+function companionShouldShow(companionActive, hiddenByUser) {
+  return Boolean(companionActive) && !hiddenByUser;
+}
+
+/** 托盘单击该做什么：当前有窗口露在屏幕上就隐，否则显示。 */
+function trayToggleAction({ companionActive, mainVisible, companionVisible }) {
+  const shown = companionActive ? Boolean(companionVisible) : Boolean(mainVisible);
+  return shown ? 'hide' : 'show';
+}
+
+/** 「从托盘唤醒」要恢复哪个窗口：陪伴模式只回字幕窗，桌宠保持隐藏。 */
+function restoreSurface(companionActive) {
+  return companionActive ? 'companion' : 'main';
+}
+
+/**
+ * 宽度是否已收敛。
+ * setBounds 写 738、getBounds 回读 740 是常态（非客户区 + 175% 缩放取整），
+ * 用严格相等判断就永远收敛不了 → 每 3 秒真改一次宽度 → 重折行 → 高度变 → 顶边跳。
+ */
+function widthConverged(actual, wanted, tolerance = 4) {
+  return Math.abs(Number(actual) - Number(wanted)) <= tolerance;
+}
+
+/**
+ * 字幕高度上报判定：按 8px 网格取整，和当前高度差不到 12px 就不上报。
+ * 返回 null = 不动窗口；返回数字 = 上报这个高度。
+ */
+function snapCompanionHeight(measured, current, { grid = 8, minDelta = 12, min = 56 } = {}) {
+  const raw = Number(measured);
+  if (!Number.isFinite(raw)) return null;
+  const snapped = Math.max(min, Math.round(raw / grid) * grid);
+  const base = Number(current);
+  if (Number.isFinite(base) && base > 0 && Math.abs(snapped - base) < minDelta) return null;
+  return snapped;
+}
+
+/**
+ * 底边锚定：高度变化时脚底不动，只在越界时向上让位（绝不下移）。
+ * 旧实现把 y 往下夹到 area.bottom-40，内容变矮时窗口一路往下沉，是漂移的根因。
+ */
+function anchorCompanionBottom(bounds, wantedHeight, area, { min = 56, max = 560, margin = 8, headroom = 4 } = {}) {
+  const bottom = bounds.y + bounds.height;
+  let height = Math.round(Math.min(Math.max(Number(wantedHeight) || bounds.height, min), Math.min(max, area.height - 16)));
+  let y = bottom - height;
+  if (y < area.y + headroom) {
+    y = area.y + headroom;
+    height = Math.min(height, Math.max(min, area.y + area.height - margin - y));
+  }
+  if (y + height > area.y + area.height - margin) y = area.y + area.height - margin - height;
+  return { x: bounds.x, y, width: bounds.width, height };
+}
+
+/** 字幕窗宽度上限：建窗、轮询纠宽、拖宽手柄三处必须同一个值，否则每 3 秒互相打一次架。 */
+function companionMaxWidth(areaWidth) {
+  const width = Math.round(Number(areaWidth) || 0);
+  return Math.min(1400, Math.max(520, width - 24));
+}
+// #endregion pure-window-state
 
 function readPrefs() {
   try {
@@ -493,12 +565,21 @@ function trayImage() {
   }
 }
 
+let trayMenuSig = '';
+
 function updateTrayMenu() {
   if (!tray) return;
-  const visible = Boolean(win && !win.isDestroyed() && win.isVisible());
+  const mainVisible = Boolean(win && !win.isDestroyed() && win.isVisible());
+  const companionVisible = Boolean(companionWin && !companionWin.isDestroyed() && companionWin.isVisible());
+  const visible = companionActive ? companionVisible : mainVisible;
+  // 每 3 秒重建一次菜单会连带刷新托盘图标/tooltip；只在状态真的变了才重建。
+  const sig = `${visible}|${companionActive}|${hiddenByUser}`;
+  if (sig === trayMenuSig) return;
+  trayMenuSig = sig;
+  const showLabel = companionActive ? '显示陪伴字幕' : '显示桌宠';
   tray.setContextMenu(Menu.buildFromTemplate([
     {
-      label: visible ? '隐藏到托盘' : '显示桌宠',
+      label: visible ? '隐藏到托盘' : showLabel,
       click: () => { void toggleWindow(); },
     },
     {
@@ -513,9 +594,26 @@ function updateTrayMenu() {
 
 async function hideWindow() {
   if (!win || win.isDestroyed()) return false;
-  if (expanded) await setExpanded(false);
-  try { win.hide(); } catch (error) { log('[orb] 隐藏窗口失败', String(error?.message ?? error)); return false; }
+  // 隐藏前先停掉所有还会改窗口状态的定时器：8ms 一帧的展开动画、16ms 一帧的字幕拖动。
+  // 否则 hide() 之后它们还会把窗口 setBounds 回来（「点了隐藏，桌宠还留在桌面上」的一半原因）。
+  if (animTimer) { clearInterval(animTimer); animTimer = null; }
+  animating = false;
+  pendingExpand = null;
+  if (companionDrag) { clearInterval(companionDrag.timer); companionDrag = null; }
+  // 不播收起动画（170ms 里窗口还露着），直接标成收起态再藏；位置仍由 ballRect 记住。
+  expanded = false;
+  displayMode = 'collapsed';
+  bubbleBand = 0;
   hiddenByUser = true;
+  // 字幕窗也要一起藏：以前只 win.hide()，陪伴模式下字幕条还留在桌面上。
+  if (companionWin && !companionWin.isDestroyed()) {
+    try { companionWin.hide(); } catch {}
+  }
+  try { win.hide(); } catch (error) {
+    hiddenByUser = false;
+    log('[orb] 隐藏窗口失败', String(error?.message ?? error));
+    return false;
+  }
   stopClickWatch();
   updateTrayMenu();
   try { win.webContents.send('orb:hidden'); } catch {}
@@ -526,9 +624,39 @@ async function hideWindow() {
 function showWindow() {
   if (!win || win.isDestroyed()) return false;
   hiddenByUser = false;
+  // 陪伴模式：只回字幕窗，桌宠继续藏着（两个窗口同屏会挡视线）。
+  if (restoreSurface(companionActive) === 'companion') {
+    petHiddenByCompanion = true;
+    ensureCompanionWindow(lastCompanionState || { active: true });
+    if (companionWin && !companionWin.isDestroyed()) {
+      try { companionWin.showInactive(); } catch {}
+      try {
+        if (!companionWin.isAlwaysOnTop()) companionWin.setAlwaysOnTop(true, 'screen-saver', 1);
+        companionWin.moveTop();
+      } catch {}
+      try { sendCompanionState(lastCompanionState || { active: true }); } catch {}
+    }
+    updateTrayMenu();
+    log('[orb] 已从托盘唤醒（陪伴字幕）');
+    return true;
+  }
+  // 隐藏时窗口停在面板尺寸上：先按 ballRect 恢复成收起态再显示，避免「一唤醒就是一整块面板」。
+  // 已经可见（比如面板开着时又被叫醒）就不动尺寸，别把展开态缩回去。
+  if (!win.isVisible()) {
+    try {
+      const base = baseSize();
+      const anchor = ballRect || win.getBounds();
+      // 走 applyBounds：跟其它所有写窗口的地方一样过一遍 clampForMode（屏幕换了也夹得回来）。
+      const next = applyBounds({ x: anchor.x, y: anchor.y, width: base.width, height: base.height }, 'restore');
+      if (next) win.setBounds(next);
+    } catch {}
+  }
   try { win.showInactive(); } catch { try { win.show(); } catch {} }
-  try { win.setAlwaysOnTop(true, 'screen-saver'); win.moveTop(); } catch {}
-  try { win.setIgnoreMouseEvents(false); } catch {}
+  try {
+    if (!win.isAlwaysOnTop()) win.setAlwaysOnTop(true, 'screen-saver');
+    win.moveTop();
+    win.setIgnoreMouseEvents(false);
+  } catch {}
   startClickWatch();
   updateTrayMenu();
   try { win.webContents.send('orb:shown'); } catch {}
@@ -538,7 +666,13 @@ function showWindow() {
 
 function toggleWindow() {
   if (!win || win.isDestroyed()) return false;
-  return win.isVisible() ? hideWindow() : showWindow();
+  // 陪伴模式下 win 一直是隐藏的：不能只问 win.isVisible()，否则托盘永远只会「显示」。
+  const action = trayToggleAction({
+    companionActive,
+    mainVisible: win.isVisible(),
+    companionVisible: Boolean(companionWin && !companionWin.isDestroyed() && companionWin.isVisible()),
+  });
+  return action === 'hide' ? hideWindow() : showWindow();
 }
 
 function createTray() {
@@ -577,6 +711,9 @@ function createWindow() {
     backgroundColor: '#00000000',
     hasShadow: false,
     resizable: false,
+    // 无边框窗不要再带 WS_THICKFRAME：它会让 setBounds 的回读比写入多 2px（175% 缩放下尤其明显），
+    // 于是「纠偏 → 回读仍不符 → 再纠偏」永远收敛不了，每 3 秒真改一次尺寸，还连带重折行。
+    thickFrame: false,
     movable: true,
     skipTaskbar: true,
     focusable: true,
@@ -643,7 +780,8 @@ function companionLayout(state = {}) {
   const area = screen.getPrimaryDisplay().workArea;
   const saved = prefs.companion || {};
   // 用户拖过宽度就以本机 prefs 为准，避免服务端旧 state 每次轮询把宽度打回去。
-  const width = Math.min(Math.max(Number(saved.width) || Number(state.width) || 900, 520), Math.min(1400, area.width - 24));
+  // 上限和 companion:width 用同一个（companionMaxWidth），否则拖宽之后每 3 秒被打回去一次。
+  const width = Math.min(Math.max(Number(saved.width) || Number(state.width) || 900, 520), companionMaxWidth(area.width));
   const font = Math.min(Math.max(Number(saved.fontPx) || Number(state.fontPx) || 22, 14), 40);
   const height = Math.round(Math.min(180, Math.max(72, font * 2.3 + 44)));
   const wantX = Number.isFinite(saved.x) ? saved.x : area.x + Math.round((area.width - width) / 2);
@@ -659,26 +797,49 @@ function forceCompanionTopmost(win) {
     const hwnd = handle.length >= 8 ? handle.readBigUInt64LE(0).toString() : String(handle.readUInt32LE(0));
     const ps = [
       "Add-Type -Namespace Native -Name Win -MemberDefinition '[DllImport(\"user32.dll\")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int cx, int cy, uint f);';",
-      `[Native.Win]::SetWindowPos([IntPtr]${hwnd},[IntPtr](-1),0,0,0,0,0x0043) | Out-Null`,
+      // 0x0013 = SWP_NOSIZE(1) | SWP_NOMOVE(2) | SWP_NOACTIVATE(0x10)。
+      // 以前带 0x0040(SWP_SHOWWINDOW)，等于每 800ms 又把窗口「显示」一次：位置/可见性回读一变，
+      // 透明窗就重合成一帧，看起来就是字幕背景在闪。
+      `[Native.Win]::SetWindowPos([IntPtr]${hwnd},[IntPtr](-1),0,0,0,0,0x0013) | Out-Null`,
     ].join(' ');
     require('node:child_process').spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', ps], { windowsHide: true, stdio: 'ignore' });
   } catch {}
 }
 
+/** 给字幕窗发状态：内容没变就不发（每 3 秒全量重绘是「字幕背景一直闪」的第二来源）。 */
+function companionStateSignature(state) {
+  try { return JSON.stringify(state); } catch { return `${Date.now()}`; }
+}
+
+function sendCompanionState(state) {
+  if (!companionWin || companionWin.isDestroyed()) return;
+  const sig = companionStateSignature(state);
+  if (sig === companionSig) return;
+  companionSig = sig;
+  try { companionWin.webContents.send('companion:state', state); } catch {}
+}
+
 function ensureCompanionWindow(state = {}) {
+  // 用户点了「隐藏到托盘」：状态照收，但不许建窗、不许 showInactive——
+  // 以前这里每 3 秒把已经藏起来的字幕窗拉回来一次，主人看到的就是「藏了又自己冒出来」。
+  if (!companionShouldShow(companionActive, hiddenByUser)) return companionWin;
   const layout = companionLayout(state);
   if (companionWin && !companionWin.isDestroyed()) {
     try {
       const b = companionWin.getBounds();
       // 高度由字幕窗自己按模式量出来（单条/上下文/历史/输入），主进程不跟它抢。
-      if (b.width !== layout.width) {
+      // 宽度只在「真的没收敛」时才改：setBounds 回读经常比写入多 0~4px，严格比较会每 3 秒改一次。
+      if (!widthConverged(b.width, layout.width)) {
         companionWin.setBounds({ x: b.x, y: b.y, width: layout.width, height: b.height });
       }
-      if (!companionWin.isVisible()) companionWin.showInactive();
-      try { companionWin.setAlwaysOnTop(false); } catch {}
-      companionWin.setAlwaysOnTop(true, 'screen-saver', 1);
-      companionWin.moveTop();
-      companionWin.webContents.send('companion:state', state);
+      if (!companionWin.isVisible()) {
+        companionWin.showInactive();
+        // 字幕窗的显示/隐藏不经过主窗口，托盘菜单得自己跟上（sig 缓存，重复调用很便宜）。
+        updateTrayMenu();
+      }
+      // setAlwaysOnTop 每次都会走一遍 DWM 窗口样式刷新：先问一句再设，别再 false→true 折腾一遍。
+      if (!companionWin.isAlwaysOnTop()) companionWin.setAlwaysOnTop(true, 'screen-saver', 1);
+      sendCompanionState(state);
     } catch {}
     return companionWin;
   }
@@ -688,6 +849,8 @@ function ensureCompanionWindow(state = {}) {
     frame: false,
     transparent: true,
     resizable: false,
+    // 同上：读回值和写入值差 2px 会让「纠宽 → 回读不符 → 再纠宽」无限循环。
+    thickFrame: false,
     movable: true,
     minimizable: false,
     maximizable: false,
@@ -704,43 +867,58 @@ function ensureCompanionWindow(state = {}) {
     },
   });
   companionWin.setAlwaysOnTop(true, 'screen-saver', 1);
-  try { companionWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true }); } catch {}
+  // Windows 上不要调 setVisibleOnAllWorkspaces：DWM 会直接把窗口 cloaked
+  //（Electron 里 isVisible() 为 true，屏幕上一片空）。只有 macOS 需要它。
+  if (process.platform === 'darwin') {
+    try { companionWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true }); } catch {}
+  }
   companionWin.loadFile(path.join(__dirname, 'companion.html'));
   companionWin.once('ready-to-show', () => {
     if (!companionWin || companionWin.isDestroyed()) return;
-    companionWin.show();
-    try { companionWin.setAlwaysOnTop(false); } catch {}
-    try { companionWin.setAlwaysOnTop(true, 'screen-saver', 1); companionWin.moveTop(); } catch {}
+    // 建窗和显示之间用户可能已经点了隐藏：这里再确认一次，别把隐藏的字幕窗又 show 出来。
+    if (!companionShouldShow(companionActive, hiddenByUser)) return;
+    companionWin.showInactive();
+    try {
+      if (!companionWin.isAlwaysOnTop()) companionWin.setAlwaysOnTop(true, 'screen-saver', 1);
+      companionWin.moveTop();
+    } catch {}
     forceCompanionTopmost(companionWin);
     setTimeout(() => forceCompanionTopmost(companionWin), 800);
-    companionWin.webContents.send('companion:state', state);
+    // 首次要发：先清掉去重指纹，否则 sendCompanionState 会把它当成「内容没变」吞掉。
+    companionSig = '';
+    sendCompanionState(state);
   });
-  companionWin.on('closed', () => { companionWin = null; });
+  companionWin.on('closed', () => { companionWin = null; companionSig = ''; });
+  companionWin.on('show', () => updateTrayMenu());
+  companionWin.on('hide', () => updateTrayMenu());
   log('[companion] 字幕窗已创建');
   return companionWin;
 }
 
 function closeCompanionWindow() {
   if (companionDrag) { clearInterval(companionDrag.timer); companionDrag = null; }
+  companionSig = '';
   if (!companionWin || companionWin.isDestroyed()) { companionWin = null; return; }
   try { companionWin.destroy(); } catch {}
   companionWin = null;
 }
 
 function syncCompanion(state) {
+  // 记住最近一次状态：用户从托盘唤醒陪伴模式时，靠它把字幕窗按「此刻该显示什么」建回来。
+  lastCompanionState = state || null;
   const active = state?.active === true;
   if (active) {
     if (!companionActive) {
       companionActive = true;
+      // 陪伴生效时把桌宠藏起来；用户本来就隐藏着的话什么都不做（否则会「假装显示了一次」）。
       if (win && !win.isDestroyed() && win.isVisible()) {
         win.hide();
         petHiddenByCompanion = true;
         stopClickWatch();
-        updateTrayMenu();
       }
+      updateTrayMenu();
     }
     ensureCompanionWindow(state);
-    updateTrayMenu();
     return;
   }
   if (companionActive) {
@@ -764,12 +942,14 @@ async function toggleCompanionFromTray(active) {
     dialog.showErrorBox('陪伴模式', String(result.error || '开启失败'));
     return;
   }
+  // syncCompanion 里已经会按需建窗/关窗并把状态发下去，这里不用再补一次 send。
   const state = result?.data?.status || result?.data?.companion || null;
   if (state) {
+    // 从托盘显式开启陪伴 = 他此刻想看字幕。hiddenByUser 还立着的话会把刚建的字幕窗挡住，
+    // 表现为「点了开启陪伴什么都没出现」。显式动作优先，先解除隐藏标记。
+    if (active && state.active === true) hiddenByUser = false;
     syncCompanion(state);
-    if (companionWin && !companionWin.isDestroyed()) companionWin.webContents.send('companion:state', state);
-  }
-  updateTrayMenu();
+  } else updateTrayMenu();
 }
 
 function startPolling() {
@@ -787,22 +967,30 @@ function startPolling() {
     }
     failures = 0;
     // 自愈：万一窗口被撑大 / 推到屏幕外（长按、缩放、停靠都可能），每 3 秒拉回来一次。
-    if (!expanded && !animating && !dragResize && !sizePanel) {
+    // 阈值必须大于 DPI 取整噪声（175% 缩放下 setBounds→getBounds 会差 2~4px）：
+    // 以前阈值是 2，于是每次都判「异常」，每 3 秒拉起一次 120ms 动画——日志里 1 万多条
+    // 「收回异常窗口」、屏幕上看到的「球自己在抖」，都是这条循环。
+    // 窗口已经 hide() 时 getBounds 还是旧尺寸，不排除的话每 3 秒都对一个看不见的窗口
+    // setBounds + 打一条「收回异常窗口」，日志继续刷屏（而且唤醒时尺寸会被悄悄改掉）。
+    if (win.isVisible() && !hiddenByUser && !expanded && !animating && !dragResize && !sizePanel) {
       const cur = win.getBounds();
       const base = baseSize();
       const fix = safeBounds({ x: cur.x, y: cur.y, width: base.width, height: base.height });
-      // 1px 级别的差是 DPI 取整噪声，别每 3 秒拉一次（日志会刷屏、还闪）。
       const drift = Math.abs(fix.x - cur.x) + Math.abs(fix.y - cur.y) + Math.abs(fix.width - cur.width) + Math.abs(fix.height - cur.height);
-      if (drift > 2) {
+      if (drift > 6) {
         log('[orb] 收回异常窗口', cur, '->', fix);
-        animateTo(fix, { duration: 120 });
+        // 直接落位，不再 animateTo：每 3 秒一次 120ms 插值动画本身就是可见的抖动。
+        applyBounds(fix, 'self-heal');
       }
     }
     win.webContents.send('orb:conn', { ok: true });
     win.webContents.send('orb:state', res.data || null);
     try { syncCompanion(res.data?.companion || null); } catch (error) { log('[companion] 同步失败', String(error?.message ?? error)); }
     // 有些窗口（全屏播放器、别的 Electron 应用）会把自己提到最前，球要定期抢回来。
-    try { if (!win.isAlwaysOnTop()) win.setAlwaysOnTop(true, 'screen-saver'); win.moveTop(); } catch {}
+    // 但只有真的丢了置顶才重设 + moveTop：每 3 秒无条件 moveTop 会让 DWM 反复重排 z 序（也闪）。
+    if (win.isVisible() && !win.isAlwaysOnTop()) {
+      try { win.setAlwaysOnTop(true, 'screen-saver'); win.moveTop(); } catch {}
+    }
   };
   tick();
   pollTimer = setInterval(tick, STATE_POLL_MS);
@@ -821,10 +1009,59 @@ ipcMain.handle('orb:petconfig', () => {
         singleClickOpens: Boolean(pet.singleClickOpens),
         idleMinMs: Number(pet.idleMinMs) || 0,
         idleMaxMs: Number(pet.idleMaxMs) || 0,
+        // 注视 / 溜达 / 换皮：都不是必需的，缺了就当关闭。
+        gaze: pet.gaze && typeof pet.gaze === 'object' ? pet.gaze : null,
+        wander: pet.wander && typeof pet.wander === 'object' ? pet.wander : null,
+        avatar: String(pet.avatar ?? ''),
+        packId: String(pet.packId ?? ''),
+        // 设置页点「试播」时插件往 preview.json 写一条，渲染端 4 秒一轮问一次。
+        preview: readPetPreview(),
       }
       : null,
     base: baseSize(),
   };
+});
+
+/** 试播请求：<ORB_DIR>/pet/preview.json = { name, at, mirror }，渲染端靠 at 变化判断是新请求。 */
+let previewCache = { at: 0, mtimeMs: 0, data: null };
+function readPetPreview() {
+  const file = path.join(ORB_DIR, 'pet', 'preview.json');
+  try {
+    const stat = fs.statSync(file);
+    if (stat.mtimeMs === previewCache.mtimeMs) return previewCache.data;
+    previewCache = { at: Date.now(), mtimeMs: stat.mtimeMs, data: JSON.parse(fs.readFileSync(file, 'utf8')) };
+    return previewCache.data;
+  } catch {
+    previewCache = { at: 0, mtimeMs: 0, data: null };
+    return null;
+  }
+}
+
+/**
+ * 桌宠自己走两步。窗口移动只能主进程做（渲染端拿不到真实的屏幕坐标系），
+ * 所以这边负责夹到屏幕内 + 平滑动画，返回 clamped 让她知道「撞墙了，掉头吧」。
+ */
+ipcMain.handle('orb:pet-move', async (_event, payload = {}) => {
+  if (!win || win.isDestroyed()) return { ok: false, clamped: false };
+  const dx = Math.round(Number(payload.dx) || 0);
+  const dy = Math.round(Number(payload.dy) || 0);
+  if (!dx && !dy) return { ok: true, clamped: false };
+  const ms = Math.max(0, Math.min(20000, Math.round(Number(payload.ms) || 0)));
+  const bounds = win.getBounds();
+  const want = { x: bounds.x + dx, y: bounds.y + dy, width: bounds.width, height: bounds.height };
+  // applyBounds 已经按 clampForMode 夹过了：拿它跟请求值比，就知道有没有被墙挡住。
+  const next = applyBounds(want, ms > 0 ? 'pet-walk' : 'pet-move');
+  if (!next) return { ok: false, clamped: false };
+  const clamped = next.x !== want.x || next.y !== want.y;
+  if (ms > 0) await animateTo(next, { duration: ms, reason: 'pet-walk' });
+  else win.setBounds(next);
+  rememberBall();
+  return { ok: true, clamped, ...next };
+});
+
+/** 鼠标在哪：宠物窗口是全透明覆盖层，渲染端的 mousemove 不可靠，注视只能问主进程。 */
+ipcMain.handle('orb:cursor', () => {
+  try { return screen.getCursorScreenPoint(); } catch { return null; }
 });
 
 // 鼠标穿透：桌宠窗口是个「宠物 + 头顶气泡带」的矩形，透明的地方照样吃点击，
@@ -1183,9 +1420,10 @@ ipcMain.handle('orb:is-hidden', () => Boolean(!win || win.isDestroyed() || !win.
 // ── 陪伴字幕窗 ─────────────────────────────────────────────────────────────
 ipcMain.handle('companion:reply', async (_event, payload = {}) => {
   const result = await call('/companion', { method: 'POST', body: { action: 'reply', text: String(payload.text || '') } });
-  if (companionWin && !companionWin.isDestroyed()) {
-    const state = result?.data?.status || null;
-    if (state) companionWin.webContents.send('companion:state', { ...state, active: true });
+  const state = result?.data?.status || null;
+  if (state) {
+    lastCompanionState = { ...state, active: true };
+    sendCompanionState(lastCompanionState);
   }
   return result;
 });
@@ -1203,8 +1441,9 @@ ipcMain.handle('companion:toggle', async (_event, payload = {}) => {
     timeoutMs: 20000,
   });
   const state = result?.data?.companion || result?.data?.status || null;
-  if (state && companionWin && !companionWin.isDestroyed()) {
-    companionWin.webContents.send('companion:state', state);
+  if (state) {
+    lastCompanionState = state;
+    sendCompanionState(state);
   }
   return result;
 });
@@ -1213,8 +1452,9 @@ ipcMain.handle('companion:config', async (_event, patch = {}) => {
   const result = await call('/companion', { method: 'POST', body: { action: 'config', patch }, timeoutMs: 10000 });
   const data = result?.data || result;
   const state = data?.companion || data?.status || null;
-  if (state && companionWin && !companionWin.isDestroyed()) {
-    companionWin.webContents.send('companion:state', state);
+  if (state) {
+    lastCompanionState = state;
+    sendCompanionState(state);
   }
   return data;
 });
@@ -1270,15 +1510,19 @@ ipcMain.handle('companion:height', (_event, payload = {}) => {
   if (!companionWin || companionWin.isDestroyed()) return null;
   const b = companionWin.getBounds();
   const area = screen.getDisplayNearestPoint({ x: b.x + Math.round(b.width / 2), y: b.y + Math.round(b.height / 2) }).workArea;
-  const bottom = b.y + b.height;
-  let height = Math.round(Math.min(Math.max(Number(payload.height) || b.height, 56), Math.min(560, area.height - 16)));
-  let y = bottom - height;
-  if (y < area.y + 4) {
-    y = area.y + 4;
-    height = Math.min(height, Math.max(56, area.y + area.height - 8 - y));
+  // 8px 网格 + 12px 死区：渲染端按 ResizeObserver 量出来的高度经常只差 1~3px，
+  // 每次都真改窗口会让可见区上下抖；高度不变时直接回原 bounds，什么都不做。
+  const height = snapCompanionHeight(Number(payload.height) || b.height, b.height);
+  if (height === null) return b;
+  const next = anchorCompanionBottom(b, height, area);
+  if (next.y === b.y && next.height === b.height) return b;
+  companionWin.setBounds(next);
+  // 拖动中高度变了：把拖动基准一起挪过去。否则 16ms 后的拖动循环还会按旧 y/height 重算，
+  // 窗口被拉回去 → 松开前「字幕条一跳一跳」。
+  if (companionDrag) {
+    companionDrag.bounds = { ...companionDrag.bounds, y: next.y, height: next.height };
+    companionDrag.cursor = screen.getCursorScreenPoint();
   }
-  if (y + height > area.y + area.height - 8) y = area.y + area.height - 8 - height;
-  companionWin.setBounds({ x: b.x, y, width: b.width, height });
   return companionWin.getBounds();
 });
 
@@ -1287,7 +1531,7 @@ ipcMain.handle('companion:width', (_event, payload = {}) => {
   if (!companionWin || companionWin.isDestroyed()) return null;
   const b = companionWin.getBounds();
   const area = screen.getDisplayNearestPoint({ x: b.x, y: b.y }).workArea;
-  const width = Math.min(Math.max(Math.round(Number(payload.width) || b.width), 520), Math.min(1400, area.width - 16));
+  const width = Math.min(Math.max(Math.round(Number(payload.width) || b.width), 520), companionMaxWidth(area.width));
   let x = b.x;
   if (x + width > area.x + area.width - 8) x = Math.max(area.x + 8, area.x + area.width - 8 - width);
   companionWin.setBounds({ x, y: b.y, width, height: b.height });
@@ -1332,7 +1576,8 @@ if (!gotLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
-    showWindow();
+    // 用户主动隐藏时，不要因为他又双击了一次图标就把桌宠拉出来；显示只由托盘/快捷键触发。
+    if (!hiddenByUser) showWindow();
   });
   app.whenReady().then(() => {
     log('[orb] 启动', app.getVersion(), `pid=${process.pid}`, `dir=${ORB_DIR}`);

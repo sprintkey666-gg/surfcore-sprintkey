@@ -325,9 +325,9 @@ ok('设置页有「聊天外观」段与清头像缓存', orbHas(clientJs, '聊�
   ok('松手才真改窗口（拖动中只更新数字）', changeAt > inputAt && inputAt >= 0 && !/petSize/.test(orbSrc.slice(inputAt, changeAt)));
   ok('滑条改完同步角色尺寸', h(orbSrc, 'window.SurfPet?.setSize?.(size)') && h(petJs, 'function setSize(', 'setSize,'));
 
-  // ── 0.10.5：气泡小尾巴不能被裁（overflow 放到里层文字上）────────────────
+  // ── 0.12.15：气泡改浮层 + 3 行折叠（窗口不再跟着气泡改高）────────────────
   const bubbleRule = (petCss.match(/#bubble \{[^}]*\}/) || [''])[0];
-  ok('气泡框不再裁剪小尾巴', !/overflow:\s*hidden/.test(bubbleRule) && h(petCss, '#bubbleText', 'max-height: 96px', 'overflow: hidden'));
+  ok('气泡框不再裁剪小尾巴', !/overflow:\s*hidden/.test(bubbleRule) && h(petCss, '#bubbleText', '-webkit-line-clamp: 3', 'overflow: hidden'));
   ok('气泡文字走里层 span', h(htmlSrc, '<span id="bubbleText"></span>') && h(petJs, "document.getElementById('bubbleText')"));
 
   // ── 0.11.0：气泡图文一体 / 聊天配图 / 发送即清空与排队 ─────────────────
@@ -356,9 +356,9 @@ ok('设置页有「聊天外观」段与清头像缓存', orbHas(clientJs, '聊�
   ok('发送失败把话还回去', h(orbSrc, 'if (!input.value) input.value = text;'));
   ok('排队时提示前面几条', h(orbSrc, '已排队：前面还有'));
   ok('排队没回完不自动收起', h(orbSrc, 'function queueBusy()', 'sending || queueBusy()'));
-  ok('头顶气泡也能带图', h(htmlSrc, 'id="bubblePic"') && h(petJs, 'function showBubble(text, { kind = \'her\', ttlMs = 8000, onClick = null, image = \'\' }'));
-  ok('头顶气泡图限高不撑破气泡带', h(petCss, '#bubble .bubblePic', 'max-height: 72px'));
-  ok('图加载完重算头顶位置', h(petJs, 'pic.onload = () => { placeBubble(); scheduleFit(); }'));
+  ok('头顶气泡也能带图', h(htmlSrc, 'id="bubblePic"') && h(petJs, 'function showBubble(text, options = {})', "document.getElementById('bubblePic')"));
+  ok('头顶气泡图限高不撑破气泡带', h(petCss, '#bubble .bubblePic', 'max-height: min(40px', 'object-fit: contain'));
+  ok('图加载完重算头顶位置', h(petJs, 'pic.onload = () => placeBubble();'));
   ok('设置页有「聊天里也能配图」', h(uiSrc, '聊天里也能配图', 'pic.attachToChat'));
   ok('设置页有「气泡图文一体」', h(uiSrc, '气泡图文一体', 'chat.richBubble'));
 
@@ -372,9 +372,9 @@ ok('设置页有「聊天外观」段与清头像缓存', orbHas(clientJs, '聊�
   const orbLibSrc = rd('plugins/surfcore/lib/orb.js');
   // A. 面板气泡不再被压扁（flex 容器缺 min-height:0 会让行被压缩、顶部文字被裁）
   ok('消息列表允许滚动不被压扁', h(cssSrc, 'min-height: 0') && h(cssSrc, '.bubbles > .row', 'flex: 0 0 auto'));
-  // B. 头顶气泡按内容长高窗口
-  ok('头顶气泡按内容量高度', h(petSrc, 'async function fitBubble(', 'window.orb?.bubbleSpace?.(want)'));
-  ok('气泡收起时窗口回落', h(petSrc, 'void window.orb?.bubbleSpace?.(0)'));
+  // B. 头顶气泡在窗口内浮层化：高度靠 --bubble-max，窗口尺寸不再跟着气泡变（0.12.15 起）
+  ok('头顶气泡按可用余量折算高度', h(petSrc, 'function placeBubble()', "setProperty('--bubble-max'") && h(petCss, 'max-height: var(--bubble-max, 96px)'));
+  ok('气泡收起时窗口不回落', !/bubbleSpace\?\.\(0\)/.test(petSrc) && h(petSrc, '不需要 bubbleSpace(0) 复位'));
   ok('主进程能吃气泡带高度', h(mainSrc, "ipcMain.handle('orb:bubble-space'", 'function bandFor()', 'bubbleBand'));
   ok('窗口按带高向上长', h(mainSrc, 'size + bandFor()'));
   ok('preload 暴露 bubbleSpace', h(preload, 'bubbleSpace: (px)'));
@@ -395,7 +395,7 @@ ok('设置页有「聊天外观」段与清头像缓存', orbHas(clientJs, '聊�
   ok('看图时 Esc 先关查看器', h(orbSrc, 'if (view.open) { closeViewer(); return; }'));
   // E. QQ 近况：撤掉原文通道，只用共用那张衰减记忆卡
   ok('不再有 QQ 原文通道', !h(httpSrc, 'recentQqLines') && !h(chatSrc, '你们刚在 QQ 上聊的') && !h(uiSrc, 'chat.shareQqRecent'));
-  ok('悬浮窗仍用同一张记忆卡', h(chatSrc, "memoryCardPromptBlock('qq')", 'memoryBlock()'));
+  ok('悬浮窗仍用同一张记忆卡', h(chatSrc, "promptCard('qq')", 'buildInteropMemory(') && h(chatSrc, 'memoryCardPromptBlock(platform)'));
 
   // ── 0.12.1：记忆三项互通（悬浮窗自己的开关 + B站 读桌宠记忆）───────────
   ok('互通记忆默认开', def.chat.shareMemory === true);

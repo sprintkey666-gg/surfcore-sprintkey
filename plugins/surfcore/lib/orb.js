@@ -24,6 +24,7 @@ import {
 import { readUnified, saveUnified } from './store.js';
 import { createPetAssetsService } from './pet-assets.js';
 import { DEFAULT_COMPANION, normalizeCompanionConfig } from './orb-companion.js';
+import { normalizeInterop } from './interop.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** 随插件发布的悬浮窗应用源码目录。 */
@@ -57,6 +58,9 @@ export const DEFAULT_ORB = {
     // 互通记忆：和 QQ / B站 共用同一张衰减记忆卡——这边聊的写进去，那边的事她也读得到。
     // 关掉 = 只当悬浮窗里的私聊：不写卡，读卡也停（桌宠的开关各管各的，不连坐）。
     shareMemory: true,
+    // 回复速度：legacy = 专门开一个 DSH 会话跑（上下文连续，和 QQ 那边同款回合）；
+    // fast = 直连模型单轮（快，但每句都从记忆卡重建上下文）。
+    reply: { mode: 'legacy', timeoutMs: 180000, sessionTurns: 0, maxTokens: 800 },
     // 气泡上要不要显示头像/名字。默认显示——主人要求「像 QQ 那样一人一排」。
     ident: {
       showAvatar: true,
@@ -69,12 +73,28 @@ export const DEFAULT_ORB = {
       mePath: '',
     },
   },
+  // 互通：让悬浮窗/桌宠/字幕和 QQ、B站 共用记忆。
+  // qq/bili = 读那边的记忆卡；identity/recent = 注入身份与「最近在别处聊了什么」。
+  interop: {
+    qq: true,
+    bili: true,
+    identity: true,
+    recent: true,
+    recentLines: 12,
+    recentHours: 24,
+    personaMaxChars: 12000,
+    memoryMaxChars: 8000,
+  },
   pet: {
     // 单击默认只播「被摸一下」的反应，双击才开会话；想回到单击开会话就打开这个。
     singleClickOpens: false,
     // 空闲时随机动作的间隔上下限（毫秒），0 = 只播待机
     idleMinMs: 6000,
     idleMaxMs: 16000,
+    // 注视：跟着鼠标转头（走位/待机时才跟，播动作时不抢戏）。
+    gaze: { enabled: true, intervalMs: 40 },
+    // 自己溜达：隔一阵挪一小步，撞到屏幕边就掉头。
+    wander: { enabled: true, minMs: 8000, maxMs: 20000 },
   },
   screen: {
     // 看屏幕三档：off 关 / manual 只有主人点「眼」那一下 / auto 她想看就看。
@@ -127,6 +147,18 @@ function strList(value, fallback) {
   return out.length ? out : fallback;
 }
 
+/** 回复速度那一小撮字段：mode + 单轮超时 + 每几轮换会话 + 单轮 token 上限。 */
+function replyBlock(value, fallbackMode = 'legacy') {
+  const src = value && typeof value === 'object' ? value : {};
+  return {
+    mode: src.mode === 'fast' ? 'fast' : (src.mode === 'legacy' ? 'legacy' : fallbackMode),
+    timeoutMs: clampNum(src.timeoutMs, 180000, 30000, 600000, { integer: true }),
+    // 0 = 永不换会话（上下文最连贯，也最容易越聊越慢）；>0 = 每 N 轮换一个新的。
+    sessionTurns: clampNum(src.sessionTurns, 0, 0, 60, { integer: true }),
+    maxTokens: clampNum(src.maxTokens, 800, 200, 4000, { integer: true }),
+  };
+}
+
 /** 配置归一化：越界钳制 + 缺省补齐。纯函数，单测直接打。 */
 export function normalizeOrbConfig(raw) {
   const src = raw && typeof raw === 'object' ? raw : {};
@@ -150,10 +182,21 @@ export function normalizeOrbConfig(raw) {
       const min = clampNum(src.pet?.idleMinMs, DEFAULT_ORB.pet.idleMinMs, 0, 120000, { integer: true });
       // max 永远不小于 min：填反了会让随机间隔算出负数，桌宠就一直在抽风。
       const max = Math.max(min, clampNum(src.pet?.idleMaxMs, DEFAULT_ORB.pet.idleMaxMs, 0, 300000, { integer: true }));
+      const gaze = src.pet && typeof src.pet === 'object' && src.pet.gaze && typeof src.pet.gaze === 'object' ? src.pet.gaze : {};
+      const wander = src.pet && typeof src.pet === 'object' && src.pet.wander && typeof src.pet.wander === 'object' ? src.pet.wander : {};
+      const wMin = clampNum(wander.minMs, DEFAULT_ORB.pet.wander.minMs, 2000, 120000, { integer: true });
+      const wMax = Math.max(wMin, clampNum(wander.maxMs, DEFAULT_ORB.pet.wander.maxMs, 2000, 300000, { integer: true }));
       return {
         singleClickOpens: (src.pet && typeof src.pet === 'object' ? src.pet.singleClickOpens : false) === true,
         idleMinMs: min,
         idleMaxMs: max,
+        // 注视：跟随鼠标方向转头。intervalMs 越小越顺，太小会烧 CPU（20ms 起）。
+        gaze: {
+          enabled: gaze.enabled !== false,
+          intervalMs: clampNum(gaze.intervalMs, DEFAULT_ORB.pet.gaze.intervalMs, 20, 200, { integer: true }),
+        },
+        // 自己溜达：隔一阵挪一小步。
+        wander: { enabled: wander.enabled !== false, minMs: wMin, maxMs: wMax },
       };
     })(),
     chat: {
@@ -174,6 +217,7 @@ export function normalizeOrbConfig(raw) {
         herPath: stripQuotes(chat.ident?.herPath).slice(0, 260),
         mePath: stripQuotes(chat.ident?.mePath).slice(0, 260),
       },
+      reply: replyBlock(chat.reply, DEFAULT_ORB.chat.reply.mode),
     },
     screen: {
       // 兼容：老配置只有 enabled。enabled=false → off；enabled=true 且没写 mode → manual。
@@ -195,6 +239,7 @@ export function normalizeOrbConfig(raw) {
       denyTitles: strList(screen.denyTitles, DEFAULT_ORB.screen.denyTitles),
     },
     companion: normalizeCompanionConfig(src.companion),
+    interop: normalizeInterop(src.interop),
     pic: {
       enabled: pic.enabled === true,
       preferQqSticker: pic.preferQqSticker !== false,
@@ -234,6 +279,11 @@ export function createOrbService({ stateDir, pluginLog = () => {}, getSubprocess
       singleClickOpens: cfg.pet.singleClickOpens,
       idleMinMs: cfg.pet.idleMinMs,
       idleMaxMs: cfg.pet.idleMaxMs,
+      // 注视 / 溜达：宠物窗口读不到鼠标，全靠主进程帮忙（orb:cursor / orb:pet-move）。
+      gaze: cfg.pet.gaze,
+      wander: cfg.pet.wander,
+      avatar: cfg.ball.avatar,
+      packId: assets.activePackId || '',
       dir: pets.dir,
       manifest: wantPet && assets.installed ? pets.manifest() : null,
       assets,

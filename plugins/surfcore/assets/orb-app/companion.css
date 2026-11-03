@@ -34,7 +34,9 @@ body {
   overflow: hidden;
   cursor: grab;
   transition: background .18s ease, border-color .18s ease;
-  backdrop-filter: blur(10px);
+  /* 不要加 backdrop-filter / blur：透明窗 + 背景模糊会让 DWM 每一帧重新合成整块字幕条，
+     175% 缩放下就是肉眼可见的「字幕背景一直在闪」。要质感就用实色底 + 内描边。 */
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .05);
 }
 .bar:hover { border-color: rgba(255, 255, 255, 0.3); }
 .bar.dragging { cursor: grabbing; }

@@ -354,24 +354,75 @@ function hourReached(nowMs, hour) {
   return new Date(nowMs).getHours() >= h;
 }
 
+/** 本地零点（不能用 UTC，跨时区会把「今天」算错）。 */
+function localDayStart(nowMs) {
+  const d = new Date(Number(nowMs));
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+/** 今天这个「写作时间」的时间点：本地零点 + hour 点。 */
+function slotStartOf(nowMs, hour) {
+  const h = Number(hour);
+  if (!Number.isFinite(h)) return localDayStart(nowMs);
+  return localDayStart(nowMs) + Math.min(23, Math.max(0, Math.round(h))) * 3_600_000;
+}
+
+/**
+ * 下一次「该写日记」的时间点。
+ *
+ * 语义（2026-11-03 重写）：调度只认「本地日期 + 写作时间点」，不认「上次写入的绝对时间 + N 天」。
+ * 原来的写法有个致命副作用：凌晨 00:02 补写一篇之后，当天 22:00 会被算成「还没到间隔」而跳过，
+ * 主人看到的就是「日记开着、今天却没发」。
+ *
+ * - 每天一篇（everyDays=1）：今天这个时间点之后还没写过 → 今天；已经写过 → 明天。
+ * - 每 N 天一篇：上次那天的零点 + N 天 + 写作时间。
+ * - 从没写过：今天这个时间点。
+ */
+export function diaryNextDueAt({ lastWriteAt, everyDays = 1, hour = 22, now = Date.now() }) {
+  const nowMs = Number(now);
+  const days = Math.max(1, Number(everyDays) || 1);
+  const last = Number(lastWriteAt) || 0;
+  const hourMs = (() => {
+    const h = Number(hour);
+    if (!Number.isFinite(h)) return 0;
+    return Math.min(23, Math.max(0, Math.round(h))) * 3_600_000;
+  })();
+  const todaySlot = localDayStart(nowMs) + hourMs;
+  if (!last) return todaySlot;
+  if (days === 1) return last < todaySlot ? todaySlot : todaySlot + DAY_MS;
+  return localDayStart(last) + days * DAY_MS + hourMs;
+}
+
 /**
  * 是否该写今天的日记。
- * - 第一次：到了 hour 才写；如果已经逾期超过 24 小时（关过机），任何时间补一次。
- * - 之后：距上次写满 N 天，并且到了 hour；逾期超过 24 小时则立即补。
+ *
+ * 判定就是「现在 >= 下一次该写的时间」：
+ * - 到了今天这个时间点、且今天这个点之后还没写过 → 该写（凌晨补写/手动补写都不会吞掉当晚那一篇）；
+ * - 每 N 天一篇时，只有到了第 N 天的写作时间点才写；
+ * - 关机错过（候选时间点早已过去）→ 任何时间补写一次。
  */
 export function isDiaryDue({ lastWriteAt, everyDays = 1, hour = 22, now = Date.now() }) {
   const nowMs = Number(now);
   const days = Math.max(1, Number(everyDays) || 1);
   const last = Number(lastWriteAt) || 0;
-  if (!last) {
-    return hourReached(nowMs, hour)
-      ? { due: true, reason: 'first' }
-      : { due: false, reason: 'hour' };
+  const hourMs = (() => {
+    const h = Number(hour);
+    if (!Number.isFinite(h)) return 0;
+    return Math.min(23, Math.max(0, Math.round(h))) * 3_600_000;
+  })();
+  const todaySlot = localDayStart(nowMs) + hourMs;
+  // 每天一篇时，「昨天那一篇整个没写」说明桥接/电脑整天没开——今天就不要再等到 22 点，立刻补。
+  // 注意要先 `last` 判定：从没写过（last=0）走下面的 first 分支，不能算成「逾期」。
+  if (last && days === 1 && last < todaySlot - DAY_MS) return { due: true, reason: 'catchup' };
+  const candidate = diaryNextDueAt({ lastWriteAt: last, everyDays, hour, now: nowMs });
+  if (nowMs < candidate) {
+    const firstToday = !last && candidate > nowMs;
+    return { due: false, reason: firstToday ? 'hour' : 'interval' };
   }
-  const dueAt = last + days * DAY_MS;
-  if (nowMs < dueAt) return { due: false, reason: 'interval' };
-  if (!hourReached(nowMs, hour) && nowMs - dueAt < DAY_MS) return { due: false, reason: 'hour' };
-  return { due: true, reason: 'interval' };
+  if (!last) return { due: true, reason: 'first' };
+  if (nowMs - candidate >= DAY_MS) return { due: true, reason: 'catchup' };
+  return { due: true, reason: 'slot' };
 }
 
 export function buildDiaryPrompt({

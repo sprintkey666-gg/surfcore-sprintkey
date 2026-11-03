@@ -9,9 +9,34 @@ const MAX_FILE_MB = 512;
 const MAX_SEEN = 5000;
 const CHANNELS = new Set(['qq', 'desktop-orb', 'companion']);
 
+/**
+ * 「数据类型」：每条存档除了 channel，还带一个给人看的中文来源标签和一个语义类型。
+ *   悬浮窗会话 = orb-chat，陪伴字幕 = companion-subtitle，QQ = qq-message。
+ * 这两列是 2026-11-03 加的（主人要求字幕/会话的对话也要有明确的数据类型），
+ * 老记录没有它们，读的时候按 channel 现推。
+ */
+export const CHANNEL_LABELS = Object.freeze({
+  qq: 'QQ',
+  'desktop-orb': '悬浮窗',
+  companion: '陪伴字幕',
+});
+export const MESSAGE_TYPES = Object.freeze({
+  qq: 'qq-message',
+  'desktop-orb': 'orb-chat',
+  companion: 'companion-subtitle',
+});
+
 export function normalizeChannel(value) {
   const s = String(value || '').trim().toLowerCase();
   return CHANNELS.has(s) ? s : 'qq';
+}
+
+export function channelLabel(channel) {
+  return CHANNEL_LABELS[normalizeChannel(channel)] || CHANNEL_LABELS.qq;
+}
+
+export function messageTypeOf(channel) {
+  return MESSAGE_TYPES[normalizeChannel(channel)] || MESSAGE_TYPES.qq;
 }
 
 function clampInt(value, min, max, fallback) {
@@ -272,6 +297,8 @@ export function createChatArchiveWriter({
       time: localIso(ts),
       platform: String(src.platform || (channel === 'qq' ? 'qq' : 'desktop')),
       channel,
+      channelLabel: channelLabel(channel),
+      messageType: messageTypeOf(channel),
       kind: convKind,
       conversation: { key: convKey, id: convId, name: String(conversation.name || '') },
       sender: {
@@ -362,6 +389,8 @@ export function createChatArchiveWriter({
       time: localIso(ts),
       platform: 'qq',
       channel: 'qq',
+      channelLabel: channelLabel('qq'),
+      messageType: messageTypeOf('qq'),
       kind: convKind,
       conversation: { key: convKey, id: convId, name: String(name || '') },
       sender: { id: '', name: senderName, isOwner: false, isSelf: true },
@@ -391,3 +420,55 @@ export function createChatArchiveWriter({
 
   return { appendRecord, appendIncoming, appendOutgoing, status };
 }
+
+/**
+ * 从存档里读「最近的对话」——给悬浮窗会话/陪伴字幕当跨端上下文用。
+ * 只读文件尾部（单个 jsonl 最多几十 MB，整读会拖慢每一轮聊天），
+ * 返回按时间升序的记录数组；坏行直接跳过。
+ */
+export function readRecentChatRecords(root, { sinceMs = 0, limit = 40, tailBytes = 256 * 1024 } = {}) {
+  const max = Math.max(1, Math.min(200, Number(limit) || 40));
+  const since = Number.isFinite(Number(sinceMs)) ? Number(sinceMs) : 0;
+  const files = listChatArchiveFiles(root || '');
+  const all = [...files.private, ...files.group].sort((a, b) => a.name.localeCompare(b.name));
+  const out = [];
+  for (let i = all.length - 1; i >= 0 && out.length < max; i -= 1) {
+    const file = all[i];
+    let text = '';
+    let cut = false;
+    try {
+      const start = Math.max(0, file.bytes - Math.max(4096, Number(tailBytes) || 0));
+      cut = start > 0;
+      const fd = fs.openSync(file.path, 'r');
+      try {
+        const buf = Buffer.alloc(Math.min(file.bytes - start, 1 << 20));
+        fs.readSync(fd, buf, 0, buf.length, start);
+        text = buf.toString('utf8');
+      } finally { fs.closeSync(fd); }
+    } catch { continue; }
+    // 从文件中间开始读时，第一行大概率被切了一半，直接丢掉。
+    const lines = text.split('\n');
+    if (cut && lines.length) lines.shift();
+    for (let j = lines.length - 1; j >= 0 && out.length < max; j -= 1) {
+      const line = lines[j].trim();
+      if (!line) continue;
+      let record = null;
+      try { record = JSON.parse(line); } catch { continue; }
+      if (!record || typeof record !== 'object') continue;
+      const at = Number(record.at) || 0;
+      if (since && at && at < since) return out.reverse();
+      out.push({
+        at,
+        time: String(record.time || ''),
+        channel: normalizeChannel(record.channel),
+        channelLabel: record.channelLabel || channelLabel(record.channel),
+        messageType: record.messageType || messageTypeOf(record.channel),
+        role: record.sender && record.sender.isSelf ? 'assistant' : 'user',
+        name: String(record.sender && record.sender.name ? record.sender.name : ''),
+        text: String(record.text || '').trim(),
+      });
+    }
+  }
+  return out.reverse();
+}
+

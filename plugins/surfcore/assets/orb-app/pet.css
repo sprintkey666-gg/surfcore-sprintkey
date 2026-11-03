@@ -25,8 +25,9 @@
   position: absolute;
   bottom: 0;
   left: 50%;
-  /* 素材是「包围盒底部对齐」的，缩放后依然站在窗口底边 */
-  transform: translateX(-50%);
+  /* 素材是「包围盒底部对齐」的，缩放后依然站在窗口底边。
+     --gaze-shift 是注视时那几像素的横向偏移（pet.js 写进来），让「看」有一点物理感。 */
+  transform: translateX(calc(-50% + var(--gaze-shift, 0px)));
   /* 素材帧是 16:9（640×360），角色只占中间 295/360 高。
      用 height:100% + contain 会把整帧塞进竖窗：角色只剩 135px、还悬在窗口中间，
      头顶离气泡十万八千里。这里按「角色身高 = pet-size」反推整帧要放多大（×1.22），
@@ -38,12 +39,36 @@
   opacity: 0;
   transition: opacity 120ms ease-out;
   pointer-events: none;
+  will-change: opacity;
 }
 
 .petStage video.on { opacity: 1; }
 
-/* 面朝方向：素材默认朝左，需要时整体镜像 */
-.petStage.mirror video { transform: translateX(-50%) scaleX(-1); }
+/* 面朝方向：素材默认朝左，需要时整体镜像（文字类动作不镜像，否则反字） */
+.petStage.mirror video {
+  transform: translateX(calc(-50% + var(--gaze-shift, 0px))) scaleX(-1);
+}
+
+/* 素材不可用时的静态回退形象（avatar），由 pet.js 动态插入 */
+.petStage .petFallback {
+  position: absolute;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  height: calc(var(--pet-size, 200px) * 0.92);
+  width: auto;
+  max-width: 100%;
+  object-fit: contain;
+  pointer-events: none;
+  filter: drop-shadow(0 6px 10px rgba(0, 0, 0, 0.25));
+}
+
+#pet.fallback video { display: none; }
+
+/* ── 头顶气泡 ────────────────────────────────────────────────────────────────
+   老版本的问题：rgba 半透明 + backdrop-filter 模糊，在桌面上就是一块糊掉的黑块；
+   而且宽度跟着内容量、位置跟着实测 headTop 算，窗口还会为它长高再缩回去。
+   现在是「实心卡片 + 细描边」，不模糊、不跟着窗口变，位置只由宠物身高决定。 */
 
 #bubble {
   position: absolute;
@@ -53,50 +78,65 @@
   right: 8px;
   margin: 0 auto;
   width: fit-content;
-  /* 气泡贴在头顶：具体 bottom 由 pet.js 按「角色头顶的实测位置」算（placeBubble），
+  /* 气泡贴在头顶：具体 bottom 由 pet.js 按宠物身高算（placeBubble），
      这里的值只是加载瞬间的兜底。 */
   top: auto;
   bottom: 200px;
-  max-width: 100%;
+  max-width: min(320px, calc(100% - 16px));
+  min-width: 56px;
   /* 这里不要裁剪溢出——小尾巴是 ::after 画在框外的，会被一起切掉。
      限高挪到里层的 #bubbleText 上。 */
   overflow: visible;
-  min-width: 60px;
-  padding: 7px 11px;
-  border-radius: 13px;
-  background: rgba(24, 28, 38, 0.94);
-  color: #eaf1ff;
-  font-size: 13px;
+  box-sizing: border-box;
+  padding: 6px 10px;
+  border-radius: 14px;
+  /* 实心深色卡片：不用 backdrop-filter，字才不糊 */
+  background: #1b2130;
+  color: #e9eefb;
+  font-size: 12.5px;
   line-height: 1.5;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  backdrop-filter: blur(10px);
+  letter-spacing: 0.01em;
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.06) inset,
+    0 6px 18px rgba(0, 0, 0, 0.32);
+  border: 1px solid rgba(140, 170, 225, 0.22);
   pointer-events: auto;
   cursor: pointer;
   word-break: break-word;
+  animation: bubbleIn 90ms ease-out;
 }
 
-/* 预览只留 4 行左右（全文在面板里）；限高裁切只作用于文字本身，
-   这样气泡框和下面的小尾巴都不会被裁。带图时文字再收一点，保证整块
-   气泡不超过头顶预留的 110px 带。 */
+@keyframes bubbleIn {
+  from { opacity: 0; transform: translateY(3px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+
+/* 预览只留 3 行（全文在面板里）；限高裁切只作用于文字本身，
+   这样气泡框和下面的小尾巴都不会被裁。--bubble-max 由 pet.js 按头顶余量算。 */
 #bubbleText {
-  display: block;
-  max-height: 96px;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  max-height: var(--bubble-max, 96px);
   overflow: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
+/* 带图时文字再收一点（2 行），保证整块气泡不超过头顶预留的那条带 */
 #bubble.haspic #bubbleText {
-  max-height: 48px;
-  margin-top: 5px;
+  -webkit-line-clamp: 2;
+  max-height: calc(var(--bubble-max, 96px) * 0.5);
+  margin-top: 4px;
 }
 
-/* 头顶气泡里的小图：等比缩、不拉伸、小图不放大；限高 72px 是为了不撑破气泡带。 */
+/* 头顶气泡里的小图：等比缩、不拉伸、小图不放大；上限跟着气泡余量走。 */
 #bubble .bubblePic {
   display: block;
   width: auto;
   height: auto;
   max-width: 100%;
-  max-height: 72px;
+  max-height: min(40px, calc(var(--bubble-max, 96px) * 0.4));
   object-fit: contain;
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.04);
@@ -109,28 +149,33 @@
 
 #bubble.hidden { display: none; }
 
-/* 小尾巴，指着宠物头 */
+/* 小尾巴，指着宠物头（气泡底边就压在头顶 6px 处） */
 #bubble::after {
   content: '';
   position: absolute;
   left: 50%;
-  bottom: -6px;
-  width: 11px;
-  height: 11px;
-  margin-left: -6px;
+  bottom: -5px;
+  width: 10px;
+  height: 10px;
+  margin-left: -5px;
   background: inherit;
-  border-right: 1px solid rgba(255, 255, 255, 0.1);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  border-right: 1px solid rgba(140, 170, 225, 0.22);
+  border-bottom: 1px solid rgba(140, 170, 225, 0.22);
   transform: rotate(45deg);
 }
 
 /* 用户自己的话用另一种颜色，跟面板里的气泡区分开 */
 #bubble.me {
-  background: rgba(56, 104, 200, 0.94);
+  background: #24457f;
+  border-color: rgba(120, 165, 240, 0.34);
 }
 
 #bubble.proactive {
-  border-color: rgba(120, 200, 255, 0.35);
+  border-color: rgba(120, 200, 255, 0.4);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.06) inset,
+    0 0 0 1px rgba(120, 200, 255, 0.1),
+    0 6px 18px rgba(0, 0, 0, 0.32);
 }
 
 /* 右键 → 桌宠大小面板（窗口会被临时撑成这个尺寸） */

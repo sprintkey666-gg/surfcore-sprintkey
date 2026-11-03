@@ -17,6 +17,12 @@ export const DEFAULT_COMPANION = {
   width: 900,
   opacity: 55,
   contextSubtitles: false,
+  // 字幕要看屏幕才能说话，画面每 tick 都在变，所以默认走快回复（直连单轮）；
+  // 想让她像会话那样连着聊（有自己的 DSH 会话上下文）就切 legacy。
+  reply: { mode: 'fast', timeoutMs: 120000, sessionTurns: 0, maxTokens: 500 },
+  // 字幕里的对话要不要写进记忆卡 / 聊天存档（关掉 = 只是屏幕上飘一句话）。
+  remember: true,
+  archive: true,
 };
 
 const MESSAGE_LIMIT = 200;
@@ -40,6 +46,17 @@ export function normalizeCompanionConfig(raw) {
     width: clampNum(src.width, DEFAULT_COMPANION.width, 520, 1400),
     opacity: clampNum(src.opacity, DEFAULT_COMPANION.opacity, 0, 90),
     contextSubtitles: src.contextSubtitles === true,
+    reply: (() => {
+      const r = src.reply && typeof src.reply === 'object' ? src.reply : {};
+      return {
+        mode: r.mode === 'legacy' ? 'legacy' : 'fast',
+        timeoutMs: clampNum(r.timeoutMs, DEFAULT_COMPANION.reply.timeoutMs, 30000, 600000),
+        sessionTurns: clampNum(r.sessionTurns, DEFAULT_COMPANION.reply.sessionTurns, 0, 60),
+        maxTokens: clampNum(r.maxTokens, DEFAULT_COMPANION.reply.maxTokens, 200, 4000),
+      };
+    })(),
+    remember: src.remember !== false,
+    archive: src.archive !== false,
   };
 }
 
@@ -89,6 +106,10 @@ export function createOrbCompanionService({
       width: cfg().width,
       opacity: cfg().opacity,
       contextSubtitles: cfg().contextSubtitles,
+      // 字幕对话是否进聊天存档 / 记忆卡（1.1.0 默认都开，设置页可关）。
+      archive: cfg().archive,
+      remember: cfg().remember,
+      replyMode: cfg().reply.mode,
       subtitle,
       messages,
       lastError,
@@ -182,7 +203,7 @@ export function createOrbCompanionService({
 
   async function capture({ reason = 'companion' } = {}) {
     try {
-      return await look({ small: true, manual: true, reason });
+      return await look({ small: true, manual: true, tier: 'companion', reason });
     } catch (error) {
       return { ok: false, error: String(error?.message ?? error) };
     }
@@ -227,6 +248,7 @@ export function createOrbCompanionService({
       let reply = '';
       let failure = '';
       try {
+        const rc = cfg().reply;
         const result = await chat.chat({
           text: prompt,
           modality: 'text',
@@ -234,8 +256,10 @@ export function createOrbCompanionService({
           image,
           screenMode: 'auto',
           allowPic: false,
-          archive: false,
-          remember: false,
+          channel: 'companion',
+          replyMode: rc.mode,
+          archive: cfg().archive,
+          remember: cfg().remember,
         });
         if (result?.ok) reply = cleanSubtitle(result.reply?.text || '');
         else failure = String(result?.error || '模型没有回复');
@@ -313,6 +337,7 @@ export function createOrbCompanionService({
     let out = '';
     let error = '';
     try {
+      const rc = cfg().reply;
       const result = await chat.chat({
         text: prompt,
         modality: 'text',
@@ -320,8 +345,10 @@ export function createOrbCompanionService({
         image,
         screenMode: 'auto',
         allowPic: false,
-        archive: false,
-        remember: false,
+        channel: 'companion',
+        replyMode: rc.mode,
+        archive: cfg().archive,
+        remember: cfg().remember,
       });
       if (result?.ok) out = cleanSubtitle(result.reply?.text || '', MAX_REPLY);
       else error = String(result?.error || '模型没有回复');

@@ -32,6 +32,10 @@
 | 20 | 陪伴模式（桌宠右键开启，字幕陪看 / 上下文 / 历史 / 字号） | 右键桌宠 → 陪伴；参数在 SurfCore → 悬浮窗 → 陪伴模式 | `plugins/surfcore/lib/orb-companion.js`、`assets/orb-app/companion.*`、`main.js`、`orb.js` | `socialV2.orb.companion`（enabled/intervalSec/maxCommentsPerHour/fontPx/width/opacity/contextSubtitles） |
 | 21 | 聊天全量存档（QQ 私聊/群聊 + 桌宠/字幕分 channel、按 MB 滚动、随全量卡备份发送，可选全发/增量） | SurfCore → Sprintkey扩展插件 → 记忆 | `src/chat-archive.js`、`src/memory-backup.js`、`src/bridge.js`、`plugins/surfcore/lib/desktop-archive.js`、`plugins/surfcore/lib/pet-chat.js`、`plugins/surfcore/lib/orb-companion.js`、`plugins/surfcore/lib/client.js` | `socialV2.memoryCardBackup.archive`（enabled/maxFileMB）、`.send.fullArchive` |
 | 22 | 回复速度：原版 / 快回复两套参数 + 自动换会话（0.13.0~0.13.3） | SurfCore → QQ → 回复速度（总开关）/ 原版回复 / 快回复 | `src/bridge.js`（`replyParamsNow` / `rotateSessionV2` / `POST /api/socialV2/rotate`） | `socialV2.reply = { mode, legacy:{…}, fast:{…} }` |
+| 23 | 悬浮窗 / 字幕 ↔ QQ / B站：同一个她（记忆互通 + 回复速度） | SurfCore → 悬浮窗 → 记忆互通 / 回复速度（会话·字幕） | `plugins/surfcore/lib/{interop,orb-agent,pet-chat,desktop-archive}.js`、`src/chat-archive.js`、`src/memory-card.js` | `socialV2.orb.interop`、`socialV2.orb.chat.reply`、`socialV2.orb.companion.reply` |
+| 24 | 字幕窗不闪不跳 · 托盘隐藏不留残影 | 无（修 bug，托盘菜单「隐藏到后台」） | `plugins/surfcore/assets/orb-app/{main.js,companion.js,companion.css}` | `socialV2.orb.companion`（沿用） |
+| 25 | 桌宠：形象包切换 / 待机动作 / 注视 / 气泡重做 | SurfCore → 悬浮窗 → 外观；右键桌宠 | `plugins/surfcore/lib/{pet-packs,pet-gaze,pet-assets}.js`、`assets/orb-app/{pet.js,pet.css,main.js,preload.js}` | `socialV2.orb.pet.gaze`、`socialV2.orb.pet.wander`、`<stateDir>/orb/pet/packs.json` |
+| 26 | 看屏幕：只截主人当前用的窗口（三档） | 悬浮窗面板「眼」/ 会话里说「看一眼」/ 陪伴模式 | `plugins/surfcore/lib/orb-api.js`（`WINDOW_SCRIPT` / `SCREEN_SCRIPT` / `look`） | `socialV2.orb.screen.*`（沿用） |
 
 ---
 
@@ -366,6 +370,73 @@
 
 **验证**：`scripts/test-reply-mode.mjs`、`scripts/test-reply-wait.mjs`；真机 `POST /api/socialV2/rotate` 后 `GET /api/sessions` 能看到新 sessionId，旧会话保留可切回。
 
+## 23. 悬浮窗 / 字幕 ↔ QQ / B站：同一个她（记忆互通 + 回复速度）
+
+**背景**：以前悬浮窗会话和陪伴字幕其实是「另一个她」——只读同一张 `memory-card-prompt-qq.md`，人设截前 4200 字、记忆截前 2600 字，也不写回记忆卡；回复只有直连单轮一条路，没有 QQ 那边的会话连续性。主人要求「就像插件 qq 聊天一样专门开一个会话来进行聊天（注入记忆和人设）」，并且字幕/会话的记忆也要进记忆卡、进 Sprintkey 的记忆备份。
+
+**互通（`interop`）**：`orb.interop = { qq, bili, identity, recent, recentLines(4~40), recentHours(1~168), personaMaxChars(4000~30000), memoryMaxChars(2000~20000) }`
+
+- `qq` / `bili`：分别注入 `memory-card-prompt-qq.md` / `-prompt-bili.md`（B站 卡里本来只有公开内容）。
+- `identity`：注入「她叫谁、主人是谁、这台电脑是主人的、不是在群里说话」——以前这块完全没有，所以「你」指谁经常糊。
+- `recent`：读聊天存档里**别处**最近 N 行（QQ 为主，桌面这条线自己的话不重复塞），成 `- [来源] 谁：内容` 行。
+- 人设不再写死 4200 字，记忆不再写死 2600 字，按配置上限裁（末尾标「…（后面省略）」）。
+- 拼接顺序固定：身份 → 最近在别处 → QQ 卡 → B站 卡，总长受 `memoryMaxChars` 约束。
+
+**回复速度（两套，各自独立）**：`orb.chat.reply` 管悬浮窗会话，`orb.companion.reply` 管陪伴字幕。
+
+- `legacy`（原版）：专门开一个 DSH 会话（`orb-chat-<角色>-<代数>` / `orb-companion-<角色>-<代数>`），用 `sessionController` 推一轮、收 `turn/end` 的最终文本 —— 上下文连续，和 QQ 那边同款回合；代价是越聊越慢。
+- `fast`（快回复）：仍旧直连 `ctx.get('llm').stream()` 单轮，每句从记忆卡重建上下文。
+- 原版失败/超时（默认 180 秒，30~600 可调）**自动退回快回复**，不让她彻底哑掉；`sessionTurns=0` 表示永不换会话，>0 每 N 轮递增代数换一个干净会话。
+
+**数据类型**：
+
+- 记忆卡：`inbox` 事件多带 `channel`（`orb` / `companion` / `pet`），摄取时落成标题前缀（`悬浮窗 · …` / `字幕 · …` / `桌宠 · …`）+ tag + `record.channel`。
+- 聊天存档：`chat-archive.js` 新增 `channelLabel` / `messageType` 两列，取值 `qq-message` / `orb-chat` / `companion-subtitle`；新增 `readRecentChatRecords()`（只读文件尾部 256KB，切半的首行丢掉），给「最近在别处聊了什么」用。
+
+**入口**：悬浮窗面板 → 设置 → 「记忆互通（和 QQ / B站）」「回复速度（会话 / 字幕）」两段。
+
+**验证**：`scripts/test-orb-interop.mjs`（24 项）、`scripts/test-orb-agent.mjs`（17 项）、`scripts/test-memory-card-channel.mjs`（22 项）、`scripts/test-chat-archive-recent.mjs`（20 项），均已登记进 `scripts/test-audit.mjs`。
+
+## 24. 字幕窗：不闪、不跳，托盘隐藏不留残影（0.12.15）
+
+**背景**：陪伴模式字幕每 3 秒闪一下、位置上下跳；点「隐藏到后台」桌宠还赖在桌面上。日志里 `收回异常窗口` 一条能刷 11690 次。
+
+**闪**：`main.js` 每 3 秒轮询里**无条件** `setAlwaysOnTop(false)` → `(true,'screen-saver',1)` → `moveTop()`，DWM 每次都要把 `transparent:true` 的窗口拆下重合；叠加渲染端每次重推都把字幕区 `textContent=''` 全量重建。现在：只在「还没置顶」时补一次 `setAlwaysOnTop`，`moveTop()` 只做一次，状态推送做指纹去重（`sendCompanionState`），渲染端节点复用 + 指纹比对，`.bar` 的 `backdrop-filter: blur()` 换成内描边。
+
+**跳**：`setBounds(738)` 回读恒 `740`（无边框窗保留非客户区 + 175% 缩放），`if (b.width !== layout.width)` 永不收敛 → 每 3 秒真改一次宽 → 重新折行 → 高度变 → 底边锚定重算 y → 顶边上下漂。现在：宽度收敛容差 4px，高度按 8px 网格对齐（`snapCompanionHeight`）并把拖动基准一起更新，两窗都 `thickFrame:false`，主窗自愈阈值从 2 提到 6 且走 `applyBounds(…, 'self-heal')`。
+
+**残影**：`hideWindow()` 只 `win.hide()`，从没碰字幕窗；而轮询里 `if (!isVisible()) showInactive()` 会在 3 秒后把隐藏的窗又拉回来。现在：隐藏同时收桌宠 + 字幕窗 + 清定时器并置 `hiddenByUser`，`showWindow` 按 `restoreSurface` 恢复（该恢复哪个），`second-instance` 也尊重 `hiddenByUser`；`SetWindowPos` 的 `0x0043` 去掉 `SWP_SHOWWINDOW`（`0x0013`），`setVisibleOnAllWorkspaces` 只在 macOS 调（Windows 上会让 DWM cloaked）。
+
+**验证**：`scripts/test-orb-window-state.mjs`（28 项纯函数 + 源码断言，已进审计）；真机看 `~/.dsh/surfcore/orb/orb-app.log` 里 `收回异常窗口` 是否停刷。
+
+## 25. 桌宠：形象包 / 待机动作 / 注视 / 气泡重做
+
+**形象包**：`<stateDir>/orb/pet/packs/<id>/{pack.json,webm/*.webm,preview.png,LICENSE}` + `packs.json { version:1, activePackId }`。内置包 `id='dsh-pet'` 只读（老目录 `orb/pet/webm`），新包放在 `packs/` 里；导入支持「选文件夹」和「选 .tgz」（认 `webm/*.webm`，也认上游包的 `assets/webm/*` + `assets/config.jsonc`），先 staging 再原子替换。`POST /api/orb/pet-packs { action: list|status|verify|activate|remove|preview|import }`，`activate`/`import`/`remove` 之后立刻 `writeHostFile(true)`，桌面端 4 秒内热重载（`pet.js` 的 `startConfigWatch`）。
+
+**动作**：`pickIdleAction()` 以前只抽 idle+categories+moves，manifest 里的 `turn`（东张西望）和 `weights.turn` 从来没生效；现在按权重抽 idle / turn / move / category / click，webm 播完再排下一个，带 watchdog 防「不触发 ended 卡死」和「迟到 ended 误触发」。
+
+**走位**：`pet.js` 调 `window.orb.petMove({ dx, dy, ms })` → 主进程 `ipcMain.handle('orb:pet-move')` 按 `screen.getDisplayMatching(bounds).workArea` clamp（留边距）、`animateTo(…, { duration: ms })` 平滑移动，返回 `{ ok, clamped, x, y }`；关掉走位（`pet.wander.enabled=false`）就只播原地动作。
+
+**注视**：`pet-gaze.js` 把光标坐标算成方向 / 镜像 / 距离，`pet.js` 每 40ms（20~200 可调）问一次 `window.orb.cursor()` 并写 `--gaze-shift`，眼睛和身体会真的朝光标偏；`pet.gaze.enabled=false` 关。
+
+**气泡**：改成实心卡片（`#1b2130` + 1px 内描边 + 投影 + 90ms 淡入），按「头顶可用余量」`placeBubble()` 定位，`-webkit-line-clamp:3`、240 字截断、带图 2 行 + 40px 缩略图。
+
+**许可**：内置素材来自 `dsh-pet`（MIT）；`Coopanion` 是 AGPL-3.0-or-later，**只参考设计，不搬代码/素材**。两条都写在新文件头里。
+
+**入口**：悬浮窗面板 → 设置 → 外观（形象包下拉 / 导入 / 试播 / 注视 / 走位）。
+
+**验证**：`plugins/surfcore/scripts/test-pet-packs.mjs`（8 组）；回退形象 `avatar.png` 在素材未装时仍可用。
+
+## 26. 看屏幕：只截主人当前用的那个窗口
+
+以前 `look()` 用 PowerShell 截**整屏**，模型看到一大片桌面，还容易把别的窗口看混。现在先枚举前台窗口（z-order 下探 16 层、跳过自己的三个窗口、带标题和矩形），再按矩形只截那一个窗口：失败才回退整屏并在 `note` 写原因。
+
+- 三档：`preview`（设置页试拍，原尺寸 PNG）/ `chat`（会话里「看一眼」，960 宽 JPEG）/ `companion`（陪伴字幕，1280 宽 JPEG）。
+- `runChatTurn` 在 auto 模式截图失败但拿到窗口标题时，会用标题再问一次（`screenMode:''`），并把 `[[看一眼]]` 暗号从回复里剥掉。
+- 返回字段带 `preview/mime/width/height/tier/source/captureRect/fallback/note/title/windowRect/cursor`，老字段全保留，前端不用改。
+
+**验证**：真机 PowerShell 截到 2111×1337@(245,77)，`read_image` 确认只有窗口内容、无桌面偏移；黑名单 / 屏幕权限关 / 超限 / manual 模式都不占额度。
+
 ## 附：新增文件清单
 
 | 文件 | 作用 |
@@ -391,7 +462,11 @@
 | `E:\聊天日常\pic-tab-click.mjs` | 发图设置页 CDP 验收（点 tab + 断言 + 截图） |
 | `plugins/surfcore/assets/orb-app/main.js` | 悬浮窗 Electron 主进程：窗口尺寸、`orb:*` IPC、`orb:bubble-space` 气泡带 |
 | `plugins/surfcore/assets/orb-app/orb.js` | 面板渲染、已读水位上报、双击看图器（缩放/拖动） |
-| `plugins/surfcore/assets/orb-app/pet.js` / `pet.css` | 桌面宠物与头顶气泡（`fitBubble()` 自适应高度） |
+| `plugins/surfcore/assets/orb-app/pet.js` / `pet.css` | 桌面宠物与头顶气泡（`placeBubble()` 按头顶余量定位 + 3 行折叠） |
+| `plugins/surfcore/lib/pet-packs.js` | 桌宠形象包：目录 / `packs.json` / 导入文件夹与 .tgz / 启用 / 校验 / 试播（内置包只读） |
+| `plugins/surfcore/lib/pet-gaze.js` | 光标 → 注视方向 / 镜像 / 距离（20~50ms 节流），供 `pet.js` 写 `--gaze-shift` |
+| `plugins/surfcore/scripts/test-pet-packs.mjs` | 形象包 8 组单测（空目录/导入文件夹/导入 tgz/校验/试播/内置包删不掉/脏 id/回落） |
+| `scripts/test-orb-window-state.mjs` | 字幕窗闪烁/跳位/托盘残影 28 项（纯函数 + 源码断言） |
 | `plugins/surfcore/lib/orb.js` | 悬浮窗配置与状态（消息、`seenId`、`markSeen`） |
 | `plugins/surfcore/lib/orb-api.js` | 悬浮窗 HTTP 路由 + 一轮对话编排 + QQ 近况注入 |
 | `plugins/surfcore/lib/pet-chat.js` | 悬浮窗提示词（记忆卡 / 配图） |
@@ -402,6 +477,12 @@
 | `docs/sprintkey/MEMORY-ARCHIVE.md` | 聊天全量存档目录/字段/滚动/发送/设置与验收 |
 | `src/friend-guard.js` | 好友申请判定层（白名单范围 / 配额 / 冷却 / 提示词） |
 | `scripts/test-friend-guard.mjs` / `scripts/test-friend-wiring.mjs` | 好友申请 18 项判定 + 9 项接线测试 |
+| `plugins/surfcore/lib/interop.js` | 互通记忆纯函数：`normalizeInterop` / `clampText` / `formatRecentLines` / `buildInteropMemory` |
+| `plugins/surfcore/lib/orb-agent.js` | 「原版」回复的会话驱动器：`createTurnCollector` / `createOrbAgent`（inspect→create、turn/end 收文本、超时取消） |
+| `scripts/test-orb-interop.mjs` | 互通记忆 24 项单测（钳制/截断/时间窗/拼接顺序） |
+| `scripts/test-orb-agent.mjs` | 会话驱动器 17 项单测（只认 turn/end、ready 缓存、失败/超时清理） |
+| `scripts/test-memory-card-channel.mjs` | 记忆卡数据类型 22 项单测（悬浮窗/字幕/桌宠的标题前缀与 tag） |
+| `scripts/test-chat-archive-recent.mjs` | 存档数据类型 + 尾部回读 20 项单测 |
 | `src/memory-card.js` | 衰减记忆卡（含 `includePetInBili`、B站 侧 fail-closed） |
 
 修改的既有文件：`src/bridge.js`、`plugins/surfcore/lib/index.js`、`plugins/surfcore/lib/client.js`。

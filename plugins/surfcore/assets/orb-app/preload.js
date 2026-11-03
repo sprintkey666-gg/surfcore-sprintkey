@@ -36,6 +36,10 @@ contextBridge.exposeInMainWorld('orb', {
   menurect: (width, height) => ipcRenderer.invoke('orb:menurect', { width, height }),
   /** 形象配置：是不是桌宠、素材在哪、动画清单长什么样。 */
   petconfig: () => ipcRenderer.invoke('orb:petconfig'),
+  /** 自己走两步：{dx,dy,ms}，主进程负责夹到屏幕内并平滑移动，返回 {clamped}。 */
+  petMove: (payload) => ipcRenderer.invoke('orb:pet-move', payload || {}),
+  /** 鼠标位置：宠物窗口是全透明覆盖层，收不到可靠 mousemove，注视只能问主进程。 */
+  cursor: () => ipcRenderer.invoke('orb:cursor'),
   /** 鼠标是否在宠物/气泡身上——true 才有点击权，false 让给桌面。 */
   hit: (on) => ipcRenderer.invoke('orb:hit', Boolean(on)),
   bubbleShown: (on) => ipcRenderer.invoke('orb:bubble-shown', Boolean(on)),

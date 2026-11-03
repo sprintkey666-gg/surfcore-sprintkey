@@ -51,53 +51,176 @@ export function screenGate(cfg, titles = []) {
   return { blocked: false };
 }
 
-/** 枚举窗口靠 PowerShell + User32：不引依赖，Windows 上稳。 */
+/**
+ * 枚举窗口靠 PowerShell + User32：不引依赖，Windows 上稳。
+ *
+ * 注意三件事：
+ *  - 先 SetProcessDPIAware：否则 175% 缩放下 GetWindowRect 拿到的是逻辑像素，截出来的区域会错位/发虚。
+ *  - 前台窗口可能是我们自己的悬浮窗/桌宠/字幕窗，沿 z-order 往下找第一个「不是自己的」可见窗口。
+ *  - stdout 必须显式设成 UTF-8：多行 -Command 里带中文字面量时，默认 GBK 会让 Node 解码成乱码。
+ */
 const WINDOW_SCRIPT = `
 $ProgressPreference = 'SilentlyContinue'
-Add-Type -Namespace SurfCoreOrb -Name Win -MemberDefinition @'
-[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow();
-[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(System.IntPtr hWnd, out int pid);
-'@ | Out-Null
-$fg = [SurfCoreOrb.Win]::GetForegroundWindow()
-$fgPid = 0
-[void][SurfCoreOrb.Win]::GetWindowThreadProcessId($fg, [ref]$fgPid)
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
+Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class SurfCoreOrbWin {
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+  [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT pt);
+}
+'@
+[void][SurfCoreOrbWin]::SetProcessDPIAware()
+$ownTitles = @('SurfCore 悬浮窗', 'SurfCore 桌宠', '陪伴字幕')
+
+function Read-WinTitle([IntPtr]$h) {
+  $sb = New-Object System.Text.StringBuilder 512
+  [void][SurfCoreOrbWin]::GetWindowText($h, $sb, 512)
+  return $sb.ToString()
+}
+
+$fg = [SurfCoreOrbWin]::GetForegroundWindow()
+$hwnd = [IntPtr]::Zero
+$title = ''
+$rect = New-Object SurfCoreOrbWin+RECT
+$h = $fg
+for ($i = 0; $i -lt 16 -and [int64]$h -ne 0; $i++) {
+  $t = Read-WinTitle $h
+  if ($t -and $t.Trim() -ne '' -and -not ($ownTitles -contains $t.Trim())) {
+    if ([SurfCoreOrbWin]::IsWindowVisible($h) -and -not [SurfCoreOrbWin]::IsIconic($h)) {
+      $r = New-Object SurfCoreOrbWin+RECT
+      if ([SurfCoreOrbWin]::GetWindowRect($h, [ref]$r)) {
+        $w = $r.Right - $r.Left
+        $hh = $r.Bottom - $r.Top
+        if ($w -ge 200 -and $hh -ge 150) { $hwnd = $h; $title = $t; $rect = $r; break }
+      }
+    }
+  }
+  $h = [SurfCoreOrbWin]::GetWindow($h, 2)
+}
+
+$activePid = 0
+$targetHwnd = $fg
+if ([int64]$hwnd -ne 0) { $targetHwnd = $hwnd }
+[void][SurfCoreOrbWin]::GetWindowThreadProcessId($targetHwnd, [ref]$activePid)
+$activeName = ''
+try { $activeName = (Get-Process -Id $activePid -ErrorAction Stop).ProcessName } catch {}
+$cursor = New-Object SurfCoreOrbWin+POINT
+[void][SurfCoreOrbWin]::GetCursorPos([ref]$cursor)
+
 $items = @()
-foreach ($p in (Get-Process | Where-Object { $_.MainWindowTitle -and $_.MainWindowTitle.Trim() -ne '' })) {
+foreach ($p in (Get-Process | Where-Object { $_.MainWindowTitle -and $_.MainWindowTitle.Trim() -ne '' -and -not ($ownTitles -contains $_.MainWindowTitle.Trim()) })) {
   $items += [pscustomobject]@{ pid = $p.Id; name = $p.ProcessName; title = $p.MainWindowTitle }
 }
-$active = $items | Where-Object { $_.pid -eq $fgPid } | Select-Object -First 1
+
 [pscustomobject]@{
-  active = if ($active) { $active } else { [pscustomobject]@{ pid = $fgPid; name = ''; title = '' } }
+  active = [pscustomobject]@{
+    pid = [int]$activePid
+    name = $activeName
+    title = $title
+    hwnd = [int64]$hwnd
+    rect = [pscustomobject]@{ x = $rect.Left; y = $rect.Top; w = ($rect.Right - $rect.Left); h = ($rect.Bottom - $rect.Top) }
+  }
+  cursor = [pscustomobject]@{ x = $cursor.X; y = $cursor.Y }
   windows = @($items | Select-Object -First 25)
-} | ConvertTo-Json -Depth 4 -Compress
+} | ConvertTo-Json -Depth 5 -Compress
 `;
 
+/**
+ * 截图：一张只拍一次，区域由调用方给（活动窗口矩形），拿不到/不合法才回退整屏。
+ *
+ * - SURFCORE_ORB_SHOT    目标文件（后缀决定 PNG / JPEG）
+ * - SURFCORE_ORB_MAXW    0=不缩放（设置页预览用原尺寸 PNG）；960/1280=缩放后的 JPEG
+ * - SURFCORE_ORB_QUALITY JPEG 质量，默认 85
+ * - SURFCORE_ORB_RECT    "x,y,w,h"（物理像素）；缺省或非法时回退整屏，并在 note 里说明
+ *
+ * 输出 source=window|screen + note，调用方不用猜是窗口还是整屏。
+ */
 const SCREEN_SCRIPT = `
 $ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class SurfCoreOrbDpi {
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+}
+'@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+# 必须先声明 DPI 感知：否则 175% 缩放下 VirtualScreen 是逻辑尺寸（2560x1440 -> 1463x823），
+# 拿物理像素的窗口矩形去 Intersect 会被裁掉一大块，截出来的位置也是错的。
+[void][SurfCoreOrbDpi]::SetProcessDPIAware()
 $target = $env:SURFCORE_ORB_SHOT
-$maxW = if ($env:SURFCORE_ORB_MAXW) { [int]$env:SURFCORE_ORB_MAXW } else { 1280 }
+$maxW = if ($env:SURFCORE_ORB_MAXW) { [int]$env:SURFCORE_ORB_MAXW } else { 0 }
+$quality = if ($env:SURFCORE_ORB_QUALITY) { [int]$env:SURFCORE_ORB_QUALITY } else { 85 }
 $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
-$bmp = New-Object System.Drawing.Bitmap $vs.Width, $vs.Height
+$src = New-Object System.Drawing.Rectangle $vs.Left, $vs.Top, $vs.Width, $vs.Height
+$crop = $src
+$source = 'screen'
+$note = ''
+$rect = $null
+if ($env:SURFCORE_ORB_RECT) {
+  if ($env:SURFCORE_ORB_RECT -match '^(-?\\d+),(-?\\d+),(\\d+),(\\d+)$') {
+    $rect = New-Object System.Drawing.Rectangle ([int]$Matches[1]), ([int]$Matches[2]), ([int]$Matches[3]), ([int]$Matches[4])
+  } else {
+    $note = '窗口坐标无效，回退成整屏'
+  }
+}
+if ($rect) {
+  if ($rect.Width -ge 200 -and $rect.Height -ge 150) {
+    $crop = [System.Drawing.Rectangle]::Intersect($src, $rect)
+    if ($crop.Width -ge 200 -and $crop.Height -ge 150) { $source = 'window' } else { $crop = $src; $note = '窗口区域不在屏幕内，回退成整屏' }
+  } else {
+    $note = '窗口太小，回退成整屏'
+  }
+}
+$bmp = New-Object System.Drawing.Bitmap $crop.Width, $crop.Height
 $g = [System.Drawing.Graphics]::FromImage($bmp)
-$g.CopyFromScreen($vs.Left, $vs.Top, 0, 0, $bmp.Size)
-$w = [Math]::Min($maxW, $vs.Width)
-$h = [int]($vs.Height * ($w / $vs.Width))
-$small = New-Object System.Drawing.Bitmap $w, $h
-$g2 = [System.Drawing.Graphics]::FromImage($small)
-$g2.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-$g2.DrawImage($bmp, 0, 0, $w, $h)
+$g.CopyFromScreen($crop.Left, $crop.Top, 0, 0, $bmp.Size)
+$w = $crop.Width
+$h = $crop.Height
+$scaled = $false
+if ($maxW -gt 0 -and $crop.Width -gt $maxW) {
+  $w = $maxW
+  $h = [int][Math]::Round($crop.Height * ($maxW / $crop.Width))
+  $outImg = New-Object System.Drawing.Bitmap $w, $h
+  $g2 = [System.Drawing.Graphics]::FromImage($outImg)
+  $g2.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+  $g2.DrawImage($bmp, 0, 0, $w, $h)
+  $scaled = $true
+} else {
+  $outImg = $bmp
+}
 if ($target -like '*.jpg' -or $target -like '*.jpeg') {
   $codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' }
   $params = New-Object System.Drawing.Imaging.EncoderParameters 1
-  $params.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter ([System.Drawing.Imaging.Encoder]::Quality, [long]72)
-  $small.Save($target, $codec, $params)
+  $params.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter ([System.Drawing.Imaging.Encoder]::Quality, [long]$quality)
+  $outImg.Save($target, $codec, $params)
 } else {
-  $small.Save($target, [System.Drawing.Imaging.ImageFormat]::Png)
+  $outImg.Save($target, [System.Drawing.Imaging.ImageFormat]::Png)
 }
-$g2.Dispose(); $small.Dispose(); $g.Dispose(); $bmp.Dispose()
-@{ ok = $true; width = $w; height = $h } | ConvertTo-Json -Compress
+if ($scaled) { $outImg.Dispose(); $g2.Dispose() }
+$g.Dispose(); $bmp.Dispose()
+[pscustomobject]@{
+  ok = $true
+  width = $w
+  height = $h
+  original = [pscustomobject]@{ width = $crop.Width; height = $crop.Height }
+  source = $source
+  rect = [pscustomobject]@{ x = $crop.Left; y = $crop.Top; w = $crop.Width; h = $crop.Height }
+  note = $note
+} | ConvertTo-Json -Depth 4 -Compress
 `;
 
 
@@ -369,19 +492,40 @@ export function createOrbApiService({
     return { ok: false, error: '这次没找到合适的图' };
   }
 
-  /** 拍一张给她看：图读进内存，磁盘那张按设置立刻删。 */
-  async function shotForChat(reason, cfg) {
-    const shot = await look({ reason, small: true });
-    if (!shot.ok || !shot.screenshot) return null;
+  /** 拍一张给她看：图读进内存，磁盘那张按设置立刻删。失败时把原因和窗口标题一起带回来。 */
+  async function shotForChat(reason, cfg, tier = '') {
+    const shot = await look({ reason, small: true, tier });
+    if (!shot.ok || !shot.screenshot) {
+      return {
+        image: null,
+        error: shot.error || '拍不到屏幕',
+        reason: shot.reason || '',
+        title: String(shot.title || ''),
+        active: shot.active || null,
+        fallback: shot.fallback === true,
+      };
+    }
     let image = null;
+    let error = '';
     try {
       const buf = fs.readFileSync(shot.screenshot);
       if (buf.length > 0 && buf.length <= 900 * 1024) {
-        image = { mimeType: 'image/jpeg', data: buf.toString('base64') };
+        image = { mimeType: shot.mime === 'image/png' ? 'image/png' : 'image/jpeg', data: buf.toString('base64') };
+      } else {
+        error = '截出来的图太大（超过 900KB），没附上';
       }
-    } catch {}
+    } catch (e) {
+      error = String(e?.message ?? e);
+    }
     if (cfg?.screen?.deleteAfterRead !== false) dropShot(shot.screenshot);
-    return image;
+    return {
+      image,
+      error: image ? '' : error || '截图没能读进内存',
+      reason: '',
+      title: String(shot.title || ''),
+      active: shot.active || null,
+      fallback: shot.fallback === true,
+    };
   }
 
   /** 她这一小时还能不能配图（和 /pic 共用同一个额度）。 */
@@ -422,6 +566,8 @@ export function createOrbApiService({
 
     let image = null;
     let result;
+    // [[看一眼]] 是「申请」标记，最终回复里绝不能出现（模型有时会把它留在第二段里）。
+    const dropPeek = (s) => String(s || '').replace(/\[\[看一眼\]\]/g, '').trim();
     if (mode === 'auto' && cfg.screen.enabled === true) {
       // 自动档两段式：先让她自己决定要不要看（只在回复里出一句 [[看一眼]]），
       // 真要看才拍一张、拍完再问一遍，用第二次的回复当正式回答。
@@ -429,19 +575,37 @@ export function createOrbApiService({
       const first = await chat.chat({ text: say, modality: 'text', desktop, images: userImages, pics, screenMode: 'auto', allowPic });
       const firstText = String(first.reply?.text || '');
       if (first.ok && /\[\[看一眼\]\]/.test(firstText)) {
-        image = await shotForChat('auto', cfg);
+        const shotRes = await shotForChat('auto', cfg);
+        image = shotRes.image;
         if (image) {
           result = await chat.chat({ text: say, modality: 'text', desktop, image, images: userImages, pics, screenMode: 'auto', allowPic });
-          if (!result.ok) result = { ...first, reply: { ...(first.reply || {}), text: firstText.replace(/\[\[看一眼\]\]/g, '').trim() } };
+          if (!result.ok) result = { ...first, reply: { ...(first.reply || {}), text: dropPeek(firstText) } };
+        } else if (shotRes.title) {
+          // 截不到画面时别装瞎也别装看见：拿窗口标题当唯一线索，再问一次。
+          pluginLog('[orb-api] 自动看屏幕失败，回退窗口标题：', String(shotRes.error || ''));
+          // 失败原因只进日志：PowerShell 的 stderr 又长又乱，塞给模型只会干扰它说话。
+          const note = [
+            '（你本来想看一眼屏幕，但这次没截到画面。）',
+            `只知道主人此刻正在用的窗口标题是「${shotRes.title}」。`,
+            '只根据窗口标题和聊天上下文回，别装作看到了画面，也别念窗口标题里的文件路径、账号之类的隐私。',
+          ].join('');
+          const retry = await chat.chat({ text: note, modality: 'text', desktop, images: userImages, pics, screenMode: '', allowPic });
+          result = retry.ok ? retry : { ...first, reply: { ...(first.reply || {}), text: dropPeek(firstText) } };
+          if (result.ok && result.reply) result = { ...result, reply: { ...result.reply, text: dropPeek(result.reply.text) } };
+          if (result.rawReply) result = { ...result, rawReply: dropPeek(result.rawReply) };
         } else {
-          result = { ...first, reply: { ...(first.reply || {}), text: firstText.replace(/\[\[看一眼\]\]/g, '').trim() } };
+          result = { ...first, reply: { ...(first.reply || {}), text: dropPeek(firstText) } };
         }
       } else {
         result = first;
       }
     } else {
       // 手动档 / 老配置（attachToChat）：每条消息都顺手拍一张给她看。
-      if (cfg.screen.enabled === true && cfg.screen.attachToChat !== false) image = await shotForChat('chat', cfg);
+      if (cfg.screen.enabled === true && cfg.screen.attachToChat !== false) {
+        const shotRes = await shotForChat('chat', cfg);
+        image = shotRes.image;
+        if (!image) pluginLog('[orb-api] 手动档截图失败：', String(shotRes.error || ''));
+      }
       result = await chat.chat({ text: say, modality: 'text', desktop, image, images: userImages, pics, allowPic });
     }
     if (!result.ok) return { ok: false, result };
@@ -549,6 +713,11 @@ export function createOrbApiService({
           singleClickOpens: pet.singleClickOpens,
           idleMinMs: pet.idleMinMs,
           idleMaxMs: pet.idleMaxMs,
+          // 注视 / 溜达 / 换皮：桌面端只认这几个字段，改配置后靠 writeHostFile 重写。
+          gaze: pet.gaze || null,
+          wander: pet.wander || null,
+          avatar: pet.avatar || '',
+          packId: pet.packId || '',
           manifest: pet.manifest,
         }
         : null,
@@ -614,7 +783,26 @@ export function createOrbApiService({
     };
   }
 
-  async function look({ reason = '', small = false, manual = false } = {}) {
+  /** 把窗口矩形收敛成 {x,y,w,h} 的整数；拿不到/太小就给 null（调用方回退整屏）。 */
+  function normRect(rect) {
+    const n = (v) => Number(v);
+    if (!rect) return null;
+    const x = n(rect.x), y = n(rect.y), w = n(rect.w ?? rect.width), h = n(rect.h ?? rect.height);
+    if (![x, y, w, h].every(Number.isFinite)) return null;
+    if (w < 200 || h < 150) return null;
+    return { x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) };
+  }
+
+  /**
+   * 看屏幕（唯一入口）。
+   *
+   * 档位（tier）：
+   *  - preview：设置页试拍，原尺寸 PNG，另存临时文件把路径回给前端；
+   *  - chat：聊天里附给模型，宽 960 JPEG；
+   *  - companion：陪伴字幕，宽 1280 JPEG（reason 以 companion 开头或显式 tier 指定）。
+   * 只截主人此刻正在用的那个窗口；截不到窗口才回退整屏，并在 note/fallback 里说清楚。
+   */
+  async function look({ reason = '', small = false, manual = false, tier = '' } = {}) {
     const cfg = orb.readConfig();
     if (cfg.screen.enabled !== true) {
       return { ok: false, reason: 'screen-disabled', error: '主人还没允许「让她看见屏幕」（设置 → SurfCore → 悬浮窗 → 让它看见）' };
@@ -632,14 +820,33 @@ export function createOrbApiService({
       return { ok: false, reason: 'blocked', matched: gate.matched, error: `当前窗口命中隐私黑名单，没拍：${gate.matched.join('、')}` };
     }
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    // 给模型看的那张要小（宽 800 的 JPEG，几十 KB）；给工具/设置页看的存 PNG 原尺寸。
-    const shotPath = path.join(shotDir, small ? `${stamp}.chat.jpg` : `${stamp}.png`);
+    const wantTier = small
+      ? (/^companion/i.test(String(tier || '')) || /^companion/i.test(String(reason || '')) ? 'companion' : 'chat')
+      : 'preview';
+    const maxW = wantTier === 'chat' ? 960 : wantTier === 'companion' ? 1280 : 0;
+    const ext = wantTier === 'preview' ? 'png' : 'jpg';
+    const shotPath = path.join(shotDir, `${stamp}.${wantTier}.${ext}`);
+    const windowRect = normRect(win?.active?.rect);
     const shot = await runPowerShell(SCREEN_SCRIPT, {
-      env: { SURFCORE_ORB_SHOT: shotPath, ...(small ? { SURFCORE_ORB_MAXW: '800' } : {}) },
+      env: {
+        SURFCORE_ORB_SHOT: shotPath,
+        SURFCORE_ORB_MAXW: String(maxW),
+        SURFCORE_ORB_QUALITY: wantTier === 'preview' ? '92' : '85',
+        ...(windowRect ? { SURFCORE_ORB_RECT: `${windowRect.x},${windowRect.y},${windowRect.w},${windowRect.h}` } : {}),
+      },
       timeoutMs: 25000,
     });
     if (!shot.ok || !fs.existsSync(shotPath)) {
-      return { ok: false, reason: 'capture-failed', error: `截屏失败：${String(shot.stderr || shot.error?.message || '').slice(0, 200)}` };
+      return {
+        ok: false,
+        reason: 'capture-failed',
+        error: `截屏失败：${String(shot.stderr || shot.error?.message || '').slice(0, 200)}`,
+        title: String(win?.active?.title || '').slice(0, 120),
+        windowRect,
+        fallback: true,
+        active: { title: String(win?.active?.title || '').slice(0, 120), name: String(win?.active?.name || '').slice(0, 60) },
+        windows: (Array.isArray(win?.windows) ? win.windows : []).slice(0, 15).map((w) => ({ title: String(w?.title || '').slice(0, 120), name: String(w?.name || '').slice(0, 60) })),
+      };
     }
     screenHits.push(Date.now());
     bumpShot(reason);
@@ -652,9 +859,30 @@ export function createOrbApiService({
     } catch {}
     let size = 0;
     try { size = fs.statSync(shotPath).size; } catch {}
+    let cap = null;
+    try { cap = JSON.parse(String(shot.stdout || '').trim()); } catch {}
+    const cursor = win?.cursor && Number.isFinite(Number(win.cursor.x)) && Number.isFinite(Number(win.cursor.y))
+      ? { x: Math.round(Number(win.cursor.x)), y: Math.round(Number(win.cursor.y)) }
+      : null;
+    const source = cap?.source === 'window' ? 'window' : 'screen';
+    const note = String(cap?.note || '')
+      || (source !== 'window' ? (windowRect ? '窗口截取失败，回退成整屏' : '没拿到活动窗口，回退成整屏') : '');
     return {
       ok: true,
       screenshot: shotPath,
+      // 设置页预览拿原尺寸 PNG；聊天/陪伴的那张不另存路径，图读进内存就删。
+      preview: wantTier === 'preview' ? shotPath : '',
+      mime: wantTier === 'preview' ? 'image/png' : 'image/jpeg',
+      width: Number(cap?.width) || 0,
+      height: Number(cap?.height) || 0,
+      tier: wantTier,
+      source,
+      captureRect: cap?.rect ? { x: Number(cap.rect.x), y: Number(cap.rect.y), w: Number(cap.rect.w), h: Number(cap.rect.h) } : null,
+      fallback: source !== 'window',
+      note,
+      title: String(win?.active?.title || '').slice(0, 120),
+      windowRect,
+      cursor,
       bytes: size,
       active: { title: String(win?.active?.title || '').slice(0, 120), name: String(win?.active?.name || '').slice(0, 60) },
       windows: (Array.isArray(win?.windows) ? win.windows : []).slice(0, 15).map((w) => ({ title: String(w?.title || '').slice(0, 120), name: String(w?.name || '').slice(0, 60) })),
@@ -1192,7 +1420,7 @@ export function createOrbApiService({
         return;
       }
       lastEyeAt = nowMs;
-      const shot = await look({ reason: 'eye', small: true, manual: true });
+      const shot = await look({ reason: 'eye', small: true, manual: true, tier: 'chat' });
       if (!shot.ok) {
         json(res, 200, {
           ok: false,
@@ -1201,6 +1429,10 @@ export function createOrbApiService({
           visionOk,
           reason: shot.reason,
           error: shot.error || '拍不到屏幕',
+          title: shot.title || '',
+          windowRect: shot.windowRect ?? null,
+          source: shot.source || '',
+          fallback: shot.fallback === true,
           screen: openedScreen,
         });
         return;
@@ -1209,7 +1441,7 @@ export function createOrbApiService({
       try {
         const buf = fs.readFileSync(shot.screenshot);
         if (buf.length > 0 && buf.length <= 900 * 1024) {
-          image = { mimeType: 'image/jpeg', data: buf.toString('base64') };
+          image = { mimeType: shot.mime || 'image/jpeg', data: buf.toString('base64') };
         }
       } catch (error) {
         pluginLog('[orb-api] 读截图失败：', String(error?.message ?? error));
@@ -1217,8 +1449,13 @@ export function createOrbApiService({
       if (cfg.screen.deleteAfterRead !== false) dropShot(shot.screenshot);
 
       const probe = [
-        '（主人刚给了你看屏幕的权限，这是刚刚截的一张屏。）',
-        '如果你真的能看到这张图：先一句话说清画面里最显眼的窗口/内容，再用你自己的口气跟主人说一句。',
+        shot.title
+          ? `（这是主人此刻正在用的窗口：标题「${shot.title}」。）`
+          : '（这是主人此刻的屏幕。）',
+        shot.source === 'window'
+          ? '只看这个窗口：一句话说你真正注意到的内容（窗口里在做什么、画面大概是什么），再用你自己的口气跟主人说一句。'
+          : '这次没抓到活动窗口、只截到了整张屏幕，就说你注意到的内容。',
+        '不要念文件名、聊天内容、账号、地址或任何数字；拿不准的就别提。',
         '如果你看不到任何图片（只有一段“(image omitted...)”文字），就只回「看不到图」，别的什么都别说。',
       ].join('');
       let reply = '';
@@ -1251,6 +1488,14 @@ export function createOrbApiService({
         reply: text,
         shotAt: shot.at,
         active: shot.active ?? null,
+        title: shot.title || '',
+        windowRect: shot.windowRect ?? null,
+        cursor: shot.cursor ?? null,
+        tier: shot.tier || '',
+        source: shot.source || '',
+        captureRect: shot.captureRect ?? null,
+        fallback: shot.fallback === true,
+        bytes: shot.bytes || 0,
         screen: screenSnapshot(orb.readConfig()),
         state: stateForOrb(),
       });

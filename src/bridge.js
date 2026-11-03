@@ -91,7 +91,7 @@ import {
 } from './self-expression.js';
 import {
   appendDiaryEntry, appendDiaryEntryGrouped, buildDiaryPrompt, characterDiaryState, cleanDiaryText,
-  diaryBaseDir, diaryCharDir, diaryFileFor, diaryPublicBaseDir, diaryPublicCharDir, diaryStateFile,
+  diaryBaseDir, diaryCharDir, diaryFileFor, diaryNextDueAt, diaryPublicBaseDir, diaryPublicCharDir, diaryStateFile,
   formatDiaryEntry, isDiaryDue, listDiaryEntries, listDiaryFiles, migrateLegacyDiary,
   normalizeDiaryConfig, publicPublishQuota, readDiaryState, readDiaryTail, scrubPublicText, writeDiaryState,
 } from './diary.js';
@@ -5301,6 +5301,12 @@ async function main() {
         file,
         dir: charDir,
         lastWriteAt: Number(diarySt.lastWriteAt) || 0,
+        // 下次写作时间点：按「本地日期 + 写作时间」算，界面上能直接看到什么时候写下一篇。
+        nextDueAt: diaryNextDueAt({
+          lastWriteAt: Number(diarySt.lastWriteAt) || 0,
+          everyDays: diary.everyDays,
+          hour: diary.hour,
+        }),
         lastSendAt: Number(diarySt.lastSendAt) || 0,
         lastError: String(diarySt.lastError || ''),
         lastSendError: String(diarySt.lastSendError || ''),
@@ -7491,18 +7497,11 @@ async function main() {
           // 如果当前已经是“潜水”唤醒配置，且最近还有对话/刚被唤醒，不允许用 mark_read 直接回到潜水；
           // 必须先等够沉睡前观察窗口，避免“聊两句又去潜水”。
           if (isSleepingConfigV2(st.wakeConfig) && preSleepWaitBlockedV2(st)) {
-            const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
-            const remaining = Math.max(0, preSleepMs - ((st.lastIncomingAt || 0) ? Date.now() - st.lastIncomingAt : 0));
-            const remainMin = Math.ceil(remaining / 60000);
-            sendJson({
-              ok: false,
-              error: `还不能通过 qq_mark_read 直接回到潜水：还需等待约 ${remainMin} 分钟无新消息，或调用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成一次沉睡前观察。如果等待期间有人发新消息，请先查看返回的 newMessages；判断不需要你参与就可以直接收尾沉睡，若你参与了则需下次再等观察窗口。`,
-              preSleepWaitMs: preSleepMs,
-              preSleepWaitRemainingMs: remaining
-            }, 400);
+            sendJson(preSleepGateErrorV2(st, 'qq_mark_read 直接回到潜水'), 400);
             return;
           }
           const markedCount = acknowledgeMessagesV2(st, throughSeq);
+          resetWaitStreakV2(key);
           st.lastActionAt = Date.now();
           st.wakeConfig.noActionCount = 0;
           // 防止“有限潜水被 timeout 唤醒后 sleepUntil 被清空、又 mark_read 收尾”导致无定时器无触发条件的静默态。
@@ -7780,19 +7779,12 @@ async function main() {
           }
           // 沉睡前强制观察窗口：除非对方明确结束、或已经安静/等待足够时间，否则不允许 AI 聊两句就设置潜水。
           if (isSleepingConfigV2(next) && preSleepWaitBlockedV2(st)) {
-            const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
-            const remaining = Math.max(0, preSleepMs - ((st.lastIncomingAt || 0) ? Date.now() - st.lastIncomingAt : 0));
-            const remainMin = Math.ceil(remaining / 60000);
-            sendJson({
-              ok: false,
-              error: `还不能立刻设置潜水/下一次唤醒：还需等待约 ${remainMin} 分钟无新消息，或调用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成一次沉睡前观察。如果等待期间有人发新消息，请先查看返回的 newMessages；判断不需要你参与就可以直接设置并沉睡，若你参与了则需下次再等观察窗口。`,
-              preSleepWaitMs: preSleepMs,
-              preSleepWaitRemainingMs: remaining
-            }, 400);
+            sendJson(preSleepGateErrorV2(st, '立刻设置潜水/下一次唤醒'), 400);
             return;
           }
           const markedCount = acknowledgeOnClose ? acknowledgeMessagesV2(st, throughSeq) : 0;
           st.wakeConfig = next;
+          resetWaitStreakV2(key);
           st.wakeConfig.lastWakeAt = st.wakeConfig.lastWakeAt || 0;
           st.wakeConfig.wakeCount = st.wakeConfig.wakeCount || 0;
           st.wakeConfig.noActionCount = 0;
@@ -9743,9 +9735,15 @@ async function main() {
             const now = Date.now();
             const prev = waitStreaks.get(leaseKey);
             const count = prev && now - prev.lastAt < WAIT_STREAK_RESET_MS ? prev.count : 0;
+            // 沉睡前观察是唯一能让 preSleepWaitBlockedV2() 放行的动作：
+            // 让「连续等待上限」把它挡死，模型就只能在两条互相矛盾的提示之间打转。
+            const gateBlocked = preSleepWaitBlockedV2(st);
+            const observeMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
+            const observationAttempt = !replyWait && observeMs > 0 && timeoutMs >= observeMs && gateBlocked;
             // 只拦「长轮询」型等待；短等待（<5s，测试/探针常用）不参与计数，
             // 否则会把「等待中权限被撤销」这类用例的 403 语义挡掉。
-            if (timeoutMs >= 5000 && count >= WAIT_STREAK_LIMIT) {
+            if (timeoutMs >= 5000 && !observationAttempt && count >= WAIT_STREAK_LIMIT) {
+              const remaining = preSleepWaitRemainingV2(st);
               sendJson({
                 ok: true,
                 key,
@@ -9756,8 +9754,18 @@ async function main() {
                 waitedMs: 0,
                 stopped: true,
                 reason: 'consecutive-wait-limit',
-                message: `本回合已经连续等待 ${WAIT_STREAK_LIMIT} 次，不要再调用 qq_wait_for_messages；请设置下一次唤醒（或结束本回合）。`,
-                shouldSleep: true,
+                message: gateBlocked
+                  ? `本回合已经连续等待 ${WAIT_STREAK_LIMIT} 次。你要潜水的话还差约 ${Math.ceil(remaining / 1000)} 秒安静窗口：等满后调用一次 qq_wait_for_messages(purpose="messages", timeoutMs=${observeMs}) 完成沉睡前观察；如果只是想自然收尾，直接 qq_close_conversation（不需要观察）。`
+                  : `本回合已经连续等待 ${WAIT_STREAK_LIMIT} 次，不要再调用 qq_wait_for_messages；请设置下一次唤醒（或结束本回合）。`,
+                shouldSleep: !gateBlocked,
+                gateBlocked,
+                preSleepWaitMs: observeMs,
+                preSleepWaitRemainingMs: remaining,
+                retryAfterMs: remaining,
+                nextStep: gateBlocked
+                  ? '等安静满观察窗口后，再调用一次 qq_wait_for_messages(purpose="messages", timeoutMs=<沉睡前观察时长>)'
+                  : '调用 qq_set_wake_config 设置下一次唤醒，然后结束本回合',
+                alternative: gateBlocked ? 'qq_close_conversation（自然收尾，不需要观察）' : undefined,
                 newMessages: [],
                 readThroughSeq: readThroughSeqV2(st),
                 unreadCount: st.unread.length,
@@ -9791,20 +9799,37 @@ async function main() {
             st.pendingWakeTimer = null;
           }
           cancelReplyCheckV2(key); // AI 正在主动等待，取消回复检查定时器避免重复唤醒
-          // A reply wait must also include messages received while the model
-          // was reading/thinking after its snapshot, before this HTTP request.
+          // 基线必须是「模型已经看过的水位」，不能是「最后到达的 seq」：
+          // AI 刚回完话、主人立刻接一句，这条消息在开始等之前就到了，用到达水位算
+          // 会把它当成「已经知道」，于是这一轮永远等不到「新消息」，白等满 timeoutMs。
           const requestSeq = st.lastUnreadSeq || 0;
-          const baseline = replyWait && (v2ToolEnabled('getUnread') || v2ToolEnabled('getRecent')) ? readThroughSeqV2(st) : requestSeq;
+          const waitToolsReady = v2ToolEnabled('getUnread') || v2ToolEnabled('getRecent');
+          const baseline = waitToolsReady ? readThroughSeqV2(st) : requestSeq;
           const start = Date.now();
           let arrived = false;
           let lastNewAt = 0;
           let aborted = false;
+          // 等待开始时就已经躺在缓冲里的未读（不是等出来的）——沉睡前观察不能拿它充数。
+          let backlogArrival = false;
           req.on('close', () => { aborted = true; });
+          const incomingAt = () => {
+            const value = Number(st.lastIncomingAt);
+            return Number.isFinite(value) && value > 0 ? Math.min(value, Date.now()) : start;
+          };
+          // 「这次等待能交给模型的消息」：判到没到、以及最后怎么返回，都用同一份口径。
+          // 每个缓冲各受自己的开关管，关掉的那个不能从 newMessages 或水位里漏出来。
+          const waitSeen = () => {
+            const buf = [
+              ...(v2ToolEnabled('getUnread') ? st.unread : []),
+              ...(v2ToolEnabled('getRecent') ? (Array.isArray(st.recentMessages) ? st.recentMessages : []) : []),
+            ];
+            const seen = new Map();
+            for (const m of buf) {
+              if (m && !m.isSelf && (m.seq || 0) > baseline) seen.set(m.seq, m);
+            }
+            return seen.size;
+          };
           if (replyWait) {
-            const incomingAt = () => {
-              const value = Number(st.lastIncomingAt);
-              return Number.isFinite(value) && value > 0 ? Math.min(value, Date.now()) : start;
-            };
             lastNewAt = incomingAt();
             let observedSeq = st.lastUnreadSeq || 0;
             // Batch delay and model reading time already count towards quiet.
@@ -9822,23 +9847,31 @@ async function main() {
             // Its timestamp must still invalidate the previous quiet window.
             lastNewAt = incomingAt();
             arrived = (st.lastUnreadSeq || 0) > baseline;
-          } else while (Date.now() - start < timeoutMs && !aborted) {
-            let nowSeq = st.lastUnreadSeq || 0;
-            if (nowSeq - baseline >= minNew) {
+          } else {
+            // 先看一次：消息可能在我们开始等之前就到了（AI 刚回完、主人立刻接话）。
+            // 那也必须立刻交出去——它的静默窗口从「它真的到达」算，不额外加 120 秒。
+            let known = waitSeen();
+            if (known >= minNew) {
               arrived = true;
-              lastNewAt = Date.now();
-              // 已等到新消息：继续等到“最后一条新消息之后 quietMs 内不再有新消息”再返回。
-              // 这里不再受原始 timeoutMs 限制，确保对方可能连续发消息时不会抢话。
-              while (Date.now() - lastNewAt < quietMs && Date.now() - start < timeoutMs + maxQuietMs + 5000 && !aborted) {
-                if ((st.lastUnreadSeq || 0) > nowSeq) {
-                  nowSeq = st.lastUnreadSeq || 0;
-                  lastNewAt = Date.now();
-                }
-                await sleep(200);
-              }
-              break;
+              backlogArrival = true;
+              lastNewAt = incomingAt();
             }
-            await sleep(300);
+            while (!aborted && Date.now() - start < (arrived ? timeoutMs + maxQuietMs + 5000 : timeoutMs)) {
+              const count = waitSeen();
+              if (count > known) {
+                known = count;
+                lastNewAt = Date.now();
+                arrived = true;
+              }
+              if (arrived && Date.now() - lastNewAt >= quietMs) break;
+              await sleep(200);
+            }
+            // 最后再核一次：可能在最后一次 sleep 里刚好到。
+            if (!arrived && waitSeen() >= minNew) {
+              arrived = true;
+              backlogArrival = true;
+              lastNewAt = incomingAt();
+            }
           }
           const waitedMs = Date.now() - start;
           if (socialV2.conversations.get(canonicalV2Key(key)) !== st ||
@@ -9858,10 +9891,12 @@ async function main() {
           const preSleepAttempt = !replyWait && timeoutMs >= preSleepWaitMs;
           // 只有“没等到新消息且总时长达到观察窗口”或“最后一条新消息之后安静满了观察窗口”才算满足沉睡前等待；
           // 不能因为总时长到了但最后一条消息才刚过 10 秒就误判满足。
-          const preSleepSatisfiedNow = !replyWait && (!arrived
+          const preSleepSatisfiedNow = !replyWait && !backlogArrival && (!arrived
             ? waitedMs >= preSleepWaitMs
             : (quiet && (Date.now() - lastNewAt) >= preSleepWaitMs));
           if (preSleepSatisfiedNow) {
+            // 观察已经等满：这个会话的连续等待配额也该清零，别让下一轮接着被卡。
+            waitStreaks.delete(leaseKey);
             st.preSleepWaitSatisfiedAt = Date.now();
             st.preSleepWaitObservedAt = 0;
             st.preSleepWaitAccumMs = 0;
@@ -9872,7 +9907,9 @@ async function main() {
             // 等待期间有新消息：
             // - 如果这是一次 5 分钟沉睡前观察尝试，则标记“已观察”，AI 看过 newMessages 后可自行决定是否参与；
             // - 否则只清空累计，不算完成沉睡前观察。
-            if (preSleepAttempt) {
+            // 等待开始时就已经躺着的未读，不算「观察期间来了新消息」：
+            // 模型还没看过它，标成已观察会诱导它直接沉睡，把这条消息吞掉。
+            if (preSleepAttempt && !backlogArrival) {
               st.preSleepWaitObservedAt = Date.now();
             }
             st.preSleepWaitAccumMs = 0;
@@ -9882,10 +9919,10 @@ async function main() {
           // getUnread, the recent buffer by getRecent. A disabled switch must not leak
           // through either newMessages or the watermark, so the buffer is dropped
           // before arrival is judged -- not filtered afterwards.
-          const history = replyWait
-            ? [...(v2ToolEnabled('getUnread') ? st.unread : []),
-              ...(v2ToolEnabled('getRecent') ? st.recentMessages : [])]
-            : (Array.isArray(st.recentMessages) ? st.recentMessages : []);
+          const history = [
+            ...(v2ToolEnabled('getUnread') ? st.unread : []),
+            ...(v2ToolEnabled('getRecent') ? (Array.isArray(st.recentMessages) ? st.recentMessages : []) : []),
+          ];
           const pending = [...new Map(history
             .filter((m) => m && !m.isSelf && (m.seq || 0) > baseline)
             .map((m) => [m.seq, m])).values()].sort((a, b) => a.seq - b.seq);
@@ -12485,6 +12522,39 @@ async function main() {
     return true;
   }
 
+  // 「还差多久才够沉睡前观察窗口」：原先三处各算一遍（mark_read / set_wake_config / wait），
+  // 收成一个，免得以后再改漏一处。
+  function preSleepWaitRemainingV2(st) {
+    const waitMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
+    if (!waitMs || !preSleepWaitBlockedV2(st)) return 0;
+    return Math.max(0, waitMs - ((st?.lastIncomingAt || 0) ? Date.now() - st.lastIncomingAt : 0));
+  }
+
+  // 观察通过 / 成功收尾之后，把这个会话的「连续等待」配额清掉，
+  // 否则下一轮刚开口就被旧的计数卡住。
+  function resetWaitStreakV2(key) {
+    const leaseKey = canonicalV2Key(key) ?? key;
+    if (leaseKey) waitStreaks.delete(leaseKey);
+  }
+
+  // 被沉睡前门拦住时的统一回包：除了说明原因，必须给出「现在能做什么」——
+  // 只说「等一会儿」而同时把设置唤醒/标记已读都拒掉，模型就会在两条错误之间打转。
+  function preSleepGateErrorV2(st, verb) {
+    const waitMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
+    const remaining = preSleepWaitRemainingV2(st);
+    const remainMin = Math.ceil(remaining / 60000);
+    return {
+      ok: false,
+      error: `还不能通过 ${verb}：还需等待约 ${remainMin} 分钟无新消息，或调用 qq_wait_for_messages(timeoutMs=${waitMs}) 完成一次沉睡前观察。如果等待期间有人发新消息，请先查看返回的 newMessages；判断不需要你参与就可以直接收尾沉睡，若你参与了则需下次再等观察窗口。如果只是想自然收尾，用 qq_close_conversation（这条路不需要观察）。`,
+      preSleepWaitMs: waitMs,
+      preSleepWaitRemainingMs: remaining,
+      retryAfterMs: remaining,
+      nextStep: `再安静约 ${Math.ceil(remaining / 1000)} 秒后，调用一次 qq_wait_for_messages(purpose="messages", timeoutMs=${waitMs}) 完成沉睡前观察`,
+      alternative: 'qq_close_conversation（自然收尾，不需要观察）'
+    };
+  }
+
+
   function computeWakeSafetyV2(wc) {
     const tr = wc?.triggers || {};
     const hard = wc?.mode === 'active' || tr.anyMessage || tr.atMention || tr.nameMention || tr.question || tr.poke ||
@@ -12622,6 +12692,10 @@ async function main() {
             turnsTotal: Number(val.turnsTotal) || 0,
             turnsSeeded: val.turnsSeeded === true,
             originalSessionId: typeof val.originalSessionId === 'string' ? val.originalSessionId : '',
+            // 待迁的定时任务清单：内存里丢了就等于永远不迁，必须跨重启保留
+            tasksToInherit: (Array.isArray(val.tasksToInherit) ? val.tasksToInherit : [])
+              .filter((it) => it && typeof it === 'object' && it.brief && typeof it.brief === 'object')
+              .slice(0, 50),
             wakeTimes: Array.isArray(val.wakeTimes) ? val.wakeTimes : [],
             sendTimes: Array.isArray(val.sendTimes) ? val.sendTimes : [],
             stickerCollectTimes: Array.isArray(val.stickerCollectTimes) ? val.stickerCollectTimes : [],
@@ -12750,6 +12824,7 @@ async function main() {
           turnsSinceRotate: Number(st.turnsSinceRotate) || 0,
           turnsTotal: Number(st.turnsTotal) || 0,
           turnsSeeded: st.turnsSeeded === true,
+          tasksToInherit: Array.isArray(st.tasksToInherit) ? st.tasksToInherit.slice(0, 50) : [],
           wakeTimes: st.wakeTimes.slice(-200),
           sendTimes: st.sendTimes.slice(-500),
           stickerCollectTimes: Array.isArray(st.stickerCollectTimes) ? st.stickerCollectTimes.slice(-500) : [],
@@ -16735,23 +16810,44 @@ async function main() {
     ].join('\n');
   }
 
-  /** 当前会话 + 换下来的会话上还挂着的任务（按 key 过滤），用于继承。 */
-  async function collectInheritTasksV2(key) {
+  /**
+   * 换下来的会话上还挂着的任务，用于继承。
+   * 关键：**绝不含当前会话**——当前会话自己的任务已经在新会话里了，把它算成「待迁」
+   * 会让收尾核对把刚建好的任务当成旧的删掉（0.13.3 的实测事故）。
+   * extraSources 只给换会话那一刻用（那时 state.sessions 还指着旧会话）。
+   */
+  async function collectInheritTasksV2(key, extraSources = []) {
     const seen = new Set();
     const out = [];
     const sources = [];
     const current = state.sessions[key] || '';
-    if (current) sources.push(current);
+    const push = (sessionId) => {
+      const id = String(sessionId || '');
+      if (!id || id === current || sources.includes(id)) return;
+      sources.push(id);
+    };
+    for (const id of Array.isArray(extraSources) ? extraSources : []) push(id);
     for (const item of Array.isArray(state.retiredSessions) ? state.retiredSessions : []) {
-      if (item && item.key === key && item.sessionId && !sources.includes(item.sessionId)) sources.push(item.sessionId);
+      if (item && item.key === key) push(item.sessionId);
     }
+    if (!sources.length) return out;
+    const currentTasks = current ? await listSessionTasksV2(current) : [];
+    const existingTitles = new Set(
+      currentTasks.map((task) => String(task?.title ?? '').trim()).filter(Boolean)
+    );
     for (const sessionId of sources) {
       const tasks = await listSessionTasksV2(sessionId);
       for (const task of tasks) {
         const id = String(task?.id ?? '');
         if (!id || seen.has(id)) continue;
         seen.add(id);
-        out.push({ sessionId, taskId: id, brief: taskBriefV2(task) });
+        const brief = taskBriefV2(task);
+        if (brief.title && existingTitles.has(brief.title)) {
+          // 新会话里已经有同名的了：旧的那条是重复的，直接清掉，别再塞进待迁清单
+          await deleteSessionTaskV2(sessionId, id);
+          continue;
+        }
+        out.push({ sessionId, taskId: id, brief });
       }
     }
     return out;
@@ -16784,8 +16880,11 @@ async function main() {
     for (const item of pending) {
       const title = String(item?.brief?.title ?? '').trim();
       if (title && titles.has(title)) {
-        await deleteSessionTaskV2(item.sessionId, item.taskId);
-        migratedSources.add(item.sessionId);
+        // 只删旧会话上的那条；current 里的是新会话刚建好的，删了就等于把任务抹了
+        if (item.sessionId && item.sessionId !== current) {
+          await deleteSessionTaskV2(item.sessionId, item.taskId);
+          migratedSources.add(item.sessionId);
+        }
       } else {
         remain.push(item);
       }
@@ -16810,7 +16909,7 @@ async function main() {
     const st = getSocialV2State(key);
     const rotateParams = replyParamsV2().rotate;
     // 旧会话挂着的自动化任务：DSH 不能改绑，只能让新会话重建，所以先把清单抓下来。
-    const inherited = rotateParams.inheritTasks ? await collectInheritTasksV2(key) : [];
+    const inherited = rotateParams.inheritTasks ? await collectInheritTasksV2(key, [old]) : [];
     if (!st.originalSessionId && old) st.originalSessionId = old; // 记住「原本那条」，方便关掉后回退
     if (!st.originalSessionId) backfillOriginalV2(key); // 上一版只删映射留下的历史，也把原会话找回来
     st.turnsSinceRotate = 0;

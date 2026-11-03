@@ -14,6 +14,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
+import { createPetPacksService, BUILTIN_PACK_ID } from './pet-packs.js';
 
 export const PET_PKG = 'dsh-pet';
 export const PET_VERSION = '0.3.8';
@@ -149,7 +150,7 @@ export function buildManifest(configText) {
   };
 }
 
-async function downloadTo(url, onProgress) {
+export async function downloadTo(url, onProgress) {
   const res = await fetch(url, { redirect: 'follow' });
   if (!res.ok) throw new Error(`下载失败 HTTP ${res.status}`);
   const total = Number(res.headers.get('content-length')) || 0;
@@ -180,6 +181,15 @@ export function createPetAssetsService({ stateDir, pluginLog = () => {} }) {
   const markerFile = path.join(dir, PET_MARKER);
   let job = null; // {phase, percent, error, startedAt}
 
+  // 换皮：外部动画包放在 <stateDir>/orb/pet/packs/<id>，packs.json 记 activePackId。
+  // 依赖注入（downloadTo/readTar/stripJsonc/buildManifest）避免两个模块互相 import 成环。
+  const packs = createPetPacksService({
+    stateDir,
+    builtinDir: dir,
+    pluginLog,
+    helpers: { downloadTo, readTar, stripJsonc, buildManifest },
+  });
+
   function readMarker() {
     try {
       const data = JSON.parse(fs.readFileSync(markerFile, 'utf8'));
@@ -196,13 +206,27 @@ export function createPetAssetsService({ stateDir, pluginLog = () => {} }) {
   function status() {
     const marker = readMarker();
     const webmCount = countWebm();
-    const installed = Boolean(marker) && webmCount > 0;
+    const builtinInstalled = Boolean(marker) && webmCount > 0;
+    // 换皮后「装没装」要看当前生效的包，而不能只看内置包。
+    let activePack = null;
+    try { activePack = packs.active(); } catch (error) {
+      pluginLog('[orb] 读动画包失败：', String(error?.message ?? error));
+    }
+    const customUsable = Boolean(activePack && !activePack.builtin && activePack.manifest);
+    const installed = builtinInstalled || customUsable;
+    let packList = [];
+    try { packList = packs.list().packs; } catch {}
     return {
       installed,
+      builtinInstalled,
       version: marker?.version || '',
       webmCount,
       bytes: Number(marker?.bytes) || 0,
       dir,
+      activePackId: activePack?.id || BUILTIN_PACK_ID,
+      activePackName: activePack?.name || '内置 · dsh-pet（小鲸鱼）',
+      activePackDir: activePack?.dir || dir,
+      packs: packList,
       updatedAt: marker?.installedAt || '',
       job: job ? { ...job } : null,
       upgradable: Boolean(marker?.version) && marker.version !== PET_VERSION,
@@ -210,6 +234,13 @@ export function createPetAssetsService({ stateDir, pluginLog = () => {} }) {
   }
 
   function manifest() {
+    // 生效包优先：外部包自带清单，内置包还是老的 manifest.json。
+    try {
+      const activePack = packs.active();
+      if (activePack?.manifest) return activePack.manifest;
+    } catch (error) {
+      pluginLog('[orb] 读动画包清单失败：', String(error?.message ?? error));
+    }
     try {
       const data = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
       return data && typeof data === 'object' ? data : null;
@@ -325,7 +356,13 @@ export function createPetAssetsService({ stateDir, pluginLog = () => {} }) {
 
   function remove() {
     try {
-      fs.rmSync(dir, { recursive: true, force: true });
+      // 只清内置素材本身：packs/ 和 packs.json 是用户导入的动画包，不能顺手删掉。
+      let entries = [];
+      try { entries = fs.readdirSync(dir); } catch {}
+      for (const name of entries) {
+        if (name === 'packs' || name === 'packs.json') continue;
+        fs.rmSync(path.join(dir, name), { recursive: true, force: true });
+      }
       job = null;
       return { ok: true, ...status() };
     } catch (error) {
@@ -333,7 +370,23 @@ export function createPetAssetsService({ stateDir, pluginLog = () => {} }) {
     }
   }
 
-  return { dir, webmDir, manifestFile, markerFile, status, manifest, install, remove, version: PET_VERSION };
+  // dir / webmDir 改成 getter：换包后 petInfo() 每次读到的都是当前生效包，
+  // orb.js 不用改一行就能跟着 activePackId 走。
+  return {
+    get dir() { return packs.active().dir; },
+    get webmDir() { return path.join(packs.active().dir, 'webm'); },
+    get installed() { return status().installed; },
+    manifestFile,
+    markerFile,
+    builtinDir: dir,
+    packs,
+    activePack: () => packs.active(),
+    status,
+    manifest,
+    install,
+    remove,
+    version: PET_VERSION,
+  };
 }
 
 // 下载时用当前版本（抽成常量，install 里两处引用保持一致）
