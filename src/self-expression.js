@@ -168,54 +168,17 @@ function stripCodeFence(text) {
   return value;
 }
 
-function firstBalancedObject(value) {
-  const start = value.indexOf('{');
-  if (start < 0) return null;
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let i = start; i < value.length; i += 1) {
-    const ch = value[i];
-    if (inString) {
-      if (escaped) escaped = false;
-      else if (ch === '\\') escaped = true;
-      else if (ch === '"') inString = false;
-      continue;
-    }
-    if (ch === '"') inString = true;
-    else if (ch === '{') depth += 1;
-    else if (ch === '}') {
-      depth -= 1;
-      if (depth === 0) return value.slice(start, i + 1);
-    }
-  }
-  return null;
-}
-
 function extractJsonObject(text) {
   const value = stripCodeFence(text);
-  const candidates = [value];
-  // 模型偶尔把整个 JSON 再包成一层 JSON 字符串（\"action\" 这种），先解开外层。
+  const start = value.indexOf('{');
+  const end = value.lastIndexOf('}');
+  if (start < 0 || end <= start) return null;
   try {
-    const unwrapped = JSON.parse(value);
-    if (typeof unwrapped === 'string' && unwrapped.trim() !== value) candidates.push(unwrapped);
-  } catch {}
-  for (const candidate of candidates) {
-    const slice = firstBalancedObject(candidate);
-    if (!slice) continue;
-    for (const attempt of [slice, slice.replace(/\\"/g, '"')]) {
-      try {
-        const parsed = JSON.parse(attempt);
-        if (isPlainObject(parsed)) return parsed;
-      } catch {}
-    }
+    const parsed = JSON.parse(value.slice(start, end + 1));
+    return isPlainObject(parsed) ? parsed : null;
+  } catch {
+    return null;
   }
-  return null;
-}
-
-function looksLikeJsonEnvelope(text) {
-  const value = String(text ?? '').trim();
-  return /^[\[{]/.test(value) || /"action"\s*:/.test(value);
 }
 
 /**
@@ -233,7 +196,6 @@ export function parseExpressionDecision(text) {
     return { action: 'post', text: content, reason: String(obj.reason ?? '') };
   }
   if (!raw) return { action: 'skip', text: '', reason: 'empty' };
-  if (looksLikeJsonEnvelope(raw)) return { action: 'skip', text: '', reason: 'unparsed-json' };
   return { action: 'post', text: raw, reason: 'plain-text' };
 }
 
