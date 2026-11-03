@@ -1099,8 +1099,11 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
             );
             // 冷会话/被占：换一代新的会话 id 再来一次（新 id 会被 create 成活会话）。
             if (attempt === 0) {
+              // 先记住「这一代的逻辑会话名」，再换代 —— 换完 agentSessionId() 返回的已经是新 id 了，
+              // 拿新 id 去 forget 等于什么都没删（旧映射会一直挂在 Map 里）。
+              const staleSession = agentSessionId(deskChannel);
               history.agentGen = Math.max(0, Number(history.agentGen) || 0) + 1;
-              try { agent.forget?.(agentSessionId(deskChannel)); } catch { /* ignore */ }
+              try { agent.forget?.(staleSession); } catch { /* ignore */ }
               pluginLog(`[pet-chat] 原版会话换代重试 agentGen=${history.agentGen}`);
             }
           }
