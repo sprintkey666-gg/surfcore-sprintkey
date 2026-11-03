@@ -1,6 +1,6 @@
 // 「最近很要紧的」段回归测试（2026-11-03）
 //
-// 背景：主人 2026-11-02 上午和她约了暗号（问「在吗 鲸鲸」→ 答「赖着不走的鱼」），
+// 背景：主人 2026-11-02 上午和她约了暗号（问「在吗 测试」→ 答「示例暗号ABC」），
 // 记忆卡里也确实有这条（importance 74，tags owner/qq/initial）。但 2026-11-03 晚上
 // 在悬浮窗里问，她答不上来 —— 因为 initial 段是「按 createdAt 升序取前 6 条」，
 // 10-28 那批老记录把 11-02 的新约定挤掉了，注入块里根本没有「暗号」二字。
@@ -64,8 +64,8 @@ const olds = Array.from({ length: 9 }, (_, i) => record({
 const secret = record({
   id: 'mem_654c17336ab254',
   title: '和主人：我们约定一个暗号，看看等会是不是你',
-  text: '他说怕换了个壳子，问「在吗 鲸鲸」，我答「赖着不走的鱼」才算我自己。',
-  botReply: '赖着不走的鱼。',
+  text: '他说怕换了个壳子，问「在吗 测试」，我答「示例暗号ABC」才算我自己。',
+  botReply: '示例暗号ABC。',
   tags: ['owner', 'qq', 'initial'],
   importance: 74,
   isInitial: true,
@@ -90,7 +90,7 @@ const cfg = normalizeMemoryCardConfig({});
 // ── 1. 暗号必须出现在 QQ 注入块里 ───────────────────────────────────────────
 {
   const text = renderMemoryCard(makeCard(), { platform: 'qq', maxChars: cfg.injectMaxChars.qq, config: cfg, now: NOW });
-  assert.ok(text.includes('赖着不走的鱼'), 'QQ 注入块里必须出现「赖着不走的鱼」');
+  assert.ok(text.includes('示例暗号ABC'), 'QQ 注入块里必须出现「示例暗号ABC」');
   assert.ok(text.includes('最近很要紧的'), '应该有「最近很要紧的」段');
   assert.ok(text.length <= cfg.injectMaxChars.qq, `注入块不能超过 ${cfg.injectMaxChars.qq} 字，实际 ${text.length}`);
 }
@@ -105,7 +105,7 @@ const cfg = normalizeMemoryCardConfig({});
 // ── 3. B站 注入块不带私事 ───────────────────────────────────────────────────
 {
   const text = renderMemoryCard(makeCard(), { platform: 'bili', maxChars: cfg.injectMaxChars.bili, config: cfg, now: NOW });
-  assert.ok(!text.includes('赖着不走的鱼'), 'B站 注入块里不能出现暗号');
+  assert.ok(!text.includes('示例暗号ABC'), 'B站 注入块里不能出现暗号');
   assert.ok(!text.includes('最近很要紧的'), 'B站 不应该有「最近很要紧的」段');
 }
 
@@ -189,7 +189,7 @@ const cfg = normalizeMemoryCardConfig({});
   const card = createEmptyCard(NOW);
   card.records = [...higher, ...recalled, { ...secret }];
   const text = renderMemoryCard(card, { platform: 'qq', maxChars: cfg.injectMaxChars.qq, config: cfg, now: NOW });
-  assert.ok(text.includes('赖着不走的鱼'), '同分的一批记录里，按 createdAt 也必须把暗号带出来');
+  assert.ok(text.includes('示例暗号ABC'), '同分的一批记录里，按 createdAt 也必须把暗号带出来');
 }
 
 // ── 9. 默认条数够用（4 条装不下真机那张卡） ─────────────────────────────────

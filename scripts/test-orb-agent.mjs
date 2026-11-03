@@ -43,8 +43,9 @@ function makeCtx({ inspectFails = false, promptFails = false, text = '我听着�
     sessionController: {
       async inspect() { calls.inspect += 1; if (inspectFails) throw new Error('not found'); return { ok: true }; },
       async create() { calls.create += 1; return { ok: true }; },
-      async prompt({ sessionId, content }) {
+      async prompt({ sessionId, content }, signal) {
         calls.prompt += 1;
+        calls.signal = signal;
         if (promptFails) throw new Error('prompt 挂了');
         setTimeout(() => {
           const emit = listeners.get('session/event');
@@ -121,6 +122,40 @@ function makeCtx({ inspectFails = false, promptFails = false, text = '我听着�
   agent.dispose();
 }
 
+// ⚠️ 2026-11-03 真机事故复盘：prompt(args, signal) 的第二个参数必须是真 signal，
+//    DSH 内部无条件 signal.throwIfAborted()，不传就抛
+//    `Cannot read properties of undefined (reading 'throwIfAborted')`，
+//    结果「原版会话」每轮都秒退回直连，看起来像根本没实现。这两组断言钉住它。
+{
+  const { ctx, calls } = makeCtx({ text: '收到 signal' });
+  const agent = createOrbAgent({ ctx, stateDir: '', pluginLog: () => {} });
+  await agent.run({ sessionId: 'orb-chat-signal', text: '在吗', timeoutMs: 5000 });
+  const sig = calls.signal;
+  ok(Boolean(sig), 'prompt 收到了第二个参数（AbortSignal）');
+  ok(typeof sig?.throwIfAborted === 'function', 'signal 有 throwIfAborted（DSH 内部会直接调）');
+  ok(sig?.aborted === false, '正常跑完不 abort');
+  agent.dispose();
+}
+
+{
+  const listeners = new Map();
+  let captured = null;
+  const ctx = {
+    on(name, fn) { listeners.set(name, fn); return () => listeners.delete(name); },
+    sessionController: {
+      async inspect() { return { ok: true }; },
+      async prompt(_args, signal) { captured = signal; return { ok: true }; },
+      async cancel() {},
+    },
+  };
+  const agent = createOrbAgent({ ctx, stateDir: '', pluginLog: () => {} });
+  let msg = '';
+  try { await agent.run({ sessionId: 'orb-chat-abort', text: '卡住', timeoutMs: 5000 }); } catch (e) { msg = String(e?.message); }
+  ok(msg.includes('还没结束'), '超时仍然报错');
+  ok(captured?.aborted === true, '超时会把 signal abort 掉（不留悬挂请求）');
+  agent.dispose();
+}
+
 // ── 6. 参数校验 ─────────────────────────────────────────────────────────
 {
   const { ctx } = makeCtx();
@@ -131,6 +166,16 @@ function makeCtx({ inspectFails = false, promptFails = false, text = '我听着�
   const empty = await agent.run({ sessionId: 'orb-chat-5', text: '   ' });
   ok(empty.ok === true && empty.text === '', '空消息直接返回，不打模型');
   agent.dispose();
+}
+
+// ── 7. pet-chat 侧：代数/轮次一定要写盘（否则看不出「到底跑没跑过」）─────
+{
+  const fs = await import('node:fs');
+  const src = fs.readFileSync(path.join(REPO_ROOT, 'plugins', 'surfcore', 'lib', 'pet-chat.js'), 'utf8');
+  ok(src.includes('history.agentTotal'), 'pet-chat 记 agentTotal（真机可核对跑过几轮）');
+  ok(src.includes('function markAgentSystemSent'), 'pet-chat 记住「这个会话代数已推过完整人设」');
+  ok(!/function bumpAgentTurns\(history, turns\) \{\s*\n\s*if \(!turns/.test(src), 'bumpAgentTurns 不再在 sessionTurns=0 时早退');
+  ok(src.includes('原版会话 ok session='), '成功路径有可 grep 的日志');
 }
 
 if (failures) {

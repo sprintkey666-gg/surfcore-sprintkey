@@ -1072,6 +1072,9 @@ ipcMain.handle('orb:petconfig', () => {
         packKind: pet.packKind === 'figure' ? 'figure' : 'webm',
         packEntry: String(pet.packEntry ?? ''),
         packEntryUrl: String(pet.packEntryUrl ?? ''),
+        // 配色：tint 是选中的 id，tints 是可选列表（渲染端自己拼 CSS filter）。
+        tint: String(pet.tint ?? ''),
+        tints: Array.isArray(pet.tints) ? pet.tints : [],
         // 设置页点「试播」时插件往 preview.json 写一条，渲染端 4 秒一轮问一次。
         preview: readPetPreview(),
       }

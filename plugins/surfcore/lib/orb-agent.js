@@ -119,8 +119,15 @@ export function createOrbAgent({ ctx, stateDir, pluginLog = () => {}, cwd = '', 
 
     const result = await new Promise((resolve, reject) => {
       const collector = createTurnCollector();
+      // ⚠️ 2026-11-03 真机事故：DSH 的 sessionController.prompt(args, signal) 内部会无条件调
+      //    signal.throwIfAborted()，不传 signal 就直接抛
+      //    `Cannot read properties of undefined (reading 'throwIfAborted')`
+      //    → 每轮都在 30ms 内退回直连，看起来「原版会话实现了但从没跑过」。
+      //    所以这里必须显式造一个 AbortController，超时/取消时 abort 掉。
+      const abort = new AbortController();
       const timer = setTimeout(() => {
         pending.delete(sid);
+        try { abort.abort(); } catch { /* ignore */ }
         try { sc.cancel?.({ sessionId: sid }); } catch { /* 取消失败也不拦着报错 */ }
         reject(fail(`这一轮超过 ${Math.round(timeoutMs / 1000)} 秒还没结束`));
       }, Math.max(5000, Number(timeoutMs) || DEFAULT_TIMEOUT_MS));
@@ -129,9 +136,9 @@ export function createOrbAgent({ ctx, stateDir, pluginLog = () => {}, cwd = '', 
         pending.delete(sid);
         resolve({ ok: true, text: String(ended.text || '').trim(), reason: ended.reason ?? null, sessionId: sid });
       };
-      pending.set(sid, { collector, resolve, reject, timer, settle });
+      pending.set(sid, { collector, resolve, reject, timer, settle, abort });
       Promise.resolve()
-        .then(() => sc.prompt({ sessionId: sid, mode: 'queue', content: parts }))
+        .then(() => sc.prompt({ sessionId: sid, mode: 'queue', content: parts }, abort.signal))
         .catch((error) => {
           clearTimeout(timer);
           pending.delete(sid);
@@ -147,12 +154,16 @@ export function createOrbAgent({ ctx, stateDir, pluginLog = () => {}, cwd = '', 
     if (waiter) {
       clearTimeout(waiter.timer);
       pending.delete(sid);
+      try { waiter.abort?.abort(); } catch { /* ignore */ }
     }
     try { await controller()?.cancel?.({ sessionId: sid }); } catch { /* ignore */ }
   }
 
   function dispose() {
-    for (const waiter of pending.values()) { try { clearTimeout(waiter.timer); } catch {} }
+    for (const waiter of pending.values()) {
+      try { clearTimeout(waiter.timer); } catch {}
+      try { waiter.abort?.abort(); } catch {}
+    }
     pending.clear();
     try { off?.(); } catch {}
     off = null;

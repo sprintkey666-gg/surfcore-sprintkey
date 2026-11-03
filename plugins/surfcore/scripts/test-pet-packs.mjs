@@ -18,6 +18,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createPetAssetsService } from '../lib/pet-assets.js';
+import { DEFAULT_TINTS, normalizeTints } from '../lib/pet-packs.js';
 
 let failed = 0;
 function check(name, fn) {
@@ -204,6 +205,97 @@ await acheck('内置清单 + install 随仓 figure 包', async () => {
   assert.equal(svc.list().activePackId, 'sprintkey-fish', 'install 默认装完就切换');
   const reg = JSON.parse(fs.readFileSync(path.join(state, 'orb', 'pet', 'packs.json'), 'utf8'));
   assert.ok(reg.packs.some((p) => p.id === 'sprintkey-fish'), 'install 后要写进 packs.json 注册表');
+});
+
+check('内置 figure 包会被 catalog 同步落盘并能直接启用', () => {
+  // 真机 bug：sprintkey-fish 只在 index.json 里，packs/ 下没有目录 → activate 报「没有这个皮肤包」。
+  // list() 之前会 syncCatalog()，把随仓包复制成 packs/<id>/。
+  const dir = path.join(state, 'orb', 'pet', 'packs', 'sprintkey-fish');
+  assert.ok(fs.existsSync(path.join(dir, 'index.html')), '同步后 packs/sprintkey-fish/index.html 要存在');
+  const item = svc.list().packs.find((p) => p.id === 'sprintkey-fish');
+  assert.equal(item.installed, true, '同步后内置 figure 包应是已安装状态');
+  const r = svc.activate('sprintkey-fish');
+  assert.equal(r.ok, true, r.error);
+  assert.equal(svc.list().activePackId, 'sprintkey-fish');
+  const back = svc.activate('dsh-pet');
+  assert.equal(back.ok, true, back.error);
+});
+
+check('未知皮肤包报错，不会乱切', () => {
+  const before = svc.list().activePackId;
+  const r = svc.activate('definitely-not-a-pack');
+  assert.equal(r.ok, false);
+  assert.match(String(r.error), /没有这个皮肤包/);
+  assert.equal(svc.list().activePackId, before);
+});
+
+check('配色白名单：6 套默认、坏 filter 丢弃、safe filter 保留', () => {
+  assert.equal(DEFAULT_TINTS.length, 6);
+  assert.equal(DEFAULT_TINTS[0].id, '', '第一套必须是原色（空 id）');
+  assert.ok(DEFAULT_TINTS.every((t) => typeof t.filter === 'string' && t.filter.length > 0));
+  const bad = normalizeTints([{ id: 'x', name: '坏', filter: 'url(javascript:1)' }]);
+  assert.ok(bad.some((t) => t.id === ''), '全坏时回落默认（含原色）');
+  const good = normalizeTints([{ id: 'warm', name: '暖', filter: 'hue-rotate(20deg) saturate(1.1)' }]);
+  assert.ok(good.some((t) => t.id === 'warm' && t.filter.includes('hue-rotate')));
+  assert.ok(good.some((t) => t.id === ''), '缺原色要补上');
+});
+
+check('清单里的 big-blue-fish 是可下载的 github-assets 包', () => {
+  const entry = svc.catalog().packs.find((p) => p.id === 'big-blue-fish');
+  assert.ok(entry, 'index.json 里要有 big-blue-fish');
+  assert.equal(entry.kind, 'webm');
+  assert.equal(entry.source.kind, 'github-assets');
+  assert.equal(entry.source.repo, 'Bai-Cute/big-blue-fish-desktop-pet');
+  assert.match(entry.source.tarball, /codeload\.github\.com/);
+  assert.equal(entry.source.assetDir, 'code/BigBlueFish.Windows/assets/fish');
+  assert.equal(entry.license, 'MIT');
+});
+
+await acheck('github-assets 包：只取素材目录并转成我们的 manifest', async () => {
+  const entry = svc.catalog().packs.find((p) => p.id === 'big-blue-fish');
+  assert.ok(entry && !entry.bundled);
+  const stage = path.join(state, 'stage-gh');
+  // GitHub tarball 顶层是「仓库名-ref/」，stripTopDir 之后才是 code/...。
+  const root = path.join(stage, 'big-blue-fish-desktop-pet-main');
+  const fish = path.join(root, 'code', 'BigBlueFish.Windows', 'assets', 'fish');
+  fs.mkdirSync(fish, { recursive: true });
+  const animations = [
+    { Id: '待机呼吸', File: '待机呼吸.webm', Pool: 'Idle', Weight: 1 },
+    { Id: '点击回应', File: '点击回应.webm', Pool: 'Click' },
+    { Id: '拖拽反馈', File: '拖拽反馈.webm', Pool: 'Drag' },
+    { Id: '事件闲聊', File: '事件闲聊.webm', Pool: 'Event' },
+    { Id: '节日烟花', File: '节日烟花.webm', Pool: 'Event', Festival: 'Spring', RadiusDays: 3 },
+    { Id: '已禁用', File: '已禁用.webm', Pool: 'Disabled' },
+  ];
+  fs.writeFileSync(path.join(fish, 'animations.json'), JSON.stringify(animations));
+  fs.writeFileSync(path.join(fish, 'LICENSE.txt'), 'MIT License\nCopyright (c) 2026 PC2005-cloud\n');
+  for (const a of animations) fs.writeFileSync(path.join(fish, a.File), Buffer.from('fake-webm'));
+  fs.writeFileSync(path.join(root, 'code', 'BigBlueFish.Windows', 'README.md'), 'not-asset');
+  const tgz = path.join(state, 'big-blue-fish.tgz');
+  const { execFileSync } = await import('node:child_process');
+  execFileSync('tar', ['-czf', tgz, '-C', stage, 'big-blue-fish-desktop-pet-main']);
+  const buf = fs.readFileSync(tgz);
+
+  const installed = await svc.installFromGithubTgz(buf, entry, { overwrite: true });
+  assert.equal(installed.ok, true, installed.error);
+  const item = svc.list().packs.find((p) => p.id === 'big-blue-fish');
+  assert.ok(item, '装完要出现在列表里');
+  assert.equal(item.kind, 'webm');
+  assert.equal(item.installed, true);
+  assert.equal(item.webmCount, animations.length, '素材目录里的 webm 都要收进来');
+  assert.equal(fs.existsSync(path.join(item.dir, 'LICENSES', 'big-blue-fish-LICENSE.txt')), true, 'LICENSE 要落到 LICENSES/');
+  const man = JSON.parse(fs.readFileSync(path.join(item.dir, 'manifest.json'), 'utf8'));
+  assert.deepEqual(man.idle, ['待机呼吸']);
+  assert.deepEqual(man.clicks, ['点击回应']);
+  assert.deepEqual(man.drag, ['拖拽反馈']);
+  assert.ok(man.categories.some((c) => c.id === 'event' && c.actions.includes('事件闲聊')));
+  assert.ok(!JSON.stringify(man).includes('已禁用'), 'Disabled 的动画不写进 manifest');
+  assert.ok(!JSON.stringify(man).includes('节日烟花'), '节日动画只进 festivals 元数据');
+  const festivals = JSON.parse(fs.readFileSync(path.join(item.dir, 'festivals.json'), 'utf8'));
+  assert.equal(festivals.festivals.length, 1);
+  assert.equal(festivals.festivals[0].action, '节日烟花');
+  assert.equal(festivals.festivals[0].festival, 'Spring');
+  assert.equal(festivals.festivals[0].radiusDays, 3);
 });
 
 if (failed) { console.error(`\n✗ pet packs：${failed} 项失败`); process.exit(1); }

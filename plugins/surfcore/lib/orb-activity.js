@@ -108,6 +108,32 @@ export function sameActivity(a, b) {
     === JSON.stringify({ active: b.active, media: b.media, cursor: b.cursor });
 }
 
+/**
+ * 这一次采样相对上一次「真的变了什么」。
+ * 光标每几秒都在动，但它不该让桌宠冒气泡，所以这里只看窗口/文件/音乐。
+ */
+export function activityChanges(prev, next) {
+  const p = prev || {};
+  const n = next || {};
+  const pa = p.active || null;
+  const na = n.active || null;
+  const pm = p.media || null;
+  const nm = n.media || null;
+  const windowChanged = !pa !== !na || (pa && na && (pa.app !== na.app || pa.title !== na.title));
+  // 第一次采到「正在改某个文件」也算变化（否则新开的编辑器要等第二次标题变才说话）。
+  const fileChanged = Boolean(na && na.file)
+    && (!pa || pa.file !== na.file || pa.project !== na.project || pa.kind !== na.kind);
+  const musicChanged = !pm !== !nm || (pm && nm && (pm.title !== nm.title || pm.artist !== nm.artist || pm.status !== nm.status || pm.app !== nm.app));
+  return { window: windowChanged, file: fileChanged, music: musicChanged };
+}
+
+function firstChangedKind(changes) {
+  if (changes.file) return 'file';
+  if (changes.window) return 'window';
+  if (changes.music) return 'music';
+  return '';
+}
+
 function parseSampleOutput(stdout) {
   const lines = String(stdout || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   for (let i = lines.length - 1; i >= 0; i -= 1) {
@@ -144,6 +170,22 @@ export function createOrbActivity({
   let lastError = '';
   let lastSampleAt = 0;
   let lastWriteAt = 0;
+  const listeners = new Set();
+
+  /** 订阅「采到一条新样本」。回调抛异常只记日志，绝不影响采样本身。 */
+  function onSample(fn) {
+    if (typeof fn !== 'function') return () => {};
+    listeners.add(fn);
+    return () => { listeners.delete(fn); };
+  }
+
+  function emitSample(data, meta) {
+    for (const fn of listeners) {
+      try { fn(data, meta); } catch (error) {
+        pluginLog('[orb-activity] onSample 回调失败：', String(error?.message ?? error));
+      }
+    }
+  }
 
   function readFile() {
     try {
@@ -181,11 +223,13 @@ export function createOrbActivity({
     });
   }
 
-  async function sample(reason = 'manual') {
+  async function sample(reason = 'manual', opts = {}) {
     if (running) return { ok: false, busy: true, error: '上一次采样还在跑', data: lastData };
+    const forced = opts.force === true;
     const at = now();
     // 手动/定时都限流：5 秒内重复触发直接回上次结果，别把 powershell 拖成常驻。
-    if (lastSampleAt && at - lastSampleAt < MIN_SAMPLE_GAP_MS) {
+    // 例外：设置页的「测试一下」要立刻看到效果，forced 可以绕过。
+    if (!forced && lastSampleAt && at - lastSampleAt < MIN_SAMPLE_GAP_MS) {
       return { ok: false, throttled: true, error: `采样太频繁（${reason}），${MIN_SAMPLE_GAP_MS}ms 内只采一次`, retryAfterMs: MIN_SAMPLE_GAP_MS - (at - lastSampleAt), data: lastData };
     }
     running = true;
@@ -213,13 +257,18 @@ export function createOrbActivity({
         return { ok: false, error: lastError, data: lastData };
       }
       const filtered = applyKindFilter(clean, config.kinds);
-      const deduped = sameActivity(filtered, lastData);
+      const changes = activityChanges(lastData, filtered);
+      const changed = changes.window || changes.file || changes.music;
+      const deduped = !changed && sameActivity(filtered, lastData);
       if (!deduped) {
         lastData = filtered;
         writeFile(filtered);
       }
       lastError = '';
-      return { ok: true, deduped, data: deduped ? lastData : filtered };
+      const kind = firstChangedKind(changes);
+      // 内容没变就不打扰桌宠；forced（设置页测试）例外，即使没变也推一条。
+      if (changed || forced) emitSample(filtered, { kind, changed, forced, changes, reason });
+      return { ok: true, deduped, changed, changes, kind, data: deduped ? lastData : filtered };
     } catch (error) {
       lastError = String(error?.message ?? error);
       pluginLog('[orb-activity] 采样异常：', lastError);
@@ -291,5 +340,5 @@ export function createOrbActivity({
     };
   }
 
-  return { file, script, start, stop, status, configure, last, sample };
+  return { file, script, start, stop, status, configure, last, sample, onSample };
 }

@@ -22,11 +22,16 @@
       <div id="bubble" class="bubble hidden"><img id="bubblePic" class="bubblePic hidden" alt=""><span id="bubbleText"></span></div>
     </div>
 
-    <!-- 右键菜单：画在窗口内部，绝不改窗口尺寸（主人要求「界面大小刚好」） -->
+    <!-- 右键菜单：画在窗口内部，绝不改窗口尺寸（主人要求「界面大小刚好」）。
+         视觉照 big-blue-fish 的 CompanionMenuStyles.xaml：白底、外圆角 12、条目圆角 7、
+         14px、hover #EDF3FC；分组标题 11px 灰。 -->
     <div id="ctxmenu" class="ctxmenu hidden" role="menu">
+      <div class="ctxgroup">会话</div>
       <button class="ctxitem" id="ctxOpen" data-act="open">打开会话</button>
-      <button class="ctxitem" id="ctxAction" data-act="action">换个动作</button>
       <button class="ctxitem" id="ctxBubbleTest" data-act="bubble">试一下气泡</button>
+      <div class="ctxgroup">桌宠</div>
+      <button class="ctxitem" id="ctxAction" data-act="action">换个动作</button>
+      <button class="ctxitem" id="ctxWalk" data-act="walk">走一走</button>
       <button class="ctxitem" id="ctxSkinToggle" data-act="skin" aria-expanded="false">皮肤<span class="ctxchev">›</span></button>
       <div id="ctxSkin" class="ctxsub hidden">
         <div id="ctxSkinList" class="ctxskinlist"></div>
@@ -56,12 +61,13 @@
         <input id="ctxSizeRange" class="szrange" type="range" min="0" max="100" step="1" value="40" />
         <b id="ctxSizeValue" class="szvalue">40%</b>
       </div>
-      <button class="ctxitem" id="ctxHide" data-act="hide">隐藏到托盘</button>
       <!-- 陪伴：直接放在菜单里，不藏二级面板 -->
       <div id="ctxCompanionPanel" class="ctxcompanion">
         <button class="ctxitem sub" id="ctxCompToggle" type="button">开启陪伴</button>
         <label class="ctxcheck"><input id="ctxCompContext" type="checkbox" /> 上下文字幕</label>
       </div>
+      <div class="ctxgroup">其它</div>
+      <button class="ctxitem" id="ctxHide" data-act="hide">隐藏到托盘</button>
     </div>
 
     <!-- 操作回执（切皮肤 / 导入 / 监测开关）：只冒一下就散 -->
@@ -73,37 +79,190 @@
       <i id="badge" class="badge hidden"></i>
     </div>
 
-    <!-- 展开后的面板 -->
+    <!-- 展开后的面板：左侧 200px 域侧栏（窗口窄的时候自动收成图标条）+ 右侧滚动页面壳。
+         视觉照 dsh-pet-indesktop 的 desktop-pet-ui-style：白底 #fcfcfd、侧栏 #f7f7f8、
+         卡片 12 圆角 + 1px 描边、页面标题 22px/600、小节标题 13px/600、正文 13px。 -->
     <div id="panel" class="panel">
-      <header class="head">
-        <span class="dot" id="connDot" title="连接状态"></span>
-        <span class="name" id="roleName">她</span>
-        <span class="spacer"></span>
-        <button class="mini eye" id="btnEye" title="让她看一眼你的屏幕（看完就删）">眼</button>
-        <button class="mini move" id="btnMove" title="点亮后按住面板任意空白处拖动">移</button>
-        <button class="mini pic hidden" id="btnPic" title="发一张图/表情包（优先 QQ 表情，其次本地图库，最后现场生图）">图</button>
-        <button class="mini pin" id="btnPin" title="固定在这里（鼠标离开也不收起）">钉</button>
-        <button class="mini" id="btnNew" title="开一个新对话">新对话</button>
-        <button class="mini" id="btnHide" title="收起">收起</button>
-      </header>
-      <!-- 眼睛开着时的一行提醒（她真的在看的时候才出现） -->
-      <div class="screenhint hidden" id="screenHint">
-        <span id="screenHintText">她正看着你的屏幕 · 看完就删</span>
-      </div>
-      <main class="bubbles" id="bubbles">
-        <div class="empty" id="empty">还没有对话。说句话吧。</div>
-      </main>
-      <!-- 主人往上翻历史时来了新消息：圆形里是条数；没有未读就显示向下箭头 -->
-      <button class="jump hidden" id="btnJump" title="有新消息，点一下跳到最新">↓</button>
-      <footer class="composer">
-        <div id="composerAttachments" class="attachments hidden" aria-label="待发附件"></div>
-        <div class="composer-row">
-          <button id="btnAttach" class="attach" type="button" title="添加图片或文件（也可以直接粘贴/拖进来）" aria-label="添加图片或文件">+</button>
-          <input id="input" type="text" placeholder="和她说点什么…" maxlength="2000" />
-          <button id="btnSend" class="send">发</button>
+      <nav class="pside" id="panelSide" aria-label="设置与对话">
+        <div class="pside-head">
+          <span class="dot" id="connDot" title="连接状态"></span>
+          <span class="pside-name" id="roleName">她</span>
         </div>
-      </footer>
-      <div class="hint" id="hint"></div>
+        <div class="pside-nav" id="panelNav" role="tablist">
+          <button class="pnav" type="button" data-page="general" role="tab" aria-selected="false"><span class="pnav-ic">常</span><span class="pnav-t">常规</span></button>
+          <button class="pnav" type="button" data-page="pet" role="tab" aria-selected="false"><span class="pnav-ic">宠</span><span class="pnav-t">桌宠</span></button>
+          <button class="pnav" type="button" data-page="interact" role="tab" aria-selected="false"><span class="pnav-ic">互</span><span class="pnav-t">互动</span></button>
+          <button class="pnav" type="button" data-page="menu" role="tab" aria-selected="false"><span class="pnav-ic">单</span><span class="pnav-t">菜单</span></button>
+          <button class="pnav" type="button" data-page="widgets" role="tab" aria-selected="false"><span class="pnav-ic">组</span><span class="pnav-t">桌面组件</span></button>
+          <button class="pnav on" type="button" data-page="chat" role="tab" aria-selected="true"><span class="pnav-ic">话</span><span class="pnav-t">AI 与对话</span></button>
+          <button class="pnav" type="button" data-page="auto" role="tab" aria-selected="false"><span class="pnav-ic">自</span><span class="pnav-t">自动化</span></button>
+        </div>
+        <div class="pside-foot">
+          <button class="pbtn side" id="btnPin" type="button" title="固定在这里（鼠标离开也不收起）">钉住</button>
+          <button class="pbtn side" id="btnHide" type="button" title="收起">收起</button>
+        </div>
+      </nav>
+
+      <section class="pmain" id="panelMain">
+        <!-- 常规 -->
+        <div class="ppage" data-page="general" role="tabpanel">
+          <h2 class="ptitle">常规</h2>
+          <section class="psec">
+            <h3 class="psec-t">连接</h3>
+            <div class="pcard">
+              <div class="prow"><span class="plabel">SurfCore</span><span class="pval" id="genConn">检查中…</span></div>
+              <div class="prow"><span class="plabel">当前角色</span><span class="pval" id="genRole">她</span></div>
+              <div class="prow"><span class="plabel">状态</span><span class="pval" id="genMode">对话中</span></div>
+            </div>
+            <p class="phint">连接断了会在标题栏那个小圆点上变成红色。</p>
+          </section>
+          <section class="psec">
+            <h3 class="psec-t">桌宠大小</h3>
+            <div class="pcard">
+              <div class="prow"><span class="plabel">大小</span><span class="pval" id="genSizeValue">200px</span></div>
+              <div class="prow"><input id="genSize" class="pslider" type="range" min="0" max="100" step="1" value="40" aria-label="桌宠大小" /></div>
+            </div>
+            <p class="phint">右键桌宠 → 大小，也可以随时改。</p>
+          </section>
+          <section class="psec">
+            <h3 class="psec-t">动作</h3>
+            <div class="pcard">
+              <div class="prow btns"><button class="pbtn" id="genAction" type="button">换个动作</button><button class="pbtn" id="genWalk" type="button">走一走</button></div>
+              <div class="prow btns"><button class="pbtn" id="genBubble" type="button">试一下气泡</button><button class="pbtn" id="genHide" type="button">隐藏到托盘</button></div>
+            </div>
+          </section>
+        </div>
+
+        <!-- 桌宠 -->
+        <div class="ppage" data-page="pet" role="tabpanel">
+          <h2 class="ptitle">桌宠</h2>
+          <section class="psec">
+            <h3 class="psec-t">皮肤</h3>
+            <div class="pcard">
+              <div id="psSkinList" class="pskinlist"><p class="phint">正在读取皮肤包…</p></div>
+            </div>
+            <div class="prow btns">
+              <input id="psSkinPath" class="pinput" type="text" placeholder="皮肤文件夹或 .tgz 路径" spellcheck="false" />
+              <button class="pbtn" id="psSkinImport" type="button">导入</button>
+            </div>
+            <div class="prow btns"><button class="pbtn wide" id="psSkinBrowse" type="button">选 .tgz 文件…</button><button class="pbtn wide" id="psSkinDir" type="button">打开皮肤文件夹</button></div>
+          </section>
+          <section class="psec">
+            <h3 class="psec-t">动作</h3>
+            <div class="pcard">
+              <div class="prow btns"><button class="pbtn" id="petAction" type="button">换个动作</button><button class="pbtn" id="petWalk" type="button">走一走</button></div>
+              <p class="phint">走一走会真的把窗口挪一段；鼠标划过她不会自己跑。</p>
+            </div>
+          </section>
+        </div>
+
+        <!-- 互动 -->
+        <div class="ppage" data-page="interact" role="tabpanel">
+          <h2 class="ptitle">互动</h2>
+          <section class="psec">
+            <h3 class="psec-t">陪伴</h3>
+            <div class="pcard">
+              <div class="prow"><span class="plabel">陪伴模式</span><span class="pval"><button class="pbtn" id="actCompanion" type="button">开启陪伴</button></span></div>
+              <div class="prow"><span class="plabel">上下文字幕</span><span class="pval"><input id="actCompanionCtx" type="checkbox" /></span></div>
+            </div>
+          </section>
+          <section class="psec">
+            <h3 class="psec-t">她知道你在做什么</h3>
+            <div class="pcard">
+              <div class="prow"><span class="plabel">在用窗口</span><span class="pval"><input id="actWindow" type="checkbox" /></span></div>
+              <div class="prow"><span class="plabel">在改文件</span><span class="pval"><input id="actFiles" type="checkbox" /></span></div>
+              <div class="prow"><span class="plabel">在听音乐</span><span class="pval"><input id="actMedia" type="checkbox" /></span></div>
+              <div class="prow"><span class="plabel">多久说一次</span><span class="pval">
+                <select id="actGap" class="pselect">
+                  <option value="5">5 分钟</option>
+                  <option value="10">10 分钟</option>
+                  <option value="30">30 分钟</option>
+                </select>
+              </span></div>
+            </div>
+            <p class="phint">开关全关掉，她就完全不看你的屏幕。</p>
+            <div class="prow btns"><button class="pbtn wide" id="actPeek" type="button">现在看一眼</button></div>
+          </section>
+        </div>
+
+        <!-- 菜单 -->
+        <div class="ppage" data-page="menu" role="tabpanel">
+          <h2 class="ptitle">菜单</h2>
+          <section class="psec">
+            <h3 class="psec-t">右键菜单</h3>
+            <div class="pcard">
+              <div class="prow"><span class="plabel">打开会话</span><span class="phint inline">展开这块面板</span></div>
+              <div class="prow"><span class="plabel">换个动作</span><span class="phint inline">随机演一段</span></div>
+              <div class="prow"><span class="plabel">走一走</span><span class="phint inline">真的挪一段窗口</span></div>
+              <div class="prow"><span class="plabel">皮肤 / 监测 / 大小</span><span class="phint inline">二级菜单</span></div>
+            </div>
+          </section>
+          <section class="psec">
+            <h3 class="psec-t">试一试</h3>
+            <div class="pcard">
+              <div class="prow btns"><button class="pbtn" id="menuBubbleTest" type="button">试一下气泡</button><button class="pbtn" id="menuCopyDir" type="button">复制皮肤目录</button></div>
+              <p class="phint">气泡是一次性预览，几秒后自己收。</p>
+            </div>
+          </section>
+        </div>
+
+        <!-- 桌面组件 -->
+        <div class="ppage" data-page="widgets" role="tabpanel">
+          <h2 class="ptitle">桌面组件</h2>
+          <section class="psec">
+            <h3 class="psec-t">当前形态</h3>
+            <div class="pcard">
+              <div class="prow"><span class="plabel">悬浮小球</span><span class="phint inline">没装桌宠素材时用</span></div>
+              <div class="prow"><span class="plabel">桌宠形象</span><span class="phint inline">webm 动画包或网页形象（figure）包</span></div>
+            </div>
+            <p class="phint">桌面组件暂时只有这两种形态；切形态在「桌宠 → 皮肤」里换包。</p>
+          </section>
+        </div>
+
+        <!-- AI 与对话（默认页）：她自己奶油白 + 描边，主人蓝灰实底 -->
+        <div class="ppage ppage-chat on" data-page="chat" role="tabpanel">
+          <header class="chead">
+            <span class="ctitle" id="chatTitle">和她说点什么</span>
+            <span class="spacer"></span>
+            <button class="mini eye" id="btnEye" title="让她看一眼你的屏幕（看完就删）">眼</button>
+            <button class="mini move" id="btnMove" title="点亮后按住面板任意空白处拖动">移</button>
+            <button class="mini pic hidden" id="btnPic" title="发一张图/表情包（优先 QQ 表情，其次本地图库，最后现场生图）">图</button>
+            <button class="mini" id="btnNew" title="开一个新对话">新对话</button>
+          </header>
+          <!-- 眼睛开着时的一行提醒（她真的在看的时候才出现） -->
+          <div class="screenhint hidden" id="screenHint">
+            <span id="screenHintText">她正看着你的屏幕 · 看完就删</span>
+          </div>
+          <main class="bubbles" id="bubbles">
+            <div class="empty" id="empty">还没有对话。说句话吧。</div>
+          </main>
+          <!-- 主人往上翻历史时来了新消息：圆形里是条数；没有未读就显示向下箭头 -->
+          <button class="jump hidden" id="btnJump" title="有新消息，点一下跳到最新">↓</button>
+          <footer class="composer">
+            <div id="composerAttachments" class="attachments hidden" aria-label="待发附件"></div>
+            <div class="composer-row">
+              <button id="btnAttach" class="attach" type="button" title="添加图片或文件（也可以直接粘贴/拖进来）" aria-label="添加图片或文件">+</button>
+              <input id="input" type="text" placeholder="和她说点什么…" maxlength="2000" />
+              <button id="btnSend" class="send">发</button>
+            </div>
+          </footer>
+          <div class="hint" id="hint"></div>
+        </div>
+
+        <!-- 自动化与联动 -->
+        <div class="ppage" data-page="auto" role="tabpanel">
+          <h2 class="ptitle">自动化</h2>
+          <section class="psec">
+            <h3 class="psec-t">监测联动</h3>
+            <div class="pcard">
+              <div class="prow"><span class="plabel">监测开关</span><span class="phint inline">在「互动 → 她知道你在做什么」里改</span></div>
+              <div class="prow"><span class="plabel">主动冒泡</span><span class="phint inline">按「多久说一次」的节奏</span></div>
+            </div>
+            <div class="prow btns"><button class="pbtn wide" id="autoGoInteract" type="button">去互动页</button></div>
+            <p class="phint">这里以后会挂定时任务和触发规则；现在联动只走监测。</p>
+          </section>
+        </div>
+      </section>
     </div>
   </div>
   <!-- 看图查看器：双击会话里的图打开，滚轮以鼠标位置为中心缩放、按住左键拖动 -->

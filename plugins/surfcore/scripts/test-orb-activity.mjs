@@ -30,6 +30,7 @@ import {
   clampPollMs,
   MIN_SAMPLE_GAP_MS,
 } from '../lib/orb-activity.js';
+import { buildActivityEvent, activityKindOf, createActivityFeed } from '../lib/orb-api.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(HERE, '..', 'scripts', 'activity.ps1');
@@ -276,6 +277,132 @@ await acheck('denyTitles：命中隐私标题时 active=null', async () => {
   const data = parseOut(out.stdout);
   assert.equal(data.active, null);
   assert.ok(data.cursor, '窗口被拦了也要有光标');
+});
+
+// ── 10. onSample：变化才回调，forced 强制回调，退订生效 ────────────────
+await acheck('onSample：变化才回调，forced 强制、退订生效', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orb-activity-listen-'));
+  let t = 1_700_000_000_000;
+  let resp = SAMPLE;
+  const seen = [];
+  const s2 = createOrbActivity({
+    stateDir: dir,
+    pluginLog: () => {},
+    getDenyTitles: () => [],
+    runner: async () => ({ stdout: `${JSON.stringify({ ...resp, at: t })}\n`, stderr: '' }),
+    now: () => t,
+  });
+  const off = s2.onSample((sample, meta) => seen.push({ sample, meta }));
+  s2.configure({ enabled: true });
+
+  let r = await s2.sample();
+  assert.equal(r.ok, true, r.error);
+  assert.equal(seen.length, 1, '第一次采样就是一次变化');
+  assert.equal(seen[0].meta.changed, true);
+  assert.equal(seen[0].meta.kind, 'file', '第一次采到正在改的文件就算文件变化');
+
+  t += MIN_SAMPLE_GAP_MS + 1;
+  r = await s2.sample();
+  assert.equal(r.deduped, true);
+  assert.equal(seen.length, 1, '内容没变不该回调');
+
+  r = await s2.sample('test', { force: true });
+  assert.equal(r.ok, true);
+  assert.equal(seen.length, 2, 'forced 即使没变化也要回调');
+  assert.equal(seen[1].meta.forced, true);
+  assert.equal(seen[1].meta.changed, false);
+
+  t += MIN_SAMPLE_GAP_MS + 1;
+  resp = { ...SAMPLE, active: { ...SAMPLE.active, title: 'b.js — surfcore - Visual Studio Code' } };
+  r = await s2.sample();
+  assert.equal(seen.length, 3);
+  assert.equal(seen[2].meta.kind, 'window', '只变标题算窗口变化');
+
+  off();
+  t += MIN_SAMPLE_GAP_MS + 1;
+  resp = { ...SAMPLE, active: { ...SAMPLE.active, title: 'c.js — surfcore - Visual Studio Code' } };
+  await s2.sample();
+  assert.equal(seen.length, 3, '退订后不再回调');
+  s2.stop();
+});
+
+// ── 11. 事件文案 + feed 节流/去重 ──────────────────────────────────────
+check('事件文案：文件 / 窗口 / 音乐', () => {
+  const fileEvent = buildActivityEvent(sanitizeSample(SAMPLE), 'file');
+  assert.equal(fileEvent.kind, 'file');
+  assert.match(fileEvent.text, /你在改「a\.js」（surfcore） — VS Code/);
+  assert.equal(fileEvent.eventKey, 'file:Code:a.js:surfcore');
+
+  const winSample = sanitizeSample({
+    at: 1, active: { app: 'Code', title: 'vite.config.js', kind: 'editor', file: '', project: '' }, media: null, cursor: null,
+  });
+  assert.equal(buildActivityEvent(winSample, 'window').text, '你在用 VS Code 看「vite.config.js」');
+
+  const musicEvent = buildActivityEvent(
+    { active: null, media: { app: 'QQMusic.exe', title: 'Fallen Angel', artist: 'Wolfgang Laux', status: 'playing' }, cursor: null },
+    'music',
+  );
+  assert.equal(musicEvent.text, '在听《Fallen Angel》 — Wolfgang Laux');
+  assert.equal(activityKindOf(sanitizeSample(SAMPLE)), 'file');
+  assert.equal(activityKindOf({ active: null, media: { title: 't' } }), 'music');
+});
+
+check('feed：按 bubbleEveryMs 节流 + 同 key 去重 + forced 绕过', () => {
+  let nowMs = 1_700_000_000_000;
+  const added = [];
+  const feed = createActivityFeed({
+    addMessage: (m) => added.push(m),
+    getConfig: () => ({ activity: { bubbleEveryMs: 600000 } }),
+    now: () => nowMs,
+  });
+  const sample = sanitizeSample(SAMPLE);
+  const r1 = feed.handle(sample, { kind: 'file' });
+  assert.equal(r1.ok, true, JSON.stringify(r1));
+  assert.equal(added.length, 1);
+  assert.equal(added[0].kind, 'event');
+  assert.equal(added[0].who, 'her');
+
+  const r2 = feed.handle(sample, { kind: 'file' });
+  assert.equal(r2.ok, false);
+  assert.equal(r2.skipped, 'rate', '间隔没到不能说第二句');
+
+  nowMs += 600001;
+  const r3 = feed.handle(sample, { kind: 'file' });
+  assert.equal(r3.ok, true, '过了节流窗口可以再说一次');
+
+  const r4 = feed.handle(sample, { kind: 'file', forced: true });
+  assert.equal(r4.ok, true, 'forced 无视节流');
+  assert.equal(added.length, 3);
+  const st = feed.state();
+  assert.equal(st.eventCount, 3);
+  assert.equal(st.bubbleEveryMs, 600000);
+  assert.ok(st.lastEventAt > 0 && st.lastEvent);
+});
+
+// ── 12. 事件伪消息不进 history / 聊天存档 ──────────────────────────────
+await acheck('互动事件是 kind=event 的伪消息，不进聊天存档', async () => {
+  const { createOrbService } = await import('../lib/orb.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orb-activity-feed-'));
+  const archived = [];
+  const orb = createOrbService({
+    stateDir: dir,
+    pluginLog: () => {},
+    getSubprocess: () => null,
+    archiveMessage: (m) => archived.push(m),
+  });
+  const feed = createActivityFeed({
+    addMessage: (m) => orb.addMessage(m),
+    getConfig: () => ({ activity: { bubbleEveryMs: 600000 } }),
+    now: () => 1_700_000_000_000,
+  });
+  const before = orb.listMessages(20).messages.length;
+  const r = feed.handle(sanitizeSample(SAMPLE), { kind: 'file', forced: true });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  const msgs = orb.listMessages(20).messages;
+  assert.equal(msgs.length, before + 1);
+  assert.equal(msgs[msgs.length - 1].kind, 'event');
+  assert.match(msgs[msgs.length - 1].text, /你在改「a\.js」/);
+  assert.equal(archived.length, 0, 'event 不进聊天存档 / 记忆卡');
 });
 
 if (failed) { console.error(`\n✗ orb activity：${failed} 项失败`); process.exit(1); }

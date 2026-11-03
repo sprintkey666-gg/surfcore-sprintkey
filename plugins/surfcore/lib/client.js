@@ -5750,6 +5750,7 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
       const [sayText, setSayText] = useState("");
       const [shot, setShot] = useState(null);
       const [checks, setChecks] = useState(null);
+      const [tintDraft, setTintDraft] = useState(null);
 
       const load = useCallback(async () => {
         try {
@@ -5917,8 +5918,8 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
                 h("div", { className: "qbw-hint" }, "形象包 = 一套动作素材（webm/）+ 一份动作清单（config.jsonc 或 pack.json）。内置包来自 dsh-pet（MIT），换皮就是切到别的包。"),
                 h("div", { style: { display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center", marginTop: "6px" } },
                   h("select", { className: "qbw-input", "data-pet-pack": "1", defaultValue: petState?.assets?.activePackId || "dsh-pet", style: { maxWidth: "320px" } },
-                    ...(petState?.assets?.packs || []).map((p) => h("option", { key: p.id, value: p.id },
-                      `${p.name || p.id} · ${p.webmCount || 0} 个动作${p.builtin ? "（内置）" : ""}`))),
+                    ...(petState?.assets?.packs || []).map((p) => h("option", { key: p.id, value: p.id, disabled: !p.installed },
+                      `${p.name || p.id} · ${p.kind === "figure" ? "网页形象" : `${p.webmCount || 0} 个动作`}${p.builtin ? "（内置）" : ""}${p.installed ? "" : "（未下载）"}`))),
                   h(Btn, { kind: "qbw-btn2", disabled: !!busy, onClick: (e) => {
                     const id = e.currentTarget.closest("[data-pet-box]")?.querySelector("[data-pet-pack]")?.value || "";
                     return act("pet-packs", { action: "activate", id }, "✓ 已切换形象包，球会自己重载");
@@ -5933,6 +5934,27 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
                 h("div", { className: "qbw-hint" },
                   `包目录：${petState?.assets?.activePackDir || petState?.assets?.dir || "（还没装）"}`,
                   petState?.assets?.packs?.length > 1 ? ` · 共 ${petState.assets.packs.length} 个包` : ""),
+
+                // ── 配色 + 皮肤目录 ─────────────────────────────────────────
+                // tint 是皮肤包里的一层 CSS filter；真正的滤镜在渲染端套，这里只存 id。
+                h("div", { style: { display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center", marginTop: "8px" } },
+                  h("span", { className: "qbw-hint" }, "配色"),
+                  h("select", {
+                    className: "qbw-input",
+                    value: tintDraft ?? (petCfg.tint || ""),
+                    style: { maxWidth: "200px" },
+                    onChange: (e) => setTintDraft(e.target.value),
+                  },
+                    ...((petState?.tints || []).length ? petState.tints : [{ id: "", name: "原色" }]).map((t) =>
+                      h("option", { key: t.id || "plain", value: t.id || "" }, t.name || t.id || "原色"))),
+                  h(Btn, { kind: "qbw-btn2", disabled: !!busy, onClick: async () => {
+                    const tint = tintDraft ?? (petCfg.tint || "");
+                    await save({ pet: { ...petCfg, tint } });
+                    setTintDraft(null);
+                  } }, "保存配色"),
+                  h(Btn, { kind: "qbw-btn2", disabled: !!busy, onClick: () => act("pet-packs", { action: "opendir" }) }, "打开皮肤目录")),
+                h("div", { className: "qbw-hint" },
+                  "配色是叠在形象上的一层滤镜（换色调，不改素材）。挑一个看着顺眼的，桌宠会立刻换色。"),
 
                 // ── 内置皮肤包清单（随插件发布的 index.json）─────────────────
                 // 没装的显示「下载」，装了的显示「启用/删除」；figure 包不用 webm，靠 index.html 自绘。
@@ -6027,6 +6049,12 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
           slider(Math.round((actCfg.pollMs ?? 20000) / 1000), 10, 120, 5, (v) => set("activity.pollMs", Number(v) * 1000)),
           h("div", { className: "qbw-kv" }, h("span", null, "主动气泡频率"), h("span", null, `${Math.round((actCfg.bubbleEveryMs ?? 600000) / 60000)} 分钟`)),
           slider(Math.round((actCfg.bubbleEveryMs ?? 600000) / 60000), 1, 60, 1, (v) => set("activity.bubbleEveryMs", Number(v) * 60000)),
+          h(Row, { label: "测试一下", hint: "立刻采一次并强制冒一条气泡，不用等下一个采样间隔。开着桌宠时最直观。" },
+            h(Btn, { kind: "qbw-btn2", disabled: !!busy, onClick: async () => {
+              const r = await act("activity/test");
+              if (r?.event?.text) setMsg(`✓ 已推一条：${r.event.text}`);
+              else if (r?.error) setMsg(`✗ ${r.error}`);
+            } }, "采一次试试")),
           h("div", { className: "qbw-hint" },
             "采样内容是给「她接话」用的，不会上传到任何服务器；关掉开关会把 activity.json 一起删掉。"
             + (st?.activity?.lastAt ? ` 上次采样：${new Date(st.activity.lastAt).toLocaleTimeString()}` : " 还没采过样。"))),

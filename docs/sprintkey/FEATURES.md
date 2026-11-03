@@ -439,7 +439,7 @@
 
 ## 27. 记忆卡：「最近很要紧的」——暗号事故的根因与修法
 
-**事故**：2026-11-02 上午她在 QQ 私聊里和主人约了暗号（问「在吗 鲸鲸」→ 答「赖着不走的鱼」）。11-03 晚上在悬浮窗里问，她一本正经地说「暗号对上了，鲸鲸在」——**在编**。
+**事故**：2026-11-02 上午她在 QQ 私聊里和主人约了暗号（问「在吗 测试」→ 答「示例暗号ABC」）。11-03 晚上在悬浮窗里问，她一本正经地说「暗号对上了，鲸鲸在」——**在编**。
 
 **这不是互通没接上**：那条记忆确实在卡里（`mem_654c17336ab254`，importance 74，tags `owner/qq/initial`），悬浮窗也确实在读同一张卡。真正的问题在**渲染**：
 
@@ -456,7 +456,7 @@
 
 **跨端最近对话**：`interop.recentLines` 12→30、`recentHours` 24→48。暗号那轮在 6 小时前、约 100 条消息之前，12 行 / 24 小时根本够不着。
 
-**验证**：拿本机真卡（610 条）直接渲染 —— `renderMemoryCard(card, {platform:'qq'})` 1656 字、含「赖着不走的鱼」；`platform:'bili'` 0 字。`scripts/test-memory-card-recent-important.mjs`（9 组，含「同分但 lastSeenAt 更新的一批记录不能把暗号挤掉」这条真机陷阱）。
+**验证**：拿本机真卡（610 条）直接渲染 —— `renderMemoryCard(card, {platform:'qq'})` 1656 字、含「示例暗号ABC」；`platform:'bili'` 0 字。`scripts/test-memory-card-recent-important.mjs`（9 组，含「同分但 lastSeenAt 更新的一批记录不能把暗号挤掉」这条真机陷阱）。
 
 **重建注入块**：`saveMemoryCardOutputs(paths, card, cfg)` 会同时重写 `memory-card.md` / `-prompt-qq.md` / `-prompt-bili.md`；改完卡渲染逻辑后跑一次，重启前就能生效。
 
@@ -530,7 +530,7 @@
 | `plugins/surfcore/lib/interop.js` | 互通记忆纯函数：`normalizeInterop` / `clampText` / `formatRecentLines` / `buildInteropMemory` |
 | `plugins/surfcore/lib/orb-agent.js` | 「原版」回复的会话驱动器：`createTurnCollector` / `createOrbAgent`（inspect→create、turn/end 收文本、超时取消） |
 | `scripts/test-orb-interop.mjs` | 互通记忆 24 项单测（钳制/截断/时间窗/拼接顺序） |
-| `scripts/test-orb-agent.mjs` | 会话驱动器 17 项单测（只认 turn/end、ready 缓存、失败/超时清理） |
+| `scripts/test-orb-agent.mjs` | 会话驱动器 22 项单测（只认 turn/end、ready 缓存、失败/超时清理、**AbortSignal 必传**、agentTurns 写盘） |
 | `scripts/test-memory-card-channel.mjs` | 记忆卡数据类型 22 项单测（悬浮窗/字幕/桌宠的标题前缀与 tag） |
 | `scripts/test-chat-archive-recent.mjs` | 存档数据类型 + 尾部回读 20 项单测 |
 | `src/memory-card.js` | 衰减记忆卡（含 `includePetInBili`、B站 侧 fail-closed、「最近很要紧的」段） |
@@ -542,6 +542,49 @@
 | `plugins/surfcore/assets/pet-packs/sprintkey-fish/` | 随仓自绘 figure 形象包（`pack.json` + 纯前端 SVG `index.html`，MIT） |
 
 修改的既有文件：`src/bridge.js`、`plugins/surfcore/lib/index.js`、`plugins/surfcore/lib/client.js`。
+
+## 30. 悬浮窗 / 字幕回复真的开一个 DSH 会话（0.12.18）
+
+**做什么**：`chat.reply.mode = legacy`（默认「原版」）时，桌宠会话与陪伴字幕不再走单轮直连，而是**真的开一个 DSH 会话**（`orb-chat-<角色>-<代数>` / `orb-companion-<角色>-<代数>`），把完整 system（身份 + 人设 + 记忆卡 + 跨端最近对话）和这轮输入推给 `sessionController.prompt`，收 `turn/end` 的最终文本当回复——和 QQ 桥接同款回合。失败或超时（默认 180 秒）自动退回直连，不会哑掉。
+
+**为什么之前一次都没跑起来（两层，缺一不可）**：
+
+1. `plugins/surfcore/lib/orb-agent.js` 调 `sessionController.prompt({...})` 时**没传第二个参数 `signal`**，而 DSH 内部无条件执行 `signal.throwIfAborted()` → 每轮抛 `Cannot read properties of undefined (reading 'throwIfAborted')` → 被 catch 成「退回直连」，只在 `plugin.log` 留一行。表面看就是普通直连回复。
+2. `bumpAgentTurns(history, turns)` 在 `turns <= 0` 时直接 return，而 `sessionTurns` 默认 0（=不换会话）→ 就算跑成功也不写任何痕迹，事后无从判断。
+
+**怎么改的**：`run()` 用 `AbortController`，`sc.prompt(args, abort.signal)`，超时先 `abort.abort()` 再 `sc.cancel({sessionId})`，`cancel()/dispose()` 也 abort；`bumpAgentTurns(history, every, sessionId)` **永远**写 `agentTurns/agentTotal/agentLastAt/agentLastSession`，达到 `every` 才换代 `agentGen`；人设只在**这个会话代数第一次开口**时整段推（`history.agentSystem[sessionId]` 记账），后续轮次只推「人设没变」+ 最新记忆卡，避免上下文堆 N 份人设。
+
+**验证**：重启 DSH 后说一句话 → `~/.dsh/surfcore/plugin.log` 出现 `[pet-chat] 原版会话 ok session=orb-chat-…`；`orb/chat/history-<角色>.json` 出现 `agentTotal`/`agentGen`/`agentSystem`；问只有记忆卡里才有的东西（约定的暗号）能答对。单测 `node scripts/test-orb-agent.mjs`（含「prompt 收到 AbortSignal」「超时会把 signal abort 掉」「pet-chat 记 agentTotal」）。
+
+
+
+## 31. 桌宠渲染：不再重影、鼠标划过不搬、气泡真的会冒（0.12.18）
+
+**重影**：`.pvBase{z-index:1}` 和 `.pvAction{z-index:3}` 同时 `opacity:1`，action 是 VP9-alpha 视频，透明区直接透出底下的待机鲸鱼 → 看着像两只叠在一起。修法：action 首帧到达后先 `dimBase(true)`（底色层 90ms 淡出），再过 90ms 才给 action 加 `.on`；`finishAction()` 摘 `.on` 后立刻 `dimBase(false)` 把待机放回来；交叉淡入只允许 base A/B 之间发生。`safePlay()` 给每层串行化 `play()`，`AbortError` 与 `interrupted by a call to pause` 一律吞掉并打 `[pet] layer-play-race`。
+
+**鼠标划过就搬窗口**：`pickIdleAction()` 把 manifest 的 `moves` 混进了待机抽取，鼠标一划过正好抽到 move 动作就真去调 `petMove()`。修法：待机池剥掉 move（另加 `moveNames` 名字级兜底），`wander.enabled` 默认 false（只有 `=== true` 才算开），move 只由右键「走一走」或 45~150 秒随机漫游触发。
+
+**气泡一次都不冒**：`maybeBubble` 拿「已读水位」`seenId` 当发布门，可面板一展开 `markSeen` 就把水位推到最新 → 之后所有新消息都被判成「已读」。修法：删掉 seenId 判据，改成 `lastBubbleId`（上次冒泡的 id）+ `lastUserReadAt`（刚读的时刻）；面板展开时**延后 600ms** 冒、收起时补冒，不丢消息。日志：`[bubble] show id=… kind=… why=…` / `[bubble] skip reason=…`。
+
+**气泡样式**：照 `Bai-Cute/big-blue-fish-desktop-pet` 的 `CompanionBubble.cs` 重画——奶油白 `#fffbf4` + 1.5px 蓝灰 `#506098` 描边 + 24px 圆角，尖角用旋转 45° 的方块只留两条边描边，和圆角框体拼成**一条连续轮廓**；`min(420px, 100%-24)`、13.5px/1.55、五种场景 class（chat/notice/event/news/error）+ 深色一套。
+
+**菜单与面板**：照 `MerZlin/dsh-pet-indesktop` 的视觉规范——侧栏 52px（≥620px 展开 200px）七个域、页面标题 22/600、小节 13/600、卡片 12 圆角、18px 节奏、浅色/深色两套 token；会话气泡她奶油白+描边、主人蓝灰实底、时间戳 11px、发送按钮 `#506098`。
+
+**验证**：`node scripts/test-orb.mjs`（67 + 313 项，含 dim 时序、待机池不含 move、气泡四道门、kind class、菜单 token、侧栏宽度）；真机看 `~/.dsh/surfcore/orb/orb-app.log`。
+
+## 32. 皮肤与配色、监测事件气泡（0.12.18）
+
+**皮肤目录同步**：`list`/`activate` 之前先把 `assets/pet-packs/index.json` 里的内置包幂等落成 `packs/<id>/`（webm 包只写 `pack.json` 并把目录指回内置只读素材，figure 包复制 `index.html`），修掉日志里那句 `没有这个皮肤包：sprintkey-fish`。
+
+**新可分发皮肤 `big-blue-fish`**：`source.kind='github-assets'`，安装时从 `https://codeload.github.com/Bai-Cute/big-blue-fish-desktop-pet/tar.gz/refs/heads/main` 只解出 `code/BigBlueFish.Windows/assets/fish/*.webm` + `animations.json` + `LICENSE.txt`；`Pool:'Disabled'` 跳过、节日项转 `festivals.json`、许可落 `LICENSES/big-blue-fish-LICENSE.txt`（**assets 是 MIT，Copyright (c) 2026 PC2005-cloud**）。
+
+**六套配色**：`pack.json` 的 `tints[{id,name,filter}]`（原色/鲸蓝/樱花/薄荷/暮金/夜航）→ 配置 `orb.pet.tint` → `petInfo()`/`hostPayload()`/`orb:petconfig` → 渲染端 `--pet-tint` 的 CSS filter。
+
+**监测 → 气泡**：`createOrbActivity` 增加 `onSample`；`orb-api` 的 `createActivityFeed` 把变化转成 `kind:'event'` 的伪消息（`你在改「a.js」（surfcore） — VS Code`、`在听《…》 — …`），按 `activity.bubbleEveryMs`（默认 10 分钟）节流 + `eventKey` 去重，**不进 history、不进聊天存档、不写记忆卡**；`POST /orb/activity/test` 可以立刻采一次用来验证。
+
+**许可边界**：dsh-pet（MIT）、big-blue-fish 的 assets（MIT）可以用；**Coopanion（AGPL-3.0-or-later）与 dsh-pet-indesktop 的角色形象（CC BY-NC-SA 类）不入库、不打包**，只允许用户自己导入自用。
+
+**验证**：`node plugins/surfcore/scripts/test-pet-packs.mjs`（18 项）、`test-orb-activity.mjs`（21 项）、`test-orb-files.mjs`；真机 `POST /orb/activity/test` 后看 `[bubble] show kind=event`。
 
 ## 新增功能时按这个格式补一条
 

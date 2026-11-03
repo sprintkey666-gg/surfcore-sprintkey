@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "packs": [
     {
       "id": "dsh-pet",
@@ -20,6 +20,23 @@
       "author": "sprintkey",
       "description": "自绘网页形象包：圆滚滚的 Q 版小鲸鱼，会呼吸、会眨眼、被点会弹一下，纯前端无依赖，随仓库直接入库。",
       "bundled": "sprintkey-fish"
+    },
+    {
+      "id": "big-blue-fish",
+      "name": "蓝胖鱼（big-blue-fish）",
+      "kind": "webm",
+      "version": "1.0.0",
+      "license": "MIT",
+      "author": "PC2005-cloud",
+      "description": "106 段 webm 动画的完整桌宠素材（待机 / 点击 / 拖拽 / 九十多种节日动作），点击「下载」时从 GitHub 拉取整包并只挑素材目录（约 64MB 下载，落地约 20MB）。",
+      "source": {
+        "kind": "github-assets",
+        "repo": "Bai-Cute/big-blue-fish-desktop-pet",
+        "ref": "main",
+        "tarball": "https://codeload.github.com/Bai-Cute/big-blue-fish-desktop-pet/tar.gz/refs/heads/main",
+        "assetDir": "code/BigBlueFish.Windows/assets/fish",
+        "licenseFile": "code/BigBlueFish.Windows/assets/fish/LICENSE.txt"
+      }
     }
   ]
 }

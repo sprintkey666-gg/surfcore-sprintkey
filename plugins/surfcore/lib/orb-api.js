@@ -239,6 +239,148 @@ function runPowerShell(script, { env = {}, timeoutMs = 20000 } = {}) {
 }
 
 /**
+ * 把一条互动监测采样翻成「她会主动说的一句话」。
+ *
+ * 纯函数，方便单测。返回：
+ *   { kind, text, eventKey }  —— 有值得说的内容
+ *   null                      —— 这次没什么好说的（没窗口、没歌、标题为空）
+ *
+ * 注意：这里只负责「说什么」，节流 / 去重 / 塞进 feed 由 createActivityFeed 管。
+ */
+const APP_LABELS = {
+  winword: 'Word', word: 'Word', excel: 'Excel', powerpnt: 'PowerPoint', powerpoint: 'PowerPoint',
+  code: 'VS Code', cursor: 'Cursor', notepad: '记事本', sublime_text: 'Sublime Text',
+  idea64: 'IntelliJ IDEA', pycharm64: 'PyCharm', webstorm64: 'WebStorm', goland64: 'GoLand',
+  chrome: 'Chrome', msedge: 'Edge', firefox: 'Firefox', explorer: '文件资源管理器',
+};
+
+function appLabel(app) {
+  const raw = String(app || '').trim();
+  if (!raw) return '这个';
+  const base = raw.replace(/\.exe$/i, '').toLowerCase();
+  if (APP_LABELS[base]) return APP_LABELS[base];
+  // 进程名一般全大写（WINWORD）；保留原大小写更像人说的（Code、QQMusic）。
+  return raw.replace(/\.exe$/i, '');
+}
+
+function clipText(text, max = 90) {
+  const s = String(text || '').replace(/\s+/g, ' ').trim();
+  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+
+export function buildActivityEvent(sample, kind = '') {
+  const active = sample?.active && typeof sample.active === 'object' ? sample.active : null;
+  const media = sample?.media && typeof sample.media === 'object' ? sample.media : null;
+  const want = String(kind || '');
+  const activeKind = String(active?.kind || '');
+  const file = clipText(active?.file, 80);
+  const project = clipText(active?.project, 40);
+  const title = clipText(active?.title, 80);
+  const app = appLabel(active?.app);
+
+  if (active && (want === 'file' || want === 'window' || !want) && (file || title)) {
+    if (file) {
+      // 编辑器/文档标题里解析出了文件名，说得具体一点；project 顺带提一下。
+      const where = project ? `（${project}）` : '';
+      return {
+        kind: 'file',
+        text: `${activeKind === 'editor' || activeKind === 'document' ? '你在改' : '你在看'}「${file}」${where}${app ? ` — ${app}` : ''}`,
+        eventKey: `file:${active.app}:${file}:${project}`,
+      };
+    }
+    if (title && want !== 'file') {
+      return {
+        kind: 'window',
+        text: `你在用 ${app} 看「${title}」`,
+        eventKey: `win:${active.app}:${title}`,
+      };
+    }
+  }
+  if (media && (want === 'music' || !want) && media.title) {
+    const artist = clipText(media.artist, 40);
+    return {
+      kind: 'music',
+      text: `在听《${clipText(media.title, 60)}》${artist ? ` — ${artist}` : ''}`,
+      eventKey: `music:${media.title}:${artist}`,
+    };
+  }
+  return null;
+}
+
+/** 采样里最值得说的那一类：文件 > 窗口 > 音乐。 */
+export function activityKindOf(sample) {
+  if (sample?.active?.file) return 'file';
+  if (sample?.active?.title) return 'window';
+  if (sample?.media?.title) return 'music';
+  return '';
+}
+
+/**
+ * 互动监测 → 会话气泡的桥。
+ *
+ * 产出的是一条 kind='event' 的伪消息，走和「她说话」同一条 feed（/state、/events、
+ * 悬浮窗冒泡都读它），但 orb.addMessage 的归档逻辑只对待 proactive/system，
+ * 所以 event **不会**进 history / 记忆卡 / 聊天存档。
+ *
+ * 节流：全局最少隔 activity.bubbleEveryMs（默认 10 分钟）；同一个 eventKey
+ * 在这个窗口内只出现一次。设置页「测试一下」传 forced=true，两种都绕过。
+ */
+export function createActivityFeed({ addMessage, getConfig = () => ({}), now = () => Date.now(), log = () => {} } = {}) {
+  let lastEventAt = 0;
+  let eventCount = 0;
+  let lastEvent = null;
+  const seen = new Map();
+
+  function bubbleEveryMs() {
+    let raw = 0;
+    try { raw = Number(getConfig()?.activity?.bubbleEveryMs) || 0; } catch {}
+    return Math.min(6 * 60 * 60 * 1000, Math.max(60_000, raw || 600_000));
+  }
+
+  function prune(cut) {
+    for (const [key, at] of seen) if (at < cut) seen.delete(key);
+  }
+
+  function handle(sample, meta = {}) {
+    if (!sample) return { ok: false, skipped: 'no-sample' };
+    const kind = String(meta.kind || '') || activityKindOf(sample);
+    const event = buildActivityEvent(sample, kind);
+    if (!event) return { ok: false, skipped: 'empty' };
+    const at = now();
+    const windowMs = bubbleEveryMs();
+    const forced = meta.forced === true;
+    if (!forced) {
+      if (lastEventAt && at - lastEventAt < windowMs) {
+        return { ok: false, skipped: 'rate', event, waitMs: windowMs - (at - lastEventAt) };
+      }
+      const prev = seen.get(event.eventKey) || 0;
+      if (prev && at - prev < windowMs) {
+        return { ok: false, skipped: 'duplicate', event, waitMs: windowMs - (at - prev) };
+      }
+    }
+    prune(at - windowMs);
+    seen.set(event.eventKey, at);
+    lastEventAt = at;
+    eventCount += 1;
+    lastEvent = { ...event, at };
+    try {
+      // 只要 text 就够冒泡；id/seq 由 orb.addMessage 自己发号。
+      addMessage({ who: 'her', text: event.text, kind: 'event', at });
+    } catch (error) {
+      log('[orb-api] 互动监测事件入 feed 失败：', String(error?.message ?? error));
+      return { ok: false, skipped: 'add-failed', event, error: String(error?.message ?? error) };
+    }
+    return { ok: true, event: lastEvent };
+  }
+
+  function state() {
+    return { lastEventAt, eventCount, lastEvent, bubbleEveryMs: bubbleEveryMs() };
+  }
+
+  return { handle, state };
+}
+
+/**
  * @param {object} opts
  * @param {object} opts.orb            lib/orb.js 的服务
  * @param {object} opts.chat           pet-chat（profile=orb）
@@ -695,6 +837,19 @@ export function createOrbApiService({
     return fresh;
   }
 
+  // 互动监测 → 气泡：activity 每采到一条有变化的样本，就翻成一句 she 的话塞进 feed。
+  // 开关、节流、去重都在 activity / feed 内部；这里只是接线，别再自己算一遍。
+  const activityFeed = createActivityFeed({
+    addMessage: (msg) => orb.addMessage(msg),
+    getConfig: () => orb.readConfig(),
+    log: pluginLog,
+  });
+  try {
+    activity?.onSample?.((sample, meta) => activityFeed.handle(sample, meta));
+  } catch (error) {
+    pluginLog('[orb-api] 订阅互动监测失败：', String(error?.message ?? error));
+  }
+
   function hostPayload() {
     let pet = null;
     try { pet = orb.petInfo(); } catch (error) {
@@ -731,6 +886,9 @@ export function createOrbApiService({
           packKind: pet.packKind || 'webm',
           packEntry: pet.packEntry || '',
           packEntryUrl: pet.packEntryUrl || '',
+          // 配色：渲染端把 tint 对应的 filter 套在图层/iframe 上。
+          tint: pet.tint || '',
+          tints: Array.isArray(pet.tints) ? pet.tints : [],
           manifest: pet.manifest,
         }
         : null,
@@ -1139,6 +1297,8 @@ export function createOrbApiService({
       },
       purpose: { focus },
       companion: companion.status(),
+      // 互动监测气泡：上次冒泡时间 / 次数 / 最后一条（设置页显示「监测中」用）
+      activity: activityFeed.state(),
       // 已读水位：面板里看到第几条，收起后就不用再弹气泡了（跨重启记住）。
       read: { seenId: orb.readSeenId() },
       theme: (() => {
@@ -1215,6 +1375,22 @@ export function createOrbApiService({
       return;
     }
     // 互动监测：主进程每 5 秒读 activity.json 推给渲染端，开关走这里。
+    // 「测试一下」：立刻采一次并强行冒一条气泡，不占日常的 10 分钟节流。
+    if (req.method === 'POST' && suffix === '/activity/test') {
+      let cfg = null;
+      try { cfg = orb.readConfig().activity; } catch {}
+      if (cfg?.enabled !== true) {
+        json(res, 409, { ok: false, error: '互动监测没开（先去设置页打开）' });
+        return;
+      }
+      const result = await (activity?.sample ? activity.sample('test', { force: true }) : null);
+      if (!result?.ok) {
+        json(res, 500, { ok: false, error: result?.error || '采样失败', sample: result?.data || null });
+        return;
+      }
+      json(res, 200, { ok: true, sample: result.data, kind: result.kind || '', event: activityFeed.state().lastEvent });
+      return;
+    }
     if (suffix === '/activity') {
       if (req.method === 'GET') {
         let config = null;
@@ -1222,7 +1398,7 @@ export function createOrbApiService({
         let status = null;
         let last = null;
         try { status = activity?.status?.() || null; last = activity?.last?.() || null; } catch {}
-        json(res, 200, { ok: true, config, status, last });
+        json(res, 200, { ok: true, config, status, last, feed: activityFeed.state() });
         return;
       }
       let body = {};
@@ -1621,5 +1797,6 @@ export function createOrbApiService({
     stateForOrb,
     desktopContext,
     companion,
+    activityFeed,
   };
 }

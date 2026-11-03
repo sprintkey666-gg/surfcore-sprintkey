@@ -39,6 +39,8 @@
     chain: 0,           // 播放代次：旧视频迟到的 ended 事件用它过滤
     playing: null,      // { name, kind } 动作层在播什么
     timer: null,        // 下一个随机动作
+    wanderTimer: null,  // 漫游（搬窗口）专用计时器；只有它和菜单能搬窗口
+    dimmed: false,      // 底色层此刻是否让位给动作层
     bubbleTimer: null,
     watchdog: null,
     bubbleClick: null,
@@ -79,10 +81,24 @@
   // 待机层交叉淡入 / 动作层淡出，跟 pet.css 里的 transition 对齐
   const IDLE_FADE_MS = 200;
   const ACTION_FADE_MS = 200;
+  // 动作层亮起前，先让底色层淡出这么久（pet.css 的 .dim 跟它对齐）。
+  // 两层同时不透明就是「重影」——动作是带 alpha 的视频，透明区会透出底下的鲸鱼。
+  const DIM_FADE_MS = 90;
   // 等首帧的上限：本地 file:// 一般 30-80ms 就有帧，超过这个数就直接放行，别把动作卡死
   const FIRST_FRAME_MS = 900;
   // 网页形象多久没喊 ready 就当它坏了，退回 webm
   const FIGURE_READY_MS = 6000;
+  // 气泡场景 → CSS class 后缀（bubble--chat / --notice / --event / --news / --error）
+  const BUBBLE_KIND_ALIAS = {
+    chat: 'chat',
+    her: 'chat',
+    proactive: 'chat',
+    me: 'me',
+    notice: 'notice',
+    event: 'event',
+    news: 'news',
+    error: 'error',
+  };
 
   // ── 小工具 ─────────────────────────────────────────────────────────────────
 
@@ -193,8 +209,9 @@
   // ── 配置 ───────────────────────────────────────────────────────────────────
 
   function petOpts() {
-    // gaze / wander 由主进程透传（main.js → orb.js petInfo → orb:petconfig）；
-    // 老版本主进程没有这两项时按默认开，行为退化但不报错。
+    // gaze / wander 由主进程透传（main.js → orb.js petInfo → orb:petconfig）。
+    // wander 默认 **关**：以前默认开，鼠标划过正好抽到 manifest 里的 move 动作，
+    // 就会真的把窗口搬走（主人实证投诉「鼠标划过就移动」）。要漫游必须显式打开。
     const pet = state.cfg || {};
     const gaze = pet.gaze && typeof pet.gaze === 'object' ? pet.gaze : {};
     const wander = pet.wander && typeof pet.wander === 'object' ? pet.wander : {};
@@ -206,7 +223,7 @@
         maxShiftPx: clamp(num(gaze.maxShiftPx, 4), 0, 12),
       },
       wander: {
-        enabled: wander.enabled !== false,
+        enabled: wander.enabled === true,
         minMs: Math.max(0, num(wander.minMs, 0)),
         maxMs: Math.max(0, num(wander.maxMs, 0)),
       },
@@ -215,10 +232,12 @@
     };
   }
 
+  /** 走位只在这一个开关打开时才允许自动发生（默认 false，见 petOpts 注释）。 */
   function wanderEnabled() {
     const w = petOpts().wander;
+    if (w.enabled !== true) return false;
     const moveWeight = num(state.manifest?.weights?.move, 5);
-    return w.enabled && moveWeight > 0;
+    return moveWeight > 0;
   }
 
   // ── 气泡摆放 ───────────────────────────────────────────────────────────────
@@ -294,6 +313,62 @@
 
   // ── 播放：三层模型 ─────────────────────────────────────────────────────────
 
+  /**
+   * 每一层同一时刻只允许一个在途 play()。
+   * 上一个 play() 还没 settle 就紧跟着 pause()/再 play()，Chromium 会抛
+   * 「The play() request was interrupted by a call to pause()」——这类 rejection
+   * 是「切得快」的正常产物，吞掉并记一行 layer-play-race，不要让它冒成未捕获异常。
+   */
+  const pendingPlay = new Map();
+  async function safePlay(video, layer) {
+    if (!video) return false;
+    const prev = pendingPlay.get(video);
+    if (prev) { try { await prev; } catch {} }
+    let started;
+    try {
+      started = video.play();
+    } catch (error) {
+      log(`layer-play-race ${layer || ''} ${String(error?.name || '')} ${String(error?.message || error)}`.trim());
+      return false;
+    }
+    const guarded = Promise.resolve(started).then(
+      () => true,
+      (error) => {
+        const name = String(error?.name || '');
+        const msg = String(error?.message || error);
+        if (name === 'AbortError' || /interrupted by a call to (pause|load)/i.test(msg)) {
+          log(`layer-play-race ${layer || ''} ${name} ${msg}`.trim());
+          return false;
+        }
+        state.failCount += 1;
+        log(`播放失败 ${layer || ''}: ${msg}`);
+        return false;
+      },
+    );
+    pendingPlay.set(video, guarded);
+    try {
+      return await guarded;
+    } finally {
+      if (pendingPlay.get(video) === guarded) pendingPlay.delete(video);
+    }
+  }
+
+  /**
+   * 底色层让位。动作层是带 alpha 的 webm，透明区会透出底下一直在循环的待机层：
+   * 两层各摆一个姿势，看起来就是「重影」。所以动作亮起前先把底色压到 0，
+   * 动作淡出时再把它亮回来（不是两个都亮着交叉淡入）。
+   */
+  function dimBase(on) {
+    const want = on === true;
+    if (state.dimmed === want) return;
+    state.dimmed = want;
+    for (const v of idleVids) {
+      if (!v) continue;
+      v.classList.toggle('dim', want);
+    }
+    log(`[layer] base dim=${want ? 'on' : 'off'}`);
+  }
+
   /** 角色身高 = 窗口高度 - 头顶气泡带；pet.css 按这个值把整帧放大（--pet-size）。 */
   function setSize(px) {
     const size = Math.max(60, Number(px) || 200);
@@ -308,21 +383,27 @@
   /**
    * 待机动作池。权重来自 manifest.weights / category.weight。
    * turn（东张西望）以前完全没被用过——它是最自然的一段「她注意到你了」，接进来。
+   *
+   * move（走位）**永远不进这个池子**：待机是每 6~16 秒抽一次的，抽到 move 就会真的
+   * 搬窗口；鼠标划过触发 react() → 也走这个池子，于是「手一挥她就跑」。走位只由
+   * 漫游计时器（wander.enabled，默认关）或右键菜单「走一走」显式触发。
    */
   function pickIdleAction() {
     const m = state.manifest;
     if (!m) return null;
     const w = m.weights;
     const pool = [];
+    // 有些包的 manifest 会把 walk 素材也塞进 categories：按名字再挡一次，
+    // 不然「随机抽动作」抽到它，她的窗口还是会自己跑。
+    const moveNames = new Set((m.moves || []).map((mv) => mv?.name).filter(Boolean));
     const add = (name, weight, extra) => {
       const n = Number(weight);
-      if (name && Number.isFinite(n) && n > 0) pool.push({ name, weight: n, ...extra });
+      if (!name || !Number.isFinite(n) || n <= 0) return;
+      if (moveNames.has(name)) return;
+      pool.push({ name, weight: n, ...extra });
     };
     for (const name of m.idle) add(name, w.idle, { kind: 'idle', mirror: true });
     for (const name of m.turn) add(name, w.turn, { kind: 'turn', mirror: true });
-    if (wanderEnabled()) {
-      for (const mv of m.moves) add(mv.name, w.move, { kind: 'move', mirror: false, params: mv.params });
-    }
     for (const cat of m.categories) {
       for (const name of cat.actions) add(name, cat.weight, { kind: 'action', mirror: cat.noMirror !== true });
     }
@@ -384,13 +465,7 @@
         // 只有「不在台上的那一层」才允许重置时间轴，可见中的层一律不动
         try { next.currentTime = 0; } catch {}
       }
-      const started = next.play();
-      if (started && typeof started.catch === 'function') {
-        started.catch((error) => {
-          state.failCount += 1;
-          log(`待机播放失败 ${name}: ${error?.message || error}`);
-        });
-      }
+      void safePlay(next, `idle:${name}`);
     } catch (error) {
       log(`待机播放异常 ${name}: ${error?.message || error}`);
       scheduleIdle();
@@ -441,14 +516,7 @@
         actionVid.setAttribute('data-src', url);
         try { actionVid.currentTime = 0; } catch {}
       }
-      const started = actionVid.play();
-      if (started && typeof started.catch === 'function') {
-        started.catch((error) => {
-          state.failCount += 1;
-          log(`动作播放失败 ${name}: ${error?.message || error}`);
-          if (state.failCount > 4) logOnce('play-fail', '连续播放失败，可能是素材路径失效');
-        });
-      }
+      void safePlay(actionVid, `action:${name}`);
     } catch (error) {
       log(`动作播放异常 ${name}: ${error?.message || error}`);
       state.busy = false;
@@ -459,6 +527,11 @@
     // 不补这一下她就永远停在一个动作上、也不再随机换动作了。
     armWatchdog(actionVid, name, loop, token);
     await whenFirstFrame(actionVid);
+    if (token !== state.actionToken) return true;
+    // 顺序很关键：先让底色层淡出（90ms），再让动作层淡入。
+    // 反过来的话两个不透明的她在同一帧里各摆一个姿势 = 重影（主人实证投诉过）。
+    dimBase(true);
+    await new Promise((resolve) => setTimeout(resolve, DIM_FADE_MS));
     if (token !== state.actionToken) return true;
     actionVid.classList.add('on');
     log(`[layer] action ${name} kind=${state.playing?.kind || ''}`);
@@ -476,6 +549,9 @@
     const vid = actionVid;
     if (vid) {
       vid.classList.remove('on'); // CSS transition 200ms 淡出，底下待机一直在
+      // 动作层开始淡出的同一刻把底色亮回来：底色 90ms 就位、动作 200ms 才淡完，
+      // 会有很轻的一下叠加，但宠物本体始终在，不会「消失 200ms」再跳出来。
+      dimBase(false);
       setTimeout(() => {
         if (state.busy) return; // 这期间又开了新动作，别把新源卸了
         if (vid.classList.contains('on')) return;
@@ -562,6 +638,41 @@
       log(`走位异常：${error?.message || error}`);
     }
     return true;
+  }
+
+  /**
+   * 走一次：只从 manifest.moves 里挑一段「走两步」并搬窗口。
+   * 调用者只有两个——漫游计时器（wander.enabled，默认关）和右键菜单「走一走」。
+   * 待机抽取、鼠标划过（react）都不许碰它，否则手一挥她就跑。
+   */
+  function wanderOnce(reason) {
+    if (state.packKind === 'figure') { log('[pet] wander 跳过：网页形象没有走位素材'); return false; }
+    const moves = state.manifest?.moves || [];
+    if (!moves.length) return false;
+    const mv = pick(moves);
+    if (!mv) return false;
+    log(`[pet] wander (${reason || 'manual'}) ${mv.name}`);
+    return walk({ name: mv.name, params: mv.params || {} });
+  }
+
+  function wanderDelayMs() {
+    const w = petOpts().wander;
+    const min = clamp(num(w.minMs, 45000), 8000, 900000);
+    const max = Math.max(min, clamp(num(w.maxMs, 150000), min, 1800000));
+    return Math.round(min + Math.random() * (max - min));
+  }
+
+  /** 漫游计时器：wander 关着就什么都不排（默认就是关）。 */
+  function scheduleWander() {
+    if (state.wanderTimer) { clearTimeout(state.wanderTimer); state.wanderTimer = null; }
+    if (!state.ready) return;
+    if (!wanderEnabled()) return;
+    state.wanderTimer = setTimeout(() => {
+      state.wanderTimer = null;
+      if (!state.ready || state.paused || state.busy) { scheduleWander(); return; }
+      wanderOnce('timer');
+      scheduleWander();
+    }, wanderDelayMs());
   }
 
   // ── 网页形象（figure）通道 ─────────────────────────────────────────────────
@@ -867,6 +978,10 @@
     // 没有 manifest 就存 null（figure 包就是这样）：存成「空归一化对象」会让
     // startConfigWatch 的 null 对照永远不相等，4 秒重载一次 iframe。
     state.manifest = pet?.manifest ? normalizeManifest(pet.manifest) : null;
+    // 主进程透传的着色：CSS filter 字符串（如 'hue-rotate(20deg) saturate(1.1)'），
+    // 只作用在形象本体上，不影响气泡和菜单。
+    const tint = typeof pet?.tint === 'string' ? pet.tint.trim() : '';
+    if (stageInner) stageInner.style.setProperty('--pet-tint', tint || 'none');
     const baseH = num(cfg?.base?.height, 0);
     // 角色身高 = 窗口高度 - 头顶气泡带；窗口比宠物高出的那一条就是气泡带。
     const petSize = baseH > PET_BUBBLE_BAND ? baseH - PET_BUBBLE_BAND : num(pet?.size, 200);
@@ -935,6 +1050,7 @@
         bindVideoErrors();
         state.ready = true;
         scheduleIdle();
+        scheduleWander();
         startGaze();
         placeBubble();
         log(`桌宠就绪（figure）：${state.figureActions.length} 个动作，尺寸 ${petSizePx()}，包 ${pet.packId || pet.dir || ''}`);
@@ -970,6 +1086,7 @@
     const first = pick(idleList()) || pick([...state.files.keys()]);
     if (first) void playIdle(first, { mirror: true });
     scheduleIdle();
+    scheduleWander();
     startGaze();
     placeBubble();
     log(`桌宠就绪：${state.files.size} 个动作，尺寸 ${petSizePx()}，包 ${pet.packId || pet.dir || ''}`);
@@ -1155,8 +1272,11 @@
         pic.removeAttribute('src');
       }
     }
+    // 场景 class：chat（她说话）/ notice（提醒）/ event（菜单、动作这类事件）
+    // / news（分享、新闻）/ error（出错）。老的 her/proactive/me 继续兼容。
     bubble.className = [
       'bubble',
+      `bubble--${BUBBLE_KIND_ALIAS[kind] || 'chat'}`,
       kind === 'me' ? 'me' : '',
       kind === 'proactive' ? 'proactive' : '',
       picSrc ? 'haspic' : '',
@@ -1212,6 +1332,7 @@
 
   function stop() {
     if (state.timer) { clearTimeout(state.timer); state.timer = null; }
+    if (state.wanderTimer) { clearTimeout(state.wanderTimer); state.wanderTimer = null; }
     if (state.watchdog) { clearTimeout(state.watchdog); state.watchdog = null; }
     state.actionToken += 1;
     state.idleToken += 1;
@@ -1220,12 +1341,14 @@
     state.playing = null;
     state.busy = false;
     state.actionName = '';
+    state.dimmed = false;
   }
 
   /** 展开面板时暂停播放（省 CPU，也避免和面板动画抢帧）；收起再恢复，不重载 src。 */
   function pause() {
     state.paused = true;
     if (state.watchdog) { clearTimeout(state.watchdog); state.watchdog = null; }
+    if (state.wanderTimer) { clearTimeout(state.wanderTimer); state.wanderTimer = null; }
     state.actionToken += 1;
     stopGaze();
     for (const v of vids) { try { v.pause(); } catch {} }
@@ -1248,6 +1371,7 @@
     }
     postFigure({ type: 'pet:resume' });
     scheduleIdle();
+    scheduleWander();
     startGaze();
     placeBubble();
   }
@@ -1259,6 +1383,7 @@
     if (options.wander && typeof options.wander === 'object') state.cfg.wander = { ...state.cfg.wander, ...options.wander };
     if (options.size) setSize(options.size);
     startGaze();
+    scheduleWander();
     return true;
   }
 
@@ -1270,6 +1395,7 @@
     drag,
     shuffle,
     action,
+    wander: () => wanderOnce('menu'),
     preview,
     refresh,
     setOptions,
@@ -1284,6 +1410,7 @@
     packKind: () => state.packKind,
     get ready() { return state.ready; },
     get element() { return stage; },
+    get size() { return state.sizePx; },
     get gaze() { return state.gaze; },
     get playing() { return state.playing ? state.playing.name : ''; },
     get idle() { return state.idleName; },

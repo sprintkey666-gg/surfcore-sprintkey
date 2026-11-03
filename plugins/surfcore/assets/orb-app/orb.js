@@ -654,10 +654,19 @@
   }
 
   // ==== 已读水位：面板里看过 = 读过 = 收起后别再冒气泡 ====================
+  // 气泡的发布门**不看**后端 seenId 水位：面板一打开水位就被推到最新，
+  // 用它当门会让气泡永远不冒（上一轮真机就是这么坏的，日志里全是 already-seen）。
+  // 这里只记「用户刚才在面板里亲手读到哪一刻」，新的、比这一刻晚的消息才冒。
+  let lastBubbleId = '';
+  // 起手的基线 = 启动这一刻：历史里那些旧消息不该在刚开机时挨个冒一遍，
+  // 只有「比这个时刻更晚」的新消息才冒。
+  let lastUserReadAt = Date.now();
+  let bubbleDeferTimer = null;
   let seenPosted = 0;
   let seenTimer = null;
   function markSeen(list) {
     if (!expanded) return;
+    lastUserReadAt = Date.now();
     const items = Array.isArray(list) ? list : [];
     const lastId = Number(items.length ? items[items.length - 1].id : 0) || 0;
     const known = Number(state?.read?.seenId || 0) || 0;
@@ -687,6 +696,9 @@
     // 收起期间消息和开关都在变：先把最新状态拉回来，再贴到底部（不然一打开是旧的）。
     void refreshState();
     markSeen(state?.messages);
+    // 面板一打开就把「常规」的大小/连接和「互动」的开关刷成最新的
+    try { paintGeneralPage(); } catch {}
+    try { syncInteractPage(); } catch {}
     setJump(false, 0);
     requestAnimationFrame(() => { bubbles.scrollTop = bubbles.scrollHeight; });
     // 每次打开会话先露 3 秒提示条（看屏幕现在的档位），然后自己渐隐，不留常驻条。
@@ -709,6 +721,7 @@
     expanded = false;
     root.classList.remove('expanded');
     window.orb?.expand(false);
+    flushDeferredBubble();
   }
 
   /**
@@ -1282,6 +1295,45 @@
       btn.addEventListener('click', () => { void activateSkin(id); });
       ctxSkinList.appendChild(btn);
     }
+    paintPanelSkins();
+  }
+
+  // 面板「桌宠 → 皮肤」里同一份数据：整行可点，当前那套打勾。
+  function paintPanelSkins() {
+    const box = document.getElementById('psSkinList');
+    if (!box) return;
+    box.textContent = '';
+    if (!skinPacks.length) {
+      const empty = document.createElement('p');
+      empty.className = 'phint';
+      empty.textContent = '还没找到皮肤包';
+      box.appendChild(empty);
+      return;
+    }
+    for (const pack of skinPacks) {
+      const id = String(pack?.id ?? '');
+      if (!id) continue;
+      const active = id === skinActiveId;
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = `pskin-row${active ? ' on' : ''}`;
+      row.dataset.pack = id;
+      const mk = document.createElement('span');
+      mk.className = 'pmk';
+      mk.textContent = active ? '✓' : '';
+      const nm = document.createElement('span');
+      nm.className = 'pnm';
+      nm.textContent = String(pack?.name || id);
+      const mt = document.createElement('span');
+      mt.className = 'pmt';
+      const count = Number(pack?.webmCount) || 0;
+      if (packIsFigure(pack)) mt.textContent = '网页';
+      else if (count > 0) mt.textContent = `${count} 段`;
+      else if (pack?.builtin) mt.textContent = '内置';
+      row.append(mk, nm, mt);
+      row.addEventListener('click', () => { void activateSkin(id); });
+      box.appendChild(row);
+    }
   }
 
   async function skinAction(body) {
@@ -1330,8 +1382,11 @@
       toast(`换成「${String(pack?.name || id)}」了`);
       // 不重载页面：pet.js 每 4s 热重载配置，这里再戳一下让它立刻去读
       try { window.SurfPet?.refresh?.(); } catch {}
-      await fitCtxWindow();
-      placeCtxMenu(null);
+      // 只有菜单真的开着才去重排菜单；从面板里换皮肤时别去动窗口
+      if (ctxOpenState) {
+        await fitCtxWindow();
+        placeCtxMenu(null);
+      }
     } catch (error) {
       toast(String(error?.message || error).slice(0, 90), true);
     }
@@ -1348,9 +1403,13 @@
       const data = await skinAction({ action: 'import', path });
       toast(`导入好了：${String(data?.name || data?.id || '皮肤包')}`);
       if (ctxSkinPath) ctxSkinPath.value = '';
+      const panelPath = document.getElementById('psSkinPath');
+      if (panelPath) panelPath.value = '';
       await loadSkins();
-      await fitCtxWindow();
-      placeCtxMenu(null);
+      if (ctxOpenState) {
+        await fitCtxWindow();
+        placeCtxMenu(null);
+      }
     } catch (error) {
       toast(String(error?.message || error).slice(0, 100), true);
     }
@@ -1498,6 +1557,7 @@
       const cfg = cfgOf(await api({ action: 'get' }));
       if (cfg) activityCfg = cfg;
       paintMonitorMenu();
+      syncInteractPage();
       plog(`监测配置 ${JSON.stringify(activityCfg || {}).slice(0, 160)}`);
       return true;
     } catch (error) {
@@ -1522,6 +1582,7 @@
       const res = await api({ action: 'set', config: next });
       activityCfg = cfgOf(res) || next;
       paintMonitorMenu();
+      syncInteractPage();
       plog(`监测改好了 ${JSON.stringify(activityCfg).slice(0, 160)}`);
       return true;
     } catch (error) {
@@ -1684,6 +1745,11 @@
 
   ctxOpenBtn?.addEventListener('click', () => { void show(); });
   ctxActionBtn?.addEventListener('click', async () => { await closeCtxMenu(); window.SurfPet?.shuffle(); });
+  // 「走一走」是唯一能主动搬窗口的入口（鼠标划过她的身体只 react，不动位置）
+  document.getElementById('ctxWalk')?.addEventListener('click', async () => {
+    await closeCtxMenu();
+    try { window.SurfPet?.wander?.(); } catch {}
+  });
   ctxHideBtn?.addEventListener('click', async () => { await closeCtxMenu(); window.orb?.hide?.(); });
   ctxSizeToggle?.addEventListener('click', async () => {
     try { window.orb?.log?.('[menu] size toggle ' + String(ctxSizeShown)); } catch {}
@@ -1789,30 +1855,175 @@
   // 点到桌面/别的窗口时 orb 会失焦，也把菜单收掉；只收菜单，不改变面板展开状态。
   window.addEventListener('blur', () => { if (ctxOpenState) closeCtxMenu(); });
   window.addEventListener('keydown', (ev) => { if (ev.key === 'Escape' && ctxOpenState) closeCtxMenu(); });
+
+  // ==== 面板：左侧七个域 + 右侧页面 =====================================
+  const pageNav = document.getElementById('panelNav');
+  const pageNavBtns = [...document.querySelectorAll('#panelNav .pnav')];
+  const pagePanes = [...document.querySelectorAll('#panelMain .ppage')];
+
+  function showPage(name) {
+    const want = String(name || 'chat');
+    for (const btn of pageNavBtns) {
+      const on = btn.dataset.page === want;
+      btn.classList.toggle('on', on);
+      btn.setAttribute('aria-selected', on ? 'true' : 'false');
+    }
+    for (const pane of pagePanes) pane.classList.toggle('on', pane.dataset.page === want);
+    // 每个页面进来时刷一遍，别让用户对着空壳
+    if (want === 'pet') void loadSkins();
+    if (want === 'interact') { void loadActivity(); syncInteractPage(); }
+    if (want === 'general') paintGeneralPage();
+    if (want === 'chat') {
+      requestAnimationFrame(() => { bubbles.scrollTop = bubbles.scrollHeight; });
+      try { input.focus(); } catch {}
+    }
+    try { window.orb?.log?.(`[panel] page=${want}`); } catch {}
+  }
+  pageNav?.addEventListener('click', (ev) => {
+    const btn = ev.target?.closest?.('.pnav');
+    if (!btn) return;
+    showPage(btn.dataset.page);
+  });
+  document.getElementById('autoGoInteract')?.addEventListener('click', () => showPage('interact'));
+
+  function paintGeneralPage() {
+    const conn = document.getElementById('genConn');
+    if (conn) {
+      const cls = String(connDot?.className || '');
+      conn.textContent = cls.includes('ok') ? '已连上' : cls.includes('bad') ? '连不上' : '检查中…';
+    }
+    const role = document.getElementById('genRole');
+    if (role) role.textContent = String(roleName?.textContent || '她');
+    const mode = document.getElementById('genMode');
+    if (mode) mode.textContent = petMode ? (state?.config?.pet?.mode === 'pet' ? '桌宠' : '悬浮小球') : '未知';
+    const size = Number(window.SurfPet?.size || state?.config?.pet?.size || 200) || 200;
+    const pct = sizeToPercent(size);
+    const range = document.getElementById('genSize');
+    if (range && document.activeElement !== range) range.value = String(pct);
+    const val = document.getElementById('genSizeValue');
+    if (val) val.textContent = `${Math.round(size)}px`;
+  }
+
+  const genSize = document.getElementById('genSize');
+  genSize?.addEventListener('input', () => {
+    const val = document.getElementById('genSizeValue');
+    if (val) val.textContent = `${Math.round(percentToSize(Number(genSize.value) || 0))}px`;
+  });
+  genSize?.addEventListener('change', async () => {
+    // 和右键菜单里的滑条走同一条路：拖动时只改数字，松手才真的改窗口
+    const size = percentToSize(Number(genSize.value) || 0);
+    const val = document.getElementById('genSizeValue');
+    if (val) val.textContent = `${Math.round(size)}px`;
+    try { window.SurfPet?.setSize?.(size); } catch {}
+    try { await window.orb?.petSize?.(size); } catch {}
+  });
+
+  const doShuffle = () => { try { window.SurfPet?.shuffle?.(); } catch {} };
+  const doWalk = () => { try { window.SurfPet?.wander?.(); } catch {} };
+  document.getElementById('genAction')?.addEventListener('click', doShuffle);
+  document.getElementById('petAction')?.addEventListener('click', doShuffle);
+  document.getElementById('genWalk')?.addEventListener('click', doWalk);
+  document.getElementById('petWalk')?.addEventListener('click', doWalk);
+  document.getElementById('genBubble')?.addEventListener('click', () => { void bubbleTestSay(); });
+  document.getElementById('menuBubbleTest')?.addEventListener('click', () => { void bubbleTestSay(); });
+  document.getElementById('menuCopyDir')?.addEventListener('click', () => { void copySkinDir(); });
+  document.getElementById('genHide')?.addEventListener('click', () => { setPinned(false); hide(true); });
+  document.getElementById('actPeek')?.addEventListener('click', () => { void peekActivity(); });
+
+  // 桌宠页的皮肤列表：数据来自 loadSkins()，整行点击切换
+  document.getElementById('psSkinImport')?.addEventListener('click', () => {
+    const el = document.getElementById('psSkinPath');
+    const typed = String(el?.value || '').trim();
+    if (typed) void importSkin(typed);
+    else void browseSkinDir();
+  });
+  document.getElementById('psSkinPath')?.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Enter') return;
+    ev.preventDefault();
+    void importSkin(ev.target.value);
+  });
+  document.getElementById('psSkinBrowse')?.addEventListener('click', () => { void browseSkinTgz(); });
+  document.getElementById('psSkinDir')?.addEventListener('click', () => { void copySkinDir(); });
+
+  // 互动页的监测开关：和右键菜单共用 activityCfg / saveActivity，不分叉
+  function syncInteractPage() {
+    const kinds = actKinds(activityCfg);
+    const w = document.getElementById('actWindow');
+    const f = document.getElementById('actFiles');
+    const m = document.getElementById('actMedia');
+    if (w) w.checked = kinds.window !== false;
+    if (f) f.checked = kinds.file !== false;
+    if (m) m.checked = kinds.music !== false;
+    const gap = document.getElementById('actGap');
+    if (gap) gap.value = String(actGapMin(activityCfg));
+    const comp = document.getElementById('actCompanion');
+    if (comp) comp.textContent = companionState?.active === true ? '关闭陪伴' : '开启陪伴';
+    const ctxBox = document.getElementById('actCompanionCtx');
+    if (ctxBox) ctxBox.checked = companionState?.contextSubtitles === true;
+  }
+  for (const [elId, key] of [['actWindow', 'window'], ['actFiles', 'file'], ['actMedia', 'music']]) {
+    document.getElementById(elId)?.addEventListener('change', (ev) => {
+      const on = ev.target.checked === true;
+      void saveActivity((cfg) => patchActivity(cfg, { kinds: { [key]: on } }));
+    });
+  }
+  document.getElementById('actGap')?.addEventListener('change', (ev) => {
+    const minutes = Number(ev.target.value) || 10;
+    void saveActivity((cfg) => patchActivity(cfg, { minutes }));
+  });
+  document.getElementById('actCompanion')?.addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
+    const active = companionState?.active === true;
+    btn.disabled = true;
+    try {
+      const r = await window.orb?.companion?.toggle?.(active);
+      paintCompanionMenu(r?.data?.companion || r?.data?.status || r?.companion || r?.status || r);
+      syncInteractPage();
+      toast(companionState?.active === true ? '陪伴开着了' : '陪伴关掉了');
+    } catch (error) {
+      toast(String(error?.message || error).slice(0, 60), true);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+  document.getElementById('actCompanionCtx')?.addEventListener('change', async (ev) => {
+    const checked = ev.target.checked === true;
+    try {
+      const r = await window.orb?.companion?.config?.({ contextSubtitles: checked });
+      paintCompanionMenu(r?.companion || r?.config || r);
+    } catch {}
+  });
+
+  // 点菜单外面 / Esc / 开始拖动，都把菜单收起来
 // 面板收起时，她最新一句（含主动）在头顶冒气泡；点气泡开会话。
-  let lastBubbleMsgId = '';
+  // 发布门只有两个：①比上次冒过的 id 新；②不是用户刚在面板里亲手读过的那条。
+  // 绝不拿后端 seenId 水位当门 —— 面板一展开水位就顶到最新，那样气泡永远是 0 次。
   function bubbleSkip(reason) {
     try { window.orb?.log?.(`[bubble] skip reason=${reason}`); } catch {}
   }
-  function maybeBubble(list) {
-    if (!petMode) { bubbleSkip('not-pet-mode'); return; }
-    if (expanded) { bubbleSkip('panel-expanded'); return; }
-    const last = [...list].reverse().find((m) => m && (m.text || m.image) && (m.who === 'her' || m.who === undefined));
-    if (!last) { bubbleSkip('no-her-message'); return; }
-    if (!last.id) { bubbleSkip('no-id'); return; }
-    if (last.id === lastBubbleMsgId) { bubbleSkip('same-id'); return; }
-    // 面板里已经看过这条了（已读水位），收起后不要再弹一次。
-    const seenId = Number(state?.read?.seenId || 0) || 0;
-    if (seenId > 0 && Number(last.id) <= seenId) {
-      bubbleSkip(`already-seen id=${String(last.id)} seen=${String(seenId)}`);
-      return;
+  function newestHer(list) {
+    const items = Array.isArray(list) ? list : [];
+    return [...items].reverse().find((m) => m && (m.text || m.image) && (m.who === 'her' || m.who === undefined)) || null;
+  }
+  function bubbleFor(list, why) {
+    const last = newestHer(list);
+    if (!last) { bubbleSkip('no-her-message'); return false; }
+    if (!last.id) { bubbleSkip('no-id'); return false; }
+    const id = String(last.id);
+    if (id === lastBubbleId) { bubbleSkip(`same-id id=${id}`); return false; }
+    // 用户刚在面板里亲手读完这条（时间戳不晚于最后一次已读）：收起后别再补弹一次。
+    const at = Number(last.at) || 0;
+    if (lastUserReadAt && at && at <= lastUserReadAt) {
+      bubbleSkip(`read-just-now id=${id} at=${at} read=${lastUserReadAt}`);
+      return false;
     }
-    try { window.orb?.log?.('[pet] bubble ' + String(last.id)); } catch {}
-    lastBubbleMsgId = last.id;
+    lastBubbleId = id;
     const ttl = Number(state?.config?.chat?.bubbleTtlSec || 8) * 1000;
     // 图文一体时头顶气泡也带图；关掉就只冒字（图在面板里看）。
     const withPic = !!last.image && state?.config?.chat?.richBubble !== false;
-    const kind = last.kind === 'proactive' ? 'proactive' : 'her';
+    // 场景 kind 直接透传（chat/notice/event/news/error 由插件侧标），其余仍按 her/proactive 走
+    const sceneKind = ['chat', 'notice', 'event', 'news', 'error', 'me'].includes(String(last.kind));
+    const kind = sceneKind ? String(last.kind) : (last.kind === 'proactive' ? 'proactive' : 'her');
     let shown = false;
     try {
       shown = window.SurfPet?.showBubble(String(last.text || ''), {
@@ -1825,8 +2036,32 @@
       try { window.orb?.log?.(`[bubble] show 抛错：${String(error?.message || error)}`); } catch {}
     }
     try {
-      window.orb?.log?.(`[bubble] show id=${String(last.id)} kind=${kind} pic=${withPic ? 'y' : 'n'} shown=${shown ? 'y' : 'n'} ttl=${ttl}`);
+      window.orb?.log?.(`[bubble] show id=${id} kind=${kind} pic=${withPic ? 'y' : 'n'} shown=${shown ? 'y' : 'n'} ttl=${ttl} why=${why}`);
     } catch {}
+    return shown;
+  }
+  // 面板展开时收到新消息不要丢：600ms 后她要是已经收起来了就冒；还开着就等收起那一刻补。
+  function queueDeferredBubble(list) {
+    void list;
+    if (bubbleDeferTimer) clearTimeout(bubbleDeferTimer);
+    bubbleDeferTimer = setTimeout(() => {
+      bubbleDeferTimer = null;
+      if (!petMode || expanded) return;
+      bubbleFor(state?.messages, 'deferred');
+    }, 600);
+  }
+  function flushDeferredBubble() {
+    if (bubbleDeferTimer) {
+      clearTimeout(bubbleDeferTimer);
+      bubbleDeferTimer = null;
+    }
+    if (!petMode) return;
+    bubbleFor(state?.messages, 'collapse');
+  }
+  function maybeBubble(list) {
+    if (!petMode) { bubbleSkip('not-pet-mode'); return; }
+    if (expanded) { bubbleSkip('panel-expanded-defer'); queueDeferredBubble(list); return; }
+    bubbleFor(list, 'state');
   }
 
   // 监测推送：主进程补齐 onActivity 后，这里会一直缓存最近一次采样，

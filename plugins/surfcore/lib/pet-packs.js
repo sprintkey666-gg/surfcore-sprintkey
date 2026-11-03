@@ -29,11 +29,69 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
+import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 export const PACKS_VERSION = 2;
 export const BUILTIN_PACK_ID = 'dsh-pet';
 export const FIGURE_ENTRY = 'index.html';
+
+// 配色（tint）：都是 CSS filter，渲染端套在桌宠图层/iframe 上就行。
+// 第一项固定是「原色」（id 为空），orb.pet.tint 为空串 = 不套滤镜。
+export const DEFAULT_TINTS = [
+  { id: '', name: '原色', filter: 'none' },
+  { id: 'whale', name: '鲸蓝', filter: 'hue-rotate(-12deg) saturate(1.18) brightness(1.02)' },
+  { id: 'sakura', name: '樱花', filter: 'hue-rotate(315deg) saturate(1.06) brightness(1.07)' },
+  { id: 'mint', name: '薄荷', filter: 'hue-rotate(88deg) saturate(0.92) brightness(1.05)' },
+  { id: 'dusk', name: '暮金', filter: 'hue-rotate(32deg) saturate(1.22) brightness(1.04) sepia(0.14)' },
+  { id: 'night', name: '夜航', filter: 'hue-rotate(198deg) saturate(0.82) brightness(0.84) contrast(1.06)' },
+];
+
+const TINT_ID_RE = /^[a-z0-9_-]{0,24}$/;
+// filter 只允许 CSS 滤镜常用的字符；分号/url()/expression 之类直接丢弃，防注入。
+const TINT_FILTER_RE = /^[a-z0-9\s().,%+\-]{0,160}$/i;
+
+/** 校验一包配色；坏的条目丢掉，全坏就回落默认六套。 */
+export function normalizeTints(raw) {
+  const list = Array.isArray(raw) ? raw : [];
+  const seen = new Set();
+  const out = [];
+  for (const item of list) {
+    const id = String(item?.id ?? '').trim().toLowerCase();
+    if (!TINT_ID_RE.test(id) || seen.has(id)) continue;
+    const name = String(item?.name ?? '').trim().slice(0, 16);
+    const filter = String(item?.filter ?? '').trim();
+    if (!TINT_FILTER_RE.test(filter)) continue;
+    if (!name) continue;
+    seen.add(id);
+    out.push({ id, name, filter: filter || 'none' });
+  }
+  if (!out.length) return DEFAULT_TINTS.map((t) => ({ ...t }));
+  // 永远给「原色」留一个位置：配置里 tint 为空时要能落回原色。
+  if (!seen.has('')) out.unshift({ id: '', name: '原色', filter: 'none' });
+  return out;
+}
+
+/** pack.json.source 既可能是老的一句话，也可能是 {kind:'github-assets',...}。两种都收。 */
+function sourceInfoOf(raw) {
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    const kind = String(raw.kind || '').trim().toLowerCase();
+    return {
+      kind: ['npm', 'github-assets', 'url', 'bundled', 'local'].includes(kind) ? kind : 'local',
+      label: String(raw.label || ''),
+      repo: String(raw.repo || ''),
+      ref: String(raw.ref || ''),
+      tarball: String(raw.tarball || ''),
+      assetDir: String(raw.assetDir || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, ''),
+      licenseFile: String(raw.licenseFile || ''),
+    };
+  }
+  const text = String(raw ?? '').trim();
+  if (/^https?:\/\//i.test(text)) {
+    return { kind: 'url', label: text, repo: '', ref: '', tarball: text, assetDir: '', licenseFile: '' };
+  }
+  return { kind: '', label: text, repo: '', ref: '', tarball: '', assetDir: '', licenseFile: '' };
+}
 
 const PACK_FILE = 'pack.json';
 const MAX_IMPORT_BYTES = 512 * 1024 * 1024;
@@ -201,6 +259,87 @@ export function manifestActions(manifest) {
   return [...out];
 }
 
+function actionNameOf(item) {
+  // 上游 big-blue-fish 的 Id 就是动作名（File 去掉 .webm 与 Id 完全一致，已核过 106 条）。
+  const id = String(item?.Id ?? item?.id ?? '').trim();
+  if (id) return id;
+  return String(item?.File ?? item?.file ?? '').trim().replace(/\.webm$/i, '');
+}
+
+/**
+ * 把 big-blue-fish 的 animations.json 转成我们的清单。
+ *   Pool Idle → idle；Click → clicks；Drag → drag；
+ *   Pool Event（没有 Festival）→ categories.event；Greeting/Daily 各一个分类；
+ *   Pool Disabled 跳过；带 Festival 的只进 festivals 元数据（不进日常动作池）。
+ * 迁移字段（MoveKind / Meal / SeasonOnly / NightOnly ...）不丢：原样存进 festivals.json 的 tags。
+ */
+export function manifestFromAnimations(raw) {
+  const list = Array.isArray(raw) ? raw : (Array.isArray(raw?.animations) ? raw.animations : []);
+  const idle = [];
+  const clicks = [];
+  const drag = [];
+  const moves = [];
+  const events = [];
+  const greeting = [];
+  const daily = [];
+  const festivals = [];
+  const tags = [];
+  const seen = new Set();
+  for (const item of list) {
+    const name = actionNameOf(item);
+    if (!name) continue;
+    const pool = String(item?.Pool ?? item?.pool ?? '').trim();
+    if (pool.toLowerCase() === 'disabled') continue;
+    const festival = String(item?.Festival ?? '').trim();
+    if (festival) {
+      festivals.push({
+        action: name,
+        festival,
+        radiusDays: Number(item?.RadiusDays) || 0,
+        mode: String(item?.FestivalMode || ''),
+        weight: Number(item?.FestivalWeight) || 0,
+      });
+      continue;
+    }
+    if (seen.has(name)) continue;
+    seen.add(name);
+    if (pool === 'Idle') idle.push(name);
+    else if (pool === 'Click') clicks.push(name);
+    else if (pool === 'Drag') drag.push(name);
+    else if (pool === 'Greeting') greeting.push(name);
+    else if (pool === 'Daily') daily.push(name);
+    else if (pool === 'Event') {
+      events.push(name);
+      const moveKind = String(item?.MoveKind || '');
+      if (moveKind) moves.push({ name, params: { kind: moveKind } });
+    }
+    const extra = {};
+    for (const key of ['WorkKind', 'WorkWeight', 'MoveKind', 'HourParity', 'Meal', 'MealBoost', 'SeasonOnly', 'NightOnly', 'MorningWeight', 'SummerWeight', 'WinterWeight']) {
+      if (item?.[key] != null && item[key] !== 0 && item[key] !== false) extra[key] = item[key];
+    }
+    if (Object.keys(extra).length) tags.push({ action: name, ...extra });
+  }
+  const categories = [];
+  if (events.length) categories.push({ id: 'event', weight: 100, actions: events });
+  if (greeting.length) categories.push({ id: 'greeting', weight: 100, actions: greeting });
+  if (daily.length) categories.push({ id: 'daily', weight: 60, actions: daily });
+  const moveNames = new Set(moves.map((m) => m.name));
+  return {
+    manifest: normalizeManifest({
+      idle: idle.length ? idle : events.slice(0, 3),
+      turn: idle.length ? idle : events.slice(0, 3),
+      drag,
+      clicks,
+      moves,
+      // 已经进了 moves 的动作别再随机抽一次，避免「溜达」和「原地演」打架。
+      categories: categories.map((c) => ({ ...c, actions: c.actions.filter((n) => !moveNames.has(n)) })),
+      weights: { idle: 10, turn: 5, move: 5, click: 0, drag: 0 },
+    }),
+    festivals,
+    tags,
+  };
+}
+
 export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => {}, helpers = {}, catalogDir = DEFAULT_CATALOG_DIR } = {}) {
   const root = path.join(stateDir, 'orb', 'pet');
   const packsDir = path.join(root, 'packs');
@@ -261,8 +400,95 @@ export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => 
         npm: String(p.npm || ''),
         bundled: String(p.bundled || ''),
         url: String(p.url || ''),
+        // 新来源：GitHub release/仓库素材（整包 tgz，只挑一个素材目录）。
+        source: sourceInfoOf(p.source),
+        tints: Array.isArray(p.tints) ? normalizeTints(p.tints) : null,
       })),
     };
+  }
+
+  // 用户手动删掉的「随仓内置包」：记下来，catalog 同步时别再硬塞回去。
+  // 否则 remove() 之后下一次 list 又会把它装回来，删除按钮等于没作用。
+  const hiddenFile = path.join(root, 'catalog-hidden.json');
+  function readHidden() {
+    const data = readJson(hiddenFile);
+    return Array.isArray(data?.ids) ? data.ids.map((id) => sanitizePackId(id)).filter(Boolean) : [];
+  }
+  function writeHidden(ids) {
+    try {
+      fs.mkdirSync(root, { recursive: true });
+      fs.writeFileSync(hiddenFile, `${JSON.stringify({ ids: [...new Set(ids)] }, null, 2)}\n`, 'utf8');
+    } catch (error) {
+      pluginLog('[pet-packs] 写 catalog-hidden.json 失败：', String(error?.message ?? error));
+    }
+  }
+  function markHidden(id) {
+    const list = readHidden();
+    if (!list.includes(id)) writeHidden([...list, id]);
+  }
+  function clearHidden(id) {
+    const list = readHidden();
+    if (list.includes(id)) writeHidden(list.filter((x) => x !== id));
+  }
+
+  /**
+   * 把内置清单里「随仓入库」的包落成 packs/<id>/。
+   *
+   * 为什么需要：内置 figure 包（sprintkey-fish）只待在 assets/pet-packs/ 下，packs.json 里没有它，
+   * activate('sprintkey-fish') 就会报「没有这个皮肤包」——真机上就是这么翻车的。
+   * 这里在 list/activate 之前做一次幂等同步：目录不存在或不完整才装，装过就不动。
+   */
+  let syncing = false;
+  function syncCatalog() {
+    if (syncing) return false;
+    syncing = true;
+    let changed = false;
+    try {
+      const catalog = readCatalog();
+      const hidden = new Set(readHidden());
+      for (const entry of catalog.packs) {
+        if (entry.id === BUILTIN_PACK_ID || !entry.bundled || hidden.has(entry.id)) continue;
+        const src = path.join(catalogRoot, entry.bundled);
+        if (!isDir(src)) continue;
+        const dest = packDirOf(entry.id);
+        if (isDir(dest) && readPackMeta(entry.id, dest).installed) continue;
+        const staging = `${dest}.sync-${Date.now()}`;
+        try {
+          fs.rmSync(staging, { recursive: true, force: true });
+          copyTree(src, staging);
+          // 清单里的名字/许可/authors 是权威的：包里的 pack.json 可能缺字段。
+          const cur = readJson(path.join(staging, PACK_FILE)) || {};
+          const merged = {
+            ...cur,
+            id: entry.id,
+            name: cur.name || entry.name,
+            version: cur.version || entry.version,
+            kind: entry.kind,
+            author: cur.author || entry.author,
+            license: cur.license || entry.license,
+            source: cur.source || '内置清单',
+            tints: normalizeTints(cur.tints || entry.tints),
+          };
+          fs.writeFileSync(path.join(staging, PACK_FILE), `${JSON.stringify(merged, null, 2)}\n`, 'utf8');
+          const result = commitFromStaging(staging, { id: entry.id, overwrite: true });
+          if (result.ok) {
+            changed = true;
+            // 同步进来的内置包也登记一下，packs.json 里能查到「装过什么」。
+            try { publish(entry.id); } catch (error) {
+              pluginLog('[pet-packs] 登记同步皮肤包失败：', entry.id, String(error?.message ?? error));
+            }
+            pluginLog('[pet-packs] 已同步内置皮肤包：', entry.id, entry.kind);
+          }
+        } catch (error) {
+          pluginLog('[pet-packs] 同步内置皮肤包失败：', entry.id, String(error?.message ?? error));
+        } finally {
+          try { fs.rmSync(staging, { recursive: true, force: true }); } catch {}
+        }
+      }
+    } finally {
+      syncing = false;
+    }
+    return changed;
   }
 
   function builtinSummary() {
@@ -285,6 +511,7 @@ export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => 
       entry,
       preview: isFile(path.join(builtin, 'preview.png')) ? path.join(builtin, 'preview.png') : '',
       updatedAt: String(marker?.installedAt || ''),
+      tints: normalizeTints(marker?.tints),
       error: '',
     };
   }
@@ -305,6 +532,7 @@ export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => 
     let error = '';
     if (!installed) error = kind === 'figure' ? `figure 包缺 ${FIGURE_ENTRY}` : '这个包里没有 webm 动画';
     else if (kind === 'webm' && !manifestOfDir(dir, { meta })) error = '缺少动画清单（manifest.json / config.jsonc）';
+    const sourceInfo = sourceInfoOf(meta.source);
     return {
       id: sanitizePackId(meta.id || id),
       name: String(meta.name || id),
@@ -312,7 +540,8 @@ export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => 
       version: String(meta.version || ''),
       author: String(meta.author || ''),
       license: String(meta.license || ''),
-      source: String(meta.source || ''),
+      source: sourceInfo.label || sourceInfo.kind || '',
+      sourceInfo,
       createdAt: String(meta.createdAt || ''),
       builtin: false,
       installed,
@@ -323,6 +552,7 @@ export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => 
       webmDir,
       preview,
       licenseFile,
+      tints: normalizeTints(meta.tints),
       error,
       meta,
     };
@@ -350,6 +580,10 @@ export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => 
   }
 
   function listPacks() {
+    // 内置随仓包先落盘，再列：否则 UI 只能看到「清单里有」，右键切不过去。
+    try { syncCatalog(); } catch (error) {
+      pluginLog('[pet-packs] 内置皮肤包同步失败：', String(error?.message ?? error));
+    }
     const state = readState();
     const catalog = readCatalog();
     const catalogById = new Map(catalog.packs.map((c) => [c.id, c]));
@@ -369,6 +603,7 @@ export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => 
         author: meta.author,
         license: meta.license,
         source: meta.source,
+        sourceInfo: meta.sourceInfo,
         createdAt: meta.createdAt,
         builtin: false,
         installed: meta.installed,
@@ -377,6 +612,7 @@ export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => 
         dir: meta.dir,
         entry: meta.entry,
         preview: meta.preview,
+        tints: meta.tints,
         updatedAt: '',
         error: meta.error,
       });
@@ -393,6 +629,7 @@ export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => 
         author: c.author,
         license: c.license,
         source: '内置清单',
+        sourceInfo: c.source,
         createdAt: '',
         builtin: c.id === BUILTIN_PACK_ID,
         installed: false,
@@ -401,12 +638,14 @@ export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => 
         dir: '',
         entry: '',
         preview: '',
+        tints: c.tints || normalizeTints(null),
         updatedAt: '',
         error: '',
         catalog: true,
         description: c.description,
         npm: c.npm,
         bundled: c.bundled,
+        npmSpec: c.npm,
       });
     }
     const ids = new Set(packs.map((p) => p.id));
@@ -428,6 +667,7 @@ export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => 
 
   /** 当前生效的包（找不到就回落内置）。webm 给 dir，figure 还多给一个 entry。 */
   function active() {
+    try { syncCatalog(); } catch {}
     const state = readState();
     const id = sanitizePackId(state.activePackId, BUILTIN_PACK_ID);
     if (id === BUILTIN_PACK_ID) {
@@ -444,6 +684,8 @@ export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => 
           : null,
         builtin: true,
         name: meta.name,
+        tints: meta.tints,
+        sourceInfo: sourceInfoOf('builtin'),
       };
     }
     const dir = packDirOf(id);
@@ -460,6 +702,8 @@ export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => 
         builtin: true,
         name: '内置 · dsh-pet（小鲸鱼）',
         missing: id,
+        tints: meta.tints,
+        sourceInfo: sourceInfoOf('builtin'),
       };
     }
     const meta = readPackMeta(id, dir);
@@ -473,6 +717,8 @@ export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => 
       manifest: meta.kind === 'figure' ? null : manifestOfDir(dir, meta),
       builtin: false,
       name: meta.name,
+      tints: meta.tints,
+      sourceInfo: meta.sourceInfo,
     };
   }
 
@@ -549,9 +795,11 @@ export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => 
         kind: 'figure',
         author: String(meta.author || ''),
         license: String(meta.license || ''),
-        source: String(meta.source || '本地导入'),
+        // source 可能是 {kind:'github-assets',...} 对象，别拍平成 "[object Object]"。
+        source: meta.source ?? '本地导入',
         createdAt: new Date().toISOString(),
         entry: entryRel,
+        tints: normalizeTints(meta.tints),
       };
     } else {
       const webm = countWebm(path.join(staging, String(meta.webm || 'webm')));
@@ -568,9 +816,10 @@ export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => 
         kind: 'webm',
         author: String(meta.author || ''),
         license: String(meta.license || ''),
-        source: String(meta.source || '本地导入'),
+        source: meta.source ?? '本地导入',
         createdAt: new Date().toISOString(),
         webm: String(meta.webm || 'webm'),
+        tints: normalizeTints(meta.tints),
       };
     }
     fs.writeFileSync(path.join(staging, PACK_FILE), `${JSON.stringify(packFile, null, 2)}\n`, 'utf8');
@@ -736,8 +985,101 @@ export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => 
     }
   }
 
+  /**
+   * 从 GitHub 仓库的 tarball 里挑一个素材目录装成 webm 包。
+   * 现在只服务 big-blue-fish：`code/BigBlueFish.Windows/assets/fish/` 下有 106 个 webm + animations.json。
+   * 整包 64MB，但只挑素材目录，落地后大约 20MB。
+   */
+  function installFromGithubTgz(buf, entry, { overwrite = false, onProgress } = {}) {
+    if (typeof readTar !== 'function') return { ok: false, error: '当前版本缺少 tar 解析器' };
+    const info = entry?.source && typeof entry.source === 'object' ? sourceInfoOf(entry.source) : sourceInfoOf('');
+    const assetDir = info.assetDir || 'code/BigBlueFish.Windows/assets/fish';
+    let entries = [];
+    try {
+      onProgress?.({ phase: 'extract', percent: 0 });
+      entries = stripTopDir(readTar(zlib.gunzipSync(buf), (n) => !n.endsWith('/')));
+    } catch (error) {
+      return { ok: false, error: `压缩包解不开：${String(error?.message ?? error)}` };
+    }
+    const packId = sanitizePackId(entry.id);
+    const staging = `${packDirOf(packId)}.gh-${Date.now()}`;
+    try {
+      fs.rmSync(staging, { recursive: true, force: true });
+      fs.mkdirSync(path.join(staging, 'webm'), { recursive: true });
+      let animationsText = '';
+      let licenseText = '';
+      let webmCount = 0;
+      for (const file of entries) {
+        const rel = String(file.name || '').replace(/^\.\//, '').replace(/\\/g, '/');
+        if (!rel.startsWith(`${assetDir}/`)) continue;
+        const base = path.posix.basename(rel);
+        const lower = base.toLowerCase();
+        if (lower.endsWith('.webm')) {
+          fs.writeFileSync(path.join(staging, 'webm', base), file.data);
+          webmCount += 1;
+          continue;
+        }
+        if (lower === 'animations.json') {
+          animationsText = file.data.toString('utf8');
+          fs.writeFileSync(path.join(staging, 'animations.json'), file.data);
+          continue;
+        }
+        if (lower === 'license.txt' || lower === 'license') {
+          licenseText = file.data.toString('utf8');
+          fs.mkdirSync(path.join(staging, 'LICENSES'), { recursive: true });
+          fs.writeFileSync(path.join(staging, 'LICENSES', 'big-blue-fish-LICENSE.txt'), file.data);
+          fs.writeFileSync(path.join(staging, 'LICENSE'), file.data);
+          continue;
+        }
+      }
+      if (!webmCount) return { ok: false, error: `素材目录里没有 webm：${assetDir}` };
+      let manifest = null;
+      let festivals = [];
+      let tags = [];
+      if (animationsText.trim()) {
+        try {
+          const parsed = manifestFromAnimations(JSON.parse(animationsText));
+          manifest = parsed.manifest;
+          festivals = parsed.festivals;
+          tags = parsed.tags;
+        } catch (error) {
+          return { ok: false, error: `animations.json 解析失败：${String(error?.message ?? error)}` };
+        }
+        if (manifest) fs.writeFileSync(path.join(staging, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+        fs.writeFileSync(path.join(staging, 'festivals.json'), `${JSON.stringify({ festivals, tags }, null, 2)}\n`, 'utf8');
+      }
+      if (!manifest) {
+        // 没动画清单就按文件名兜底（至少能待机），跟本地导入一个待遇。
+        manifest = normalizeManifest({ idle: fs.readdirSync(path.join(staging, 'webm')).map((n) => path.basename(n, '.webm')) });
+        fs.writeFileSync(path.join(staging, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+      }
+      fs.writeFileSync(path.join(staging, PACK_FILE), `${JSON.stringify({
+        id: packId,
+        name: String(entry.name || packId),
+        version: String(entry.version || '1.0.0'),
+        kind: 'webm',
+        webm: 'webm',
+        author: String(entry.author || ''),
+        license: String(entry.license || 'MIT'),
+        description: String(entry.description || ''),
+        source: { ...info },
+        tints: normalizeTints(entry.tints),
+      }, null, 2)}\n`, 'utf8');
+      onProgress?.({ phase: 'commit', percent: 90 });
+      const result = commitFromStaging(staging, { id: packId, overwrite });
+      if (result.ok && licenseText) pluginLog('[pet-packs] 已落地许可：', 'LICENSES/big-blue-fish-LICENSE.txt');
+      return result;
+    } catch (error) {
+      pluginLog('[pet-packs] 从 GitHub 素材安装失败：', String(error?.message ?? error));
+      return { ok: false, error: `安装失败：${String(error?.message ?? error)}` };
+    } finally {
+      try { fs.rmSync(staging, { recursive: true, force: true }); } catch {}
+    }
+  }
+
   /** 切换生效包（webm 和 figure 都行；figure 只要入口在就能切）。 */
   function activate(id) {
+    try { syncCatalog(); } catch {}
     const packId = sanitizePackId(id, BUILTIN_PACK_ID);
     if (packId === BUILTIN_PACK_ID) {
       writeState(BUILTIN_PACK_ID);
@@ -761,6 +1103,9 @@ export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => 
     try {
       if (active().id === packId) writeState(BUILTIN_PACK_ID);
       fs.rmSync(dir, { recursive: true, force: true });
+      // 删的是「清单里随仓入库」的包：记下来，别让 syncCatalog 下次又装回来。
+      const inCatalog = readCatalog().packs.some((c) => c.id === packId && c.bundled);
+      if (inCatalog) markHidden(packId);
       pluginLog('[pet-packs] 已删除动画包：', packId);
       return { ok: true, ...listPacks() };
     } catch (error) {
@@ -823,6 +1168,8 @@ export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => 
         author: meta.author,
         license: meta.license,
         source: meta.source,
+        sourceInfo: meta.sourceInfo,
+        tints: meta.tints,
         builtin: Boolean(meta.builtin),
         installed: meta.installed,
         dir: meta.dir,
@@ -841,11 +1188,26 @@ export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => 
     };
   }
 
-  /** 从内置清单装：npm 包（dsh-pet@x.y.z）或随仓入库的 figure 包（bundled 目录）。 */
+  /** 从内置清单装：npm 包、随仓目录、GitHub 素材目录、普通 URL 压缩包。 */
   async function installFromCatalog(id, { overwrite = false, onProgress } = {}) {
     const wantId = sanitizePackId(id);
     const entry = readCatalog().packs.find((c) => c.id === wantId);
     if (!entry) return { ok: false, error: `内置清单里没有这个皮肤包：${id}` };
+
+    // 幂等：随仓包在 list/activate 时已经被 syncCatalog 落过盘了，再点「下载」不该报「已存在」。
+    if (entry.bundled && !overwrite) {
+      const dest = entry.id === BUILTIN_PACK_ID ? builtin : packDirOf(entry.id);
+      if (isDir(dest)) {
+        const summary = entry.id === BUILTIN_PACK_ID ? builtinSummary() : readPackMeta(entry.id, dest);
+        if (summary.installed) {
+          clearHidden(entry.id);
+          const published = publish(entry.id);
+          const base = { ok: true, already: true, id: entry.id };
+          return published.ok ? { ...base, ...published } : { ...base, ...listPacks() };
+        }
+      }
+    }
+
     let result = null;
     if (entry.bundled) {
       const src = path.join(catalogRoot, entry.bundled);
@@ -854,6 +1216,17 @@ export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => 
     } else if (entry.npm) {
       if (typeof helpers.installFromNpm !== 'function') return { ok: false, error: '当前版本不支持从 npm 安装皮肤包' };
       result = await helpers.installFromNpm(entry.npm, { onProgress, overwrite });
+    } else if (entry.source?.kind === 'github-assets') {
+      if (typeof helpers.downloadTo !== 'function') return { ok: false, error: '当前版本缺少下载器' };
+      try {
+        const url = entry.source.tarball || entry.url;
+        if (!url) return { ok: false, error: `${entry.id} 的清单缺少 tarball 地址` };
+        const buf = await helpers.downloadTo(url, onProgress);
+        if (buf.length > MAX_IMPORT_BYTES) return { ok: false, error: '下载的包太大（上限 512MB）' };
+        result = installFromGithubTgz(buf, entry, { overwrite, onProgress });
+      } catch (error) {
+        result = { ok: false, error: `下载失败：${String(error?.message ?? error)}` };
+      }
     } else if (entry.url) {
       if (typeof helpers.downloadTo !== 'function') return { ok: false, error: '当前版本缺少下载器' };
       try {
@@ -863,10 +1236,11 @@ export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => 
         result = { ok: false, error: `下载失败：${String(error?.message ?? error)}` };
       }
     } else {
-      return { ok: false, error: `清单里的 ${entry.id} 没有可安装来源（npm / bundled / url）` };
+      return { ok: false, error: `清单里的 ${entry.id} 没有可安装来源（npm / bundled / url / github-assets）` };
     }
     if (result?.ok) {
       // 装完立刻登记，packs.json 里就有记录了（dsh-pet 装的是内置目录）。
+      clearHidden(entry.id);
       const published = publish(entry.id);
       if (published.ok) result = { ...result, ...published };
     }
@@ -888,6 +1262,17 @@ export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => 
       if (action === 'publish') return publish(body.id);
       if (action === 'remove') return remove(body.id);
       if (action === 'preview') return queuePreview(body.name || body.anim);
+      if (action === 'opendir') {
+        // 设置页「打开皮肤目录」：用户想自己往里丢文件夹/看装到哪了。
+        try {
+          fs.mkdirSync(packsDir, { recursive: true });
+          const child = spawn('explorer.exe', [packsDir], { detached: true, stdio: 'ignore' });
+          child.unref();
+          return { ok: true, dir: packsDir };
+        } catch (error) {
+          return { ok: false, dir: packsDir, error: `打开目录失败：${String(error?.message ?? error)}` };
+        }
+      }
       if (action === 'install') {
         const id = String(body.id || '').trim();
         if (!id) return { ok: false, error: '要装哪个皮肤包？给 id（见 list 的 catalog 条目）' };
@@ -933,8 +1318,10 @@ export function createPetPacksService({ stateDir, builtinDir, pluginLog = () => 
     detail,
     publish,
     catalog: readCatalog,
+    syncCatalog,
     installFromDir,
     installFromTgz,
+    installFromGithubTgz,
     installFromCatalog,
     activate,
     remove,

@@ -182,11 +182,55 @@ ok('皮肤包走 /pet-packs 的 list/activate/import', orbHas(orbJs, "'/pet-pack
 ok('右键有「监测 ›」子菜单（三个开关 + 间隔 + 现在看一眼）', /id="ctxMonitorToggle"/.test(html) && /id="ctxMonWindow"/.test(html) && /id="ctxMonFiles"/.test(html) && /id="ctxMonMedia"/.test(html) && /id="ctxMonGap"/.test(html) && /id="ctxMonPeek"/.test(html));
 ok('监测配置走 activityConfig（get/set）', orbHas(orbJs, 'activityConfig', "action: 'get'", "action: 'set'"));
 ok('右键有「试一下气泡」→ POST /say', /id="ctxBubbleTest"/.test(html) && orbHas(orbJs, "'/say'", 'kind: \'proactive\''));
-ok('气泡每道门都留了日志', orbHas(orbJs, '[bubble] skip reason=', 'not-pet-mode', 'panel-expanded', 'already-seen'));
+ok('气泡每道门都留了日志', orbHas(orbJs, '[bubble] skip reason=', 'not-pet-mode', 'panel-expanded-defer', 'read-just-now'));
 ok('网页形象握手（figure:ready / pet:action）', orbHas(petJs, "'figure:ready'", "'pet:action'"));
 ok('figure 包没有动画清单时按 null 对照（不会每 4 秒重载一次）',
   /state\.manifest = pet\?\.manifest \? normalizeManifest\(pet\.manifest\) : null/.test(petJs)
   && (petJs.match(/cfg\??\.pet\??\.manifest \? normalizeManifest\(/g) || []).length >= 2);
+
+// ── 2026-11-03 第三轮真机反馈：重影 / 鼠标划过搬窗口 / 气泡一次没出现 ────────
+// A. 重影：动作层亮起前底色必须 .dim，两层同时 opaque 就是两只鲸鱼
+ok('动作层亮起前底色先 dim（消重影）', orbHas(petJs, 'function dimBase(', 'DIM_FADE_MS', 'dimBase(true)', 'dimBase(false)')
+  && /\.petStage video\.dim\s*\{[^}]*opacity:\s*0/.test(petCss));
+ok('dim 规则压得住 .on 的 opacity:1', petCss.indexOf('video.dim') > petCss.indexOf('.petStage video.on'));
+// B. 鼠标划过不许搬窗口：idle 池剥 move + wander 默认关
+const pickIdleSrc = (() => {
+  const at = petJs.indexOf('function pickIdleAction(');
+  if (at < 0) return '';
+  const end = petJs.indexOf('\n  function ', at + 10);
+  return petJs.slice(at, end > at ? end : at + 2000);
+})();
+ok('待机池不掺 move（鼠标划过不会搬窗口）', petJs.includes('move（走位）**永远不进这个池子**') && /moveNames\.has\(name\)/.test(pickIdleSrc) && !/add\([^)]*mv\.name/.test(pickIdleSrc));
+ok('wander 默认关（=== true 才算开）', orbHas(petJs, 'enabled: wander.enabled === true', "if (w.enabled !== true) return false;"));
+ok('只有菜单/漫游计时器能搬窗口（wander 导出）', /wander: \(\) => wanderOnce\('menu'\)/.test(petJs) && /function scheduleWander\(/.test(petJs));
+ok('play 竞争被吞掉并记日志', orbHas(petJs, 'async function safePlay(', 'layer-play-race', '/interrupted by a call to (pause|load)/i'));
+// C. 气泡 kind → class
+ok('气泡按 kind 带 class（chat/notice/event/news/error）',
+  orbHas(petJs, 'BUBBLE_KIND_ALIAS', 'notice:', 'event:', 'news:', 'error:')
+  && orbHas(petCss, '#bubble.bubble--notice', '#bubble.bubble--event', '#bubble.bubble--news', '#bubble.bubble--error')
+  && /`bubble--\$\{BUBBLE_KIND_ALIAS\[kind\] \|\| 'chat'\}`/.test(petJs));
+ok('气泡尖角与圆角拼成一条连续轮廓（参考 16×9）', /--bubble-tail-x/.test(petCss) && /rotate\(45deg\)/.test(petCss) && /border-bottom-right-radius/.test(petCss));
+ok('气泡奶油白 + 蓝灰描边 + 24 圆角', /#fffbf4/i.test(petCss) && /#506098/i.test(petCss) && /border-radius:\s*24px/.test(petCss));
+ok('插件推来的场景 kind 直接透传（不会被压成 her）',
+  /const sceneKind = \['chat', 'notice', 'event', 'news', 'error', 'me'\]\.includes\(String\(last\.kind\)\)/.test(orbJs)
+  && /const kind = sceneKind \? String\(last\.kind\)/.test(orbJs));
+// D. 菜单与面板：参考 CompanionMenuStyles.xaml / visual-system.md
+ok('右键菜单浅色 token（白底 / 7px 条目 / 14px / #EDF3FC hover）',
+  /\.ctxmenu\s*\{[\s\S]{0,400}background:\s*#fff/.test(petCss)
+  && /\.ctxitem\s*\{[\s\S]{0,300}border-radius:\s*7px/.test(petCss)
+  && /\.ctxitem\s*\{[\s\S]{0,300}font-size:\s*14px/.test(petCss)
+  && /\.ctxitem:hover\s*\{[^}]*#edf3fc/i.test(petCss));
+ok('菜单有分组标题与「走一走」', /\.ctxgroup\s*\{/.test(petCss) && /id="ctxWalk"/.test(html));
+ok('面板左侧七个域侧栏（常规/桌宠/互动/菜单/桌面组件/AI 与对话/自动化）',
+  /id="panelNav"/.test(html)
+  && ['general', 'pet', 'interact', 'menu', 'widgets', 'chat', 'auto'].every((k) => new RegExp(`data-page="${k}"`).test(html)));
+ok('侧栏宽 200px 且窄窗收成图标条', /\.pside\s*\{[\s\S]{0,300}flex:\s*0 0 52px/.test(petCss) && /@media \(min-width: 620px\)[\s\S]{0,200}flex-basis:\s*200px/.test(petCss));
+ok('页面标题 22/600、小节 13/600、卡片 12 圆角', /\.ptitle\s*\{[\s\S]{0,200}font-size:\s*22px/.test(petCss) && /\.psec-t\s*\{[\s\S]{0,120}font-size:\s*13px/.test(petCss) && /\.pcard\s*\{[\s\S]{0,200}border-radius:\s*12px/.test(petCss));
+ok('会话气泡：她奶油白+描边、主人蓝灰实底', /#panel \.bubble\.her\s*\{[\s\S]{0,160}#fffbf4/.test(petCss) && /#panel \.bubble\.me\s*\{[\s\S]{0,160}#506098/.test(petCss));
+ok('面板里有导航切换与各页接线', orbHas(orbJs, 'function showPage(', "btn.dataset.page === want", "document.getElementById('genSize')", "document.getElementById('psSkinImport')", "document.getElementById('actWindow')", "document.getElementById('actPeek')"));
+ok('面板与右键菜单共用同一份监测/皮肤数据', orbHas(orbJs, 'function paintPanelSkins(', 'function syncInteractPage(')
+  && (orbJs.match(/paintMonitorMenu\(\);\s*\n\s*syncInteractPage\(\)/g) || []).length >= 2);
+ok('主进程透传的 tint 落到形象层', orbHas(petJs, "setProperty('--pet-tint'") && /filter:\s*var\(--pet-tint/.test(petCss));
 
 
 // 2026-10-31 第二轮契约：自由停靠 / 面板可拖 / 菜单自适应 / 平滑过渡 / 气泡身份 / 对话看图
@@ -399,13 +443,20 @@ ok('设置页有「聊天外观」段与清头像缓存', orbHas(clientJs, '聊�
   ok('窗口按带高向上长', h(mainSrc, 'size + bandFor()'));
   ok('preload 暴露 bubbleSpace', h(preload, 'bubbleSpace: (px)'));
   ok('命中判定跟着动态带高', h(orbSrc, 'window.SurfPet?.bubbleBand?.()'));
-  // C. 已读水位：看过的不再弹气泡
+  // C. 已读水位：后端照旧记录（面板里看过就上报），但气泡发布门不再用它
   ok('状态文件记住已读水位', h(orbLibSrc, 'readSeenId', 'markSeen(', 'seenId'));
   ok('已读水位只进不退', h(orbLibSrc, 'Math.max(', 'seenId'));
   ok('后端有 /seen 路由', h(httpSrc, "suffix === '/seen'", 'orb.markSeen('));
   ok('状态里带 seenId', h(httpSrc, 'read: { seenId: orb.readSeenId() }'));
   ok('面板看过就上报已读', h(orbSrc, 'function markSeen(', "http('/seen'"));
-  ok('已读的不再弹头顶气泡', h(orbSrc, 'Number(last.id) <= seenId'));
+  // C2. 气泡发布门：只认「上次冒过的 id」+「用户刚亲手读过」，不认后端 seenId 水位
+  //    （上一轮真机就是拿 seenId 当门：面板一展开水位就顶到最新，气泡永远不冒）
+  ok('气泡发布门不再看后端已读水位', !/Number\(last\.id\) <= seenId/.test(orbSrc) && !/state\?\.read\?\.seenId/.test(orbSrc.slice(orbSrc.indexOf('function bubbleFor('), orbSrc.indexOf('function queueDeferredBubble('))));
+  ok('气泡发布门记上次冒过的 id', h(orbSrc, 'let lastBubbleId', 'id === lastBubbleId'));
+  ok('气泡发布门记用户刚读的时刻', h(orbSrc, 'let lastUserReadAt', 'at <= lastUserReadAt'));
+  ok('面板展开时新消息延后冒而不是丢', h(orbSrc, 'function queueDeferredBubble(', 'panel-expanded-defer', '}, 600);'));
+  ok('面板收起时补冒延后那条', h(orbSrc, 'function flushDeferredBubble(', "bubbleFor(state?.messages, 'collapse')"));
+  ok('展开时收到消息也不丢（收起后补）', h(orbSrc, "if (expanded) { bubbleSkip('panel-expanded-defer'); queueDeferredBubble(list); return; }"));
   // D. 双击图片看大图
   ok('双击图片打开查看器', h(orbSrc, "addEventListener('dblclick'", 'openViewer('));
   ok('查看器滚轮缩放', h(orbSrc, "addEventListener('wheel'", 'Math.exp(-Number(ev.deltaY || 0) * 0.0015)'));

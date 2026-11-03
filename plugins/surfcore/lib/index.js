@@ -2331,6 +2331,28 @@ if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output 
         json(res, 200, result);
         return;
       }
+      if (suffix === '/activity/test') {
+        // 设置页「测试一下」：立刻采一次（绕过 5s 限流），强制推一条互动事件，
+        // 这样不用等十几分钟就能验证「监测 → 气泡」这条链路是否通。
+        let current = null;
+        try { current = orbService.readConfig(); } catch {}
+        if (!current?.activity?.enabled) {
+          json(res, 200, { ok: false, error: '互动监测还没开，先把开关打开' });
+          return;
+        }
+        const result = await orbActivity.sample('test', { force: true })
+          .catch((error) => ({ ok: false, error: String(error?.message ?? error) }));
+        let event = null;
+        try { event = orbApi.activityFeed?.state?.().lastEvent ?? null; } catch {}
+        json(res, 200, {
+          ok: result?.ok !== false,
+          sample: result?.data ?? null,
+          kind: result?.kind ?? '',
+          event,
+          error: result?.error,
+        });
+        return;
+      }
       if (suffix === '/activity') {
         // 互动监测开关：写进 orb 配置（normalizeOrbConfig 兜底），同时让采样器立刻生效/停表。
         const patch = body?.config && typeof body.config === 'object' ? body.config : (body || {});

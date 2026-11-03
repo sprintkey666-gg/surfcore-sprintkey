@@ -960,14 +960,39 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
     return parts;
   }
 
-  /** 记一次「这个会话又聊了一轮」，到点就换下一代会话。 */
-  function bumpAgentTurns(history, turns) {
-    if (!turns || turns <= 0) return;
+  // ⚠️ 2026-11-03：原来 `turns<=0` 就直接 return，导致「原版会话跑没跑过」在 history 上完全看不出来
+  //   （真机上 agentTurns/agentGen 都不存在，被误判成「没实现」）。现在永远记一笔，再按 sessionTurns 换代。
+  function bumpAgentTurns(history, turns, sessionId = '') {
     history.agentTurns = (Number(history.agentTurns) || 0) + 1;
-    if (history.agentTurns >= turns) {
+    history.agentTotal = (Number(history.agentTotal) || 0) + 1;
+    history.agentLastAt = Date.now();
+    if (sessionId) history.agentLastSession = sessionId;
+    const every = Number(turns) || 0;
+    if (every > 0 && history.agentTurns >= every) {
       history.agentTurns = 0;
       history.agentGen = (Number(history.agentGen) || 0) + 1;
+      history.agentSessionAt = Date.now();
     }
+  }
+
+  /** 这个会话代数里是不是已经推过完整 system（人设 + 记忆卡）。换代后自然是 false。 */
+  function agentSystemSent(history, sessionId) {
+    const map = history && typeof history.agentSystem === 'object' && history.agentSystem ? history.agentSystem : {};
+    return Boolean(map[sessionId]);
+  }
+
+  /** 只留最近两个会话（悬浮窗会话 + 陪伴字幕），别让 history 无限长。 */
+  function markAgentSystemSent(history, sessionId) {
+    if (!history || !sessionId) return;
+    const map = history && typeof history.agentSystem === 'object' && history.agentSystem ? history.agentSystem : {};
+    map[sessionId] = Date.now();
+    const keys = Object.keys(map);
+    if (keys.length > 2) {
+      keys.sort((a, b) => Number(map[a]) - Number(map[b]))
+        .slice(0, keys.length - 2)
+        .forEach((k) => { delete map[k]; });
+    }
+    history.agentSystem = map;
   }
 
   // ── 对外：聊天 ──────────────────────────────────────────────────────────
@@ -1027,15 +1052,28 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
       if (wantMode === 'legacy' && isOrb) {
         try {
           const sessionId = agentSessionId(deskChannel);
+          // 人设/记忆卡只在「这个会话代数第一次开口」时整段推一次；后续轮次只补最新的记忆卡摘要，
+          // 否则 N 轮以后上下文里会堆 N 份人设（越聊越慢、还会互相矛盾）。
+          const firstTurn = !agentSystemSent(history, sessionId);
+          const memoryNow = String(memoryBlock() || '').trim();
+          const systemForTurn = firstTurn
+            ? system
+            : [
+              `【提醒】你还是${role.name || '她'}，人设没变（这一条只是一次性提醒）。`,
+              memoryNow ? `【最新的记忆卡】\n${memoryNow}` : '',
+            ].filter(Boolean).join('\n');
+          const where = channel === 'companion' ? '屏幕上的字幕框' : '桌面的悬浮球';
           const parts = await buildPromptParts({
-            system,
-            user: `（${owner.name}在桌面的悬浮球里对你说）${say}`,
+            system: systemForTurn,
+            user: `（${owner.name}在${where}里对你说）${say}`,
             images: chatImages.length ? chatImages : null,
           });
           const run = await agent.run({ sessionId, content: parts, timeoutMs: rp.timeoutMs });
           if (run?.ok && String(run.text || '').trim()) {
             result = { text: run.text, usage: null, model: 'session' };
-            bumpAgentTurns(history, rp.sessionTurns);
+            markAgentSystemSent(history, sessionId);
+            bumpAgentTurns(history, rp.sessionTurns, sessionId);
+            pluginLog(`[pet-chat] 原版会话 ok session=${sessionId} turns=${history.agentTurns} total=${history.agentTotal}`);
           } else {
             pluginLog(`[pet-chat] 原版会话这一轮没吐字（${run?.reason?.kind || 'empty'}），退回直连`);
           }

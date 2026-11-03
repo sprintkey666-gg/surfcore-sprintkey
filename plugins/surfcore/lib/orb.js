@@ -23,6 +23,7 @@ import {
 } from './pet.js';
 import { readUnified, saveUnified } from './store.js';
 import { createPetAssetsService } from './pet-assets.js';
+import { DEFAULT_TINTS } from './pet-packs.js';
 import { DEFAULT_COMPANION, normalizeCompanionConfig } from './orb-companion.js';
 import { normalizeInterop } from './interop.js';
 
@@ -95,6 +96,8 @@ export const DEFAULT_ORB = {
     gaze: { enabled: true, intervalMs: 40 },
     // 自己溜达：隔一阵挪一小步，撞到屏幕边就掉头。
     wander: { enabled: true, minMs: 8000, maxMs: 20000 },
+    // 配色：皮肤包 tints 里的 id，空 = 原色。渲染端把 filter 套在图层/iframe 上。
+    tint: '',
   },
   // 互动监测：定时看看主人在干什么（前台窗口/文件/媒体），让桌宠能接话、能吐槽。
   // 默认关：这是「她主动注意主人」的能力，得主人自己点开；关掉时 activity.json 会被删。
@@ -205,6 +208,11 @@ export function normalizeOrbConfig(raw) {
         },
         // 自己溜达：隔一阵挪一小步。
         wander: { enabled: wander.enabled !== false, minMs: wMin, maxMs: wMax },
+        // 配色 id（皮肤包 tints 里的一个）；空串 = 原色。
+        tint: (() => {
+          const raw = String(src.pet?.tint ?? '').trim().toLowerCase();
+          return /^[a-z0-9_-]{0,24}$/.test(raw) ? raw : '';
+        })(),
       };
     })(),
     // 互动监测：窗口/文件/音乐三个开关 + 采样间隔 + 主动气泡频率。
@@ -318,6 +326,9 @@ export function createOrbService({ stateDir, pluginLog = () => {}, getSubprocess
       packKind,
       packEntry: packKind === 'figure' ? (activePack?.entry || '') : '',
       packEntryUrl: packKind === 'figure' ? (activePack?.entryUrl || '') : '',
+      // 配色：tint 是当前选中的 id，tints 是这个包可用的几套（渲染端自己找 filter）。
+      tint: cfg.pet.tint || '',
+      tints: Array.isArray(activePack?.tints) && activePack.tints.length ? activePack.tints : DEFAULT_TINTS,
       dir: pets.dir,
       manifest: wantPet && assets.installed ? pets.manifest() : null,
       assets,
@@ -425,7 +436,7 @@ export function createOrbService({ stateDir, pluginLog = () => {}, getSubprocess
       id: seq,
       who: who === 'me' ? 'me' : 'her',
       text: clean.slice(0, 4000),
-      kind: ['proactive', 'reply', 'chat', 'system', 'pic'].includes(kind) ? kind : 'chat',
+      kind: ['proactive', 'reply', 'chat', 'system', 'pic', 'event'].includes(kind) ? kind : 'chat',
       at: Number(at) || Date.now(),
       ...(pic ? { image: pic } : {}),
       ...(extras.length ? { files: extras } : {}),
