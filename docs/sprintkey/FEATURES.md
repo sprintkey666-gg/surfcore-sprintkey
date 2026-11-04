@@ -676,6 +676,23 @@
 
 **验证**：`node scripts/test-orb.mjs`（67 + 329 项，含「长气泡放不下整窗往下让」「收起要还位」「移动超过 10px 才算拖，且要按住 320ms」）、`node scripts/test-orb-window-state.mjs`（28 项）；真机看 `orb-app.log` 的 `[bubble] fit … shift=`、`[bubble] show`，以及拖不住时是否只出现 `[drag] arm` 而没有 `[drag] start`。
 
+## 37. 鼠标靠近就把她带走：拖动状态残留的真因与四道保险（0.12.23 / 0.12.24）
+
+**症状**：鼠标只要靠近（甚至没按）桌宠，她就被搬走；调了好几次阈值都没治好。
+
+**真因（这次是坐实的，不是调参数）**：主进程有个 90ms 的「鼠标穿透」轮询（`startClickWatch`），它只看指针在不在身体矩形里，**不知道有人正在拖**。拖动时窗口跟着指针跑、指针很容易落到身体矩形外 → 轮询把窗口切成穿透 → **mouseup 被系统吃掉，送不到渲染进程** → `petDrag` 永远不清 → 之后任意一次 mousemove 都满足「按住 + 移动」的判定，她就跟着光标一路跑。
+
+**四道保险（缺一条都能复现）**
+
+1. **主进程钉住** `orb:drag(true/false)`（`main.js` 的 `dragPinned`）：拖的时候穿透轮询整轮跳过并保持 `setIgnoreMouseEvents(false)`；`DRAG_PIN_TTL_MS = 15000` 自愈，渲染端崩了也不会永远钉死。
+2. **指针捕获** `petStage.setPointerCapture(ev.pointerId)`：窗口被她自己搬走、指针已经不在窗口上时，move / up 仍然送到渲染进程；`lostpointercapture` / `pointercancel` 都收尾。
+3. **主进程硬闸**：`orb:move` 只在 `dragPinned` 且未超时时才搬窗口，否则返回 `{ok:false, reason:'not-dragging'}`。残留状态从此搬不动她。
+4. **兜底**：拖动态 1.5 秒收不到任何移动事件（`stall`）直接作废；`mouseup` / `blur` / `pointercancel` / `mouseleave` / `hidden` / `Escape` 全路径都调 `endPetDrag(reason)` 并记日志。
+
+**诊断**：现在每次真正写窗口都会记一行 `[win] <reason> {旧bounds} -> {新bounds}`（同一原因 1 秒内节流）。下次再出现「她自己跑了」，看日志里最后几条 `[win]` 就知道是 `self-heal` / `bubble-space` / `pet-move` / `move` 哪一个动的手。
+
+**验证**：`node scripts/test-orb.mjs`（67 + 334 项）、`node scripts/test-orb-window-state.mjs`（28 项）；真机：鼠标划过 / 单击 / 双击 / 右键都不位移，按住左键 320ms 再拖才跟手。
+
 ## 新增功能时按这个格式补一条
 
 1. 在总表加一行（功能 / 入口 / 代码 / 配置键）；
