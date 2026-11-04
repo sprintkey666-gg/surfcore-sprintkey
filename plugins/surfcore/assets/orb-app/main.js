@@ -792,7 +792,7 @@ function createWindow() {
     // 自检：DOM 有没有真的画出来。桌宠「窗口可见但屏幕上一片空」时，
     // 十有八九是脚本/样式被 CSP 拦了（file:// 下 'self' 不认），这里直接问页面。
     win.webContents.executeJavaScript(`(() => {
-      const stage = document.getElementById('petStage');
+      const stage = document.querySelector('.petStage');
       const css = [...document.styleSheets].map(s => s.href || 'inline');
       return {
         title: document.title,
@@ -1012,7 +1012,11 @@ function startPolling() {
       const cur = win.getBounds();
       const base = baseSize();
       const fix = safeBounds({ x: cur.x, y: cur.y, width: base.width, height: base.height });
-      const drift = Math.abs(fix.x - cur.x) + Math.abs(fix.y - cur.y) + Math.abs(fix.width - cur.width) + Math.abs(fix.height - cur.height);
+      // 位置漂移（被推到屏幕外）必须拉回来；尺寸差 8px 以内是正常抖动（175% 缩放 + 气泡带 +
+      // setBounds→getBounds 取整），以前连这点差都算「异常」，每 3 秒重设一次窗口就是她抖/闪的根源。
+      const posDrift = Math.abs(fix.x - cur.x) + Math.abs(fix.y - cur.y);
+      const sizeDrift = Math.abs(fix.width - cur.width) + Math.abs(fix.height - cur.height);
+      const drift = posDrift + (sizeDrift > 16 ? sizeDrift : 0);
       if (drift > 6) {
         log('[orb] 收回异常窗口', cur, '->', fix);
         // 直接落位，不再 animateTo：每 3 秒一次 120ms 插值动画本身就是可见的抖动。

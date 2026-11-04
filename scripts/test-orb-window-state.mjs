@@ -153,6 +153,7 @@ check('无边框窗口关掉 thickFrame', () => {
 
 check('tick 自愈阈值 >6 且直接落位', () => {
   ok(mainSrc.includes('if (drift > 6)'), '自愈阈值没改');
+  ok(mainSrc.includes('const posDrift =') && mainSrc.includes('sizeDrift > 16 ? sizeDrift : 0'), '自愈只看位置漂移；尺寸差 8px 内不算异常');
   ok(!mainSrc.includes('if (drift > 2)'), '仍在用 drift > 2');
   ok(/applyBounds\(fix, 'self-heal'\)/.test(mainSrc), '自愈应直接 applyBounds，不再 animateTo');
 });
