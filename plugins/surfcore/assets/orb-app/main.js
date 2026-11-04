@@ -443,6 +443,9 @@ function expectedBounds() {
 }
 
 /** 所有写窗口的唯一出口：先夹物理上限，再按模式锁死不该变的维度。 */
+let lastMoveReason = '';
+let lastMoveAt = 0;
+
 function applyBounds(target, reason = '') {
   if (!win || win.isDestroyed()) return null;
   const want = safeBounds(target || {});
@@ -479,6 +482,14 @@ function applyBounds(target, reason = '') {
   ) return final;
   if (process.env.ORB_TRACE === '1') {
     log(`[orb] bounds ${reason || '-'} ${JSON.stringify(before)} -> ${JSON.stringify(final)}`);
+  } else if (reason !== 'animate' && reason !== 'pet-walk') {
+    // 常开但节流：谁把窗口挪了、从哪到哪。主人报「鼠标靠近她就自己跑」，靠这条从日志里定位。
+    const stamp = Date.now();
+    if (reason !== lastMoveReason || stamp - lastMoveAt > 1000) {
+      lastMoveReason = reason;
+      lastMoveAt = stamp;
+      log(`[win] ${reason || '-'} ${JSON.stringify(before)} -> ${JSON.stringify(final)}`);
+    }
   }
   win.setBounds(final);
   return final;
@@ -1545,6 +1556,9 @@ ipcMain.handle('orb:menurect', (_event, size = {}) => {
 });
 ipcMain.handle('orb:move', (_event, pos = {}) => {
   if (!win || win.isDestroyed()) return { ok: false };
+  // 硬闸：只有「渲染端明确说正在拖她」时才允许按指针搬窗口。
+  // 之前鼠标一靠近她就被带走，就是拖动状态残留后在随便一个 mousemove 里调了这里。
+  if (!dragPinned || Date.now() - dragPinnedAt > DRAG_PIN_TTL_MS) return { ok: false, reason: 'not-dragging' };
   const bounds = win.getBounds();
   const x = Number(pos.x);
   const y = Number(pos.y);
