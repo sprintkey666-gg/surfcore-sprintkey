@@ -1,9 +1,6 @@
 /* 悬浮窗前端：只负责画和交互，数据都来自主进程推来的 /orb-api/state。 */
 (() => {
   const root = document.getElementById('root');
-  const ball = document.getElementById('ball');
-  const avatarEl = document.getElementById('ballAvatar');
-  const badge = document.getElementById('badge');
   const bubbles = document.getElementById('bubbles');
   const empty = document.getElementById('empty');
   const input = document.getElementById('input');
@@ -187,14 +184,6 @@
         }
       }
     }
-  }
-
-  function applyAvatar(cfg) {
-    const custom = String(cfg?.ball?.avatar || '').trim();
-    if (!custom) return;
-    // 允许用户填绝对路径；转成 file:// 让 img 能加载（CSP 已放行 file:）。
-    const url = /^[a-zA-Z]:[\\/]/.test(custom) ? `file:///${custom.replace(/\\/g, '/')}` : custom;
-    avatarEl.style.setProperty('--orb-avatar', `url("${url}")`);
   }
 
   /** 是不是已经贴在底部（60px 容差，滚轮抖一下不算）。 */
@@ -605,7 +594,6 @@
     if (!next) return;
     state = next;
     if (next.role?.name) roleName.textContent = next.role.name;
-    applyAvatar(next.config);
     const seq = Number(next.seq || 0);
     const list = Array.isArray(next.messages) ? next.messages : [];
     // 只有真正有新消息（或换了会话）才重画，避免 3 秒一次把滚动位置顶掉。
@@ -622,8 +610,6 @@
     // 眼睛/发图的开关状态跟消息无关，每份状态都要刷：设置页改了档位，
     // 球得在几秒内自己变过来，不能等下次来消息。
     try { renderScreenHint(next.screen); } catch {}
-    const hasProactive = list.some((m) => m.kind === 'proactive' && Number(m.at) > Date.now() - 60_000);
-    badge.classList.toggle('hidden', !(hasProactive && !expanded));
     if (next.chat && next.chat.enabled === false) {
       input.disabled = true;
       btnSend.disabled = true;
@@ -633,10 +619,6 @@
       btnSend.disabled = false;
     }
     // 排队里还有没回的：球上转圈、别自动收起面板。
-    const q = next.chat?.queue;
-    const waiting = !!(q && (Number(q.pending) > 0 || q.busy === true));
-    if (waiting) ball.classList.add('thinking');
-    else if (!sending) ball.classList.remove('thinking');
   }
 
   /** 排队里还有没回完的？ */
@@ -690,8 +672,6 @@
     if (expanded) return;
     expanded = true;
     root.classList.add('expanded');
-    badge.classList.add('hidden');
-    ball.classList.remove('thinking');
     window.orb?.expand(true);
     // 收起期间消息和开关都在变：先把最新状态拉回来，再贴到底部（不然一打开是旧的）。
     void refreshState();
@@ -811,16 +791,9 @@
   };
 
   // 悬停只做视觉反馈，**不展开**（主人的要求：点一下才展开）。
-  ball.addEventListener('mouseenter', () => { clearTimeout(collapseTimer); ball.classList.add('hot'); });
-  ball.addEventListener('mouseleave', () => { ball.classList.remove('hot'); });
   document.querySelector('.panel')?.addEventListener('mouseleave', () => { if (!isComposing()) scheduleCollapse(); });
   document.querySelector('.panel')?.addEventListener('mouseenter', () => clearTimeout(collapseTimer));
 
-  // 点击球 = 展开；拖过位置的那一下不算点击。收起用面板上的「收起」或 Esc。
-  ball.addEventListener('click', () => {
-    if (lastDragMoved) { lastDragMoved = false; return; }
-    if (!expanded) show();
-  });
   btnPin.addEventListener('click', () => setPinned(!pinned));
 
   // ── 面板拖动：「移」打开后，按住面板空白处就能拖（拖的是窗口，宠物跟着走） ──
@@ -865,64 +838,11 @@
   });
   btnHide.addEventListener('click', () => { setPinned(false); hide(true); });
 
-  // 中键滚轮 / 按住中键滚 = 缩放大球（44~96）。
-  const resizeBy = (delta) => {
-    if (expanded) return;
-    window.orb?.resize({ delta });
-  };
-  let middleHeld = false;
-  ball.addEventListener('mousedown', (ev) => {
-    if (ev.button !== 1) return;
-    middleHeld = true;
-    ev.preventDefault();
-  });
-  const onWheel = (ev) => {
-    if (expanded) return;
-    // 只认中键（有的驱动把中键滚轮报成 button=1，有的只置 buttons 位）。
-    if (!middleHeld && ev.button !== 1 && ev.buttons !== 4) return;
-    ev.preventDefault();
-    resizeBy(ev.deltaY < 0 ? 4 : -4);
-  };
-  ball.addEventListener('wheel', onWheel, { passive: false });
-  window.addEventListener('mouseup', () => { middleHeld = false; });
 
-  // 拖动：按住球拖，松手贴边。
-  // 注意：小球和桌宠是**两个独立状态**（ballDrag / petDrag）。以前共用一个 drag，
-  // 桌宠的 mousedown 会把小球的拖动状态覆盖掉；再叠加 orb:hit 每帧改穿透，
-  // mouseup 经常送不到渲染进程，drag 就永远清不掉 → 之后鼠标一动窗口就跑（task-8）。
-  let ballDrag = null;
+  // 只有桌宠一种形象了：拖动状态只剩 petDrag（2026-11-04 去掉悬浮小球）。
   let lastDragMoved = false;
   // 拖动超过这个距离才算「拖」，以下算点击
   const DRAG_MIN_PX = 6;
-
-  function endBallDrag() {
-    if (!ballDrag) return;
-    const moved = ballDrag.moved;
-    ballDrag = null;
-    lastDragMoved = moved;
-    ball.classList.remove('dragging');
-    if (moved) window.orb?.dock();
-  }
-
-  ball.addEventListener('mousedown', (ev) => {
-    if (ev.button !== 0) return;
-    ballDrag = { sx: ev.screenX, sy: ev.screenY, moved: false, wx: window.screenX, wy: window.screenY };
-    ball.classList.add('dragging');
-  });
-  window.addEventListener('mousemove', (ev) => {
-    if (!ballDrag) return;
-    // 左键已经松开（或根本没按）：立刻收尾，绝不继续搬窗口
-    if (!(ev.buttons & 1)) { endBallDrag(); return; }
-    const dx = ev.screenX - ballDrag.sx;
-    const dy = ev.screenY - ballDrag.sy;
-    if (!ballDrag.moved && Math.hypot(dx, dy) < DRAG_MIN_PX) return;
-    ballDrag.moved = true;
-    window.orb?.move(ballDrag.wx + dx, ballDrag.wy + dy);
-  });
-  window.addEventListener('mouseup', () => endBallDrag());
-
-  // 右键：退出（面板里的两个按钮已经够用，不做菜单了）
-  ball.addEventListener('contextmenu', (ev) => { ev.preventDefault(); window.orb?.quit(); });
 
   async function send() {
     const text = input.value.trim();
@@ -940,7 +860,6 @@
     pendingFiles = [];
     renderAttachments();
     btnSend.disabled = true;
-    ball.classList.add('thinking');
     setHint('她在想…');
     try {
       const res = await window.orb.http('/chat', { method: 'POST', body: { text, queue: true, files }, timeoutMs: 30000 });
@@ -952,8 +871,7 @@
           renderAttachments();
         }
         setHint(res.error || '没发出去', true);
-        ball.classList.remove('thinking');
-      } else {
+        } else {
         const pos = Number(res.data?.position || 0);
         setHint(pos > 1 ? `已排队：前面还有 ${pos - 1} 条` : '');
         if (res.data?.state) onState(res.data.state);
@@ -961,8 +879,7 @@
     } catch (error) {
       if (!input.value) input.value = text;
       setHint(String(error?.message ?? error), true);
-      ball.classList.remove('thinking');
-    } finally {
+      } finally {
       btnSend.disabled = false;
     }
   }
@@ -1125,7 +1042,7 @@
     }
     return false;
   };
-  // ── 桌宠拖动状态（跟小球的 ballDrag 完全独立）────────────────────────────────
+  // ── 桌宠拖动状态 ───────────────────────────────────────────────────────────
   // 规则：只有「在她身上左键按住、并且真的移动了 >6px」才搬窗口。
   // 松开鼠标 / 窗口失焦 / 指针离开 / pointercancel / Esc 一律立刻收尾；
   // 拖动过程中绝不再调 orb.hit()（那会改穿透，mouseup 送不到渲染进程，
@@ -1162,12 +1079,12 @@
     if (!petMode || expanded) return;
     window.orb?.hit?.(petBodyHit(ev));
   });
-  window.addEventListener('mouseup', () => { endPetDrag(); endBallDrag(); });
-  window.addEventListener('blur', () => { endPetDrag(); endBallDrag(); });
-  window.addEventListener('pointercancel', () => { endPetDrag(); endBallDrag(); });
-  document.addEventListener('mouseleave', () => { endPetDrag(); endBallDrag(); });
+  window.addEventListener('mouseup', () => { endPetDrag(); });
+  window.addEventListener('blur', () => { endPetDrag(); });
+  window.addEventListener('pointercancel', () => { endPetDrag(); });
+  document.addEventListener('mouseleave', () => { endPetDrag(); });
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden) { endPetDrag(); endBallDrag(); }
+    if (document.hidden) { endPetDrag(); }
   });
 
   async function initPet() {
@@ -1175,8 +1092,6 @@
     let ok = false;
     try { ok = await window.SurfPet.init(); } catch (error) { setHint(String(error?.message ?? error), true); }
     petMode = Boolean(ok);
-    // 桌宠出来就把后备小球藏起来（面板展开时两者都隐藏，由 CSS 管）
-    ball.classList.toggle('hidden', petMode);
     root.classList.toggle('petmode', petMode);
     if (!petMode) return false;
 
@@ -1949,7 +1864,6 @@
   window.addEventListener('keydown', (ev) => {
     if (ev.key !== 'Escape') return;
     endPetDrag();
-    endBallDrag();
     if (ctxOpenState) closeCtxMenu();
   });
 
@@ -1992,7 +1906,7 @@
     const role = document.getElementById('genRole');
     if (role) role.textContent = String(roleName?.textContent || '她');
     const mode = document.getElementById('genMode');
-    if (mode) mode.textContent = petMode ? (state?.config?.pet?.mode === 'pet' ? '桌宠' : '悬浮小球') : '未知';
+    if (mode) mode.textContent = petMode ? '桌宠' : '未知';
     const size = Number(window.SurfPet?.size || state?.config?.pet?.size || 200) || 200;
     const pct = sizeToPercent(size);
     const range = document.getElementById('genSize');

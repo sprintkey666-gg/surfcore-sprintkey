@@ -5739,7 +5739,7 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
     }
 
     // ── 桌宠页：独立栏目，默认不安装，用户自己装 ───────────────────────────
-    // ── 悬浮窗（Orb）：参考 dsh-orb —— 屏幕边上一个小球，她能在里面主动说话，
+    // ── 悬浮窗（Orb）：桌宠形态（0.12.21 起去掉悬浮小球），她能在里面主动说话，
     //    也能被你录一眼屏幕上开了什么。人设与记忆直接复用角色体系（profile='orb'）。
     function OrbTab({ toast }) {
       const [st, setSt] = useState(null);
@@ -5860,7 +5860,6 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
       const petCfg = draft.pet || {};
       const actCfg = draft.activity || {};
       const petState = st?.pet || null;
-      const petMode = ballCfg.mode === "ball" ? "ball" : "pet";
       const running = Boolean(st?.running);
       const installed = Boolean(st?.installed);
       const slider = (value, min, max, step, onChange) => h("input", {
@@ -5875,7 +5874,7 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
 
       return h("div", null,
         h("div", { className: "qbw-infobox" },
-          "悬浮窗在屏幕边上放一个小球：她在里面跟你说话，你点开就能回。人设、记忆、说话方式都跟 QQ 那边同一份。",
+          "桌面上的那只桌宠：点她（或双击）打开面板，她在里面跟你说话。人设、记忆、说话方式都跟 QQ 那边同一份。",
           "参考 dsh-orb，但用的是插件自带的程序（不需要另外装别的插件）。Electron 运行时跟桌宠共用一份。"),
 
         h(Section, { title: "总览", defaultOpen: true, note: "装了才启动；关掉开关也会让球退到后台不再占内存。" },
@@ -5887,8 +5886,8 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
           h("div", { className: "qbw-kv" }, h("span", null, "最近消息"), h("span", null, `${(st?.recent || []).length} 条`)),
           h("div", { style: { display: "flex", gap: "8px", flexWrap: "wrap", marginTop: "8px" } },
             h(Btn, { onClick: () => act("install", {}, "✓ 悬浮窗已安装"), disabled: !!busy }, installed ? "重新安装" : "安装"),
-            h(Btn, { kind: "qbw-btn2", onClick: () => act("start", {}, "✓ 悬浮球已启动"), disabled: !!busy || !installed || running }, "启动"),
-            h(Btn, { kind: "qbw-btn2", onClick: () => act("stop", {}, "✓ 悬浮球已停止"), disabled: !!busy || !running }, "停止"),
+            h(Btn, { kind: "qbw-btn2", onClick: () => act("start", {}, "✓ 桌宠已启动"), disabled: !!busy || !installed || running }, "启动"),
+            h(Btn, { kind: "qbw-btn2", onClick: () => act("stop", {}, "✓ 桌宠已停止"), disabled: !!busy || !running }, "停止"),
             h(Btn, { kind: "qbw-btn2", onClick: async () => { const r = await act("history-clear", {}, "✓ 已开新对话"); if (r) setMsg(""); }, disabled: !!busy || !installed }, "清空对话")),
           msg ? h("div", { className: "qbw-hint", style: { marginTop: "6px" } }, msg) : null,
           (st?.recent || []).length
@@ -5898,12 +5897,8 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
                   `${m.who === "her" ? "她" : "你"}：${String(m.text || "").slice(0, 80)}`))))
             : null),
 
-        h(Section, { title: "外观", defaultOpen: true, note: "改完点保存，球会自己重开。" },
-          h(Row, { label: "形象", hint: "桌宠是 dsh-pet 的那只小鲸鱼，会动；悬浮球是原来的圆球。", badge: petMode === "pet" ? "桌宠" : "悬浮球" },
-            h("select", { className: "qbw-input", value: ballCfg.mode ?? "pet", onChange: (e) => set("ball.mode", e.target.value) },
-              h("option", { value: "pet" }, "桌宠（dsh-pet 素材）"), h("option", { value: "ball" }, "悬浮球"))),
-          petMode === "pet"
-            ? h("div", { "data-pet-box": "1", style: { marginTop: "6px" } },
+        h(Section, { title: "外观", defaultOpen: true, note: "改完点保存，桌宠会自己重开。" },
+          h("div", { "data-pet-box": "1", style: { marginTop: "6px" } },
                 h("div", { className: "qbw-hint" },
                   petState?.mode === "pet"
                     ? `素材已就绪：${petState?.assets?.webmCount || 0} 个动作 / ${Math.round((petState?.assets?.bytes || 0) / 1048576)}MB`
@@ -6020,20 +6015,7 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
                 h(Row, { label: "让她自己走两步", hint: "待机时会随机走位（会撞到屏幕边就掉头）。不想要就走动动作权重=0。" },
                   h("input", { className: "qbw-switch", type: "checkbox", checked: petCfg.wander?.enabled !== false, onChange: (e) => set("pet.wander.enabled", e.target.checked) })),
                 h(Row, { label: "单击就开会话", hint: "默认单击只是逗她一下，双击才开会话。" },
-                  h("input", { className: "qbw-switch", type: "checkbox", checked: petCfg.singleClickOpens === true, onChange: (e) => set("pet.singleClickOpens", e.target.checked) })))
-            : null,
-          h("div", { className: "qbw-kv" }, h("span", null, "球大小"), h("span", null, `${ballCfg.size ?? 64} px`)),
-          slider(ballCfg.size, 44, 96, 2, (v) => set("ball.size", v)),
-          h("div", { className: "qbw-kv" }, h("span", null, "透明度"), h("span", null, `${Math.round((ballCfg.opacity ?? 0.92) * 100)}%`)),
-          slider(ballCfg.opacity, 0.4, 1, 0.02, (v) => set("ball.opacity", v)),
-          h("div", { className: "qbw-kv" }, h("span", null, "停靠"), h("span", null,
-            h("select", { className: "qbw-input", value: ballCfg.dock ?? "right", onChange: (e) => set("ball.dock", e.target.value) },
-              h("option", { value: "right" }, "右侧"), h("option", { value: "left" }, "左侧")))),
-          h("div", { className: "qbw-kv" }, h("span", null, "主题"), h("span", null,
-            h("select", { className: "qbw-input", value: ballCfg.theme ?? "auto", onChange: (e) => set("ball.theme", e.target.value) },
-              h("option", { value: "auto" }, "跟随系统"), h("option", { value: "dark" }, "深色"), h("option", { value: "light" }, "浅色")))),
-          h("div", { className: "qbw-hint" }, "头像：默认用插件自带的那张 Q 版形象；换成绝对路径就是你换的头像。"),
-          h("input", { className: "qbw-input", placeholder: "头像绝对路径（可空）", value: ballCfg.avatar || "", style: { maxWidth: "420px" }, onChange: (e) => set("ball.avatar", e.target.value) })),
+                  h("input", { className: "qbw-switch", type: "checkbox", checked: petCfg.singleClickOpens === true, onChange: (e) => set("pet.singleClickOpens", e.target.checked) })))),
 
         // ── 互动监测（2026-11-03）：让她知道主人在忙什么，但不偷看内容 ──────
         h(Section, { title: "互动监测", defaultOpen: false, note: "只采「前台窗口标题 / 正在编辑的文件与项目 / 在听的歌」，存在本机 state/orb/activity.json，关掉即删。默认关。" },
@@ -6231,7 +6213,7 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
         h("div", { style: { display: "flex", gap: "8px", marginTop: "10px", alignItems: "center" } },
           h(Btn, { onClick: () => save(), disabled: !!busy }, busy === "save" ? "保存中…" : "保存设置"),
           h(Btn, { kind: "qbw-btn2", onClick: load, disabled: !!busy }, "重新读取"),
-          h("span", { className: "qbw-hint" }, "保存后立刻生效；球的窗口会自己重开一次。")));
+          h("span", { className: "qbw-hint" }, "保存后立刻生效；桌宠窗口会自己重开一次。")));
     }
 
     function PetTab({ toast, unified, setUnified }) {

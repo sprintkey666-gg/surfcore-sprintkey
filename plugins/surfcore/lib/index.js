@@ -2426,19 +2426,18 @@ if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output 
           try { return Boolean(orbApi.token() && orbApi.hostFile); } catch { return false; }
         })();
         add('host', '连接令牌与 host.json', hostOk, orbApi.hostFile || '', '重启 DSH 会自动重建');
-        add('running', '悬浮球进程', st.running, st.running ? `pid ${st.pid}` : '没在跑', '点「启动」');
+        add('running', '桌宠进程', st.running, st.running ? `pid ${st.pid}` : '没在跑', '点「启动」');
         const chatState = orbChat.status();
         add('chat', '对话模型', Boolean(chatState.llm?.model), String(chatState.llm?.model || ''), '在「模型」里选一个默认模型');
         const petState = orbService.petInfo();
-        const wantPet = petState.wantMode === 'pet';
         add(
           'pet',
           '桌宠素材',
-          !wantPet || petState.assets.installed,
-          wantPet
-            ? (petState.assets.installed ? `${petState.assets.webmCount} 个动画 / ${Math.round(petState.assets.bytes / 1024 / 1024)}MB` : '还没下载（现在是悬浮球形象）')
-            : '当前用的是悬浮球，不需要素材',
-          wantPet && !petState.assets.installed ? '点「下载桌宠素材（52MB）」' : '',
+          petState.assets.installed,
+          petState.assets.installed
+            ? `${petState.assets.webmCount} 个动画 / ${Math.round(petState.assets.bytes / 1024 / 1024)}MB`
+            : '还没下载（现在先显示静态形象）',
+          petState.assets.installed ? '' : '点「下载桌宠素材（52MB）」',
         );
         add('screen', '看屏幕（可选）', true, orbService.readConfig()?.screen?.enabled ? '已开启' : '关闭中（默认关，需要时再开）', '在「让它看见」里打开');
         const ok = checks.filter((c) => c.key !== 'screen').every((c) => c.ok);

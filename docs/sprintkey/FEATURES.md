@@ -629,6 +629,28 @@
 
 **验证**：`node scripts/test-orb-agent.mjs`（建档/复用/失败重建/超时/并发 busy/forget + 4 条 pet-chat 源码断言）；真机看 `plugin.log` 里 `[pet-chat] 原版会话 ok session=… total=…`，失败时日志带 `data={"reason":"…"}`。
 
+## 35. 去掉悬浮小球，只留桌宠（0.12.21）
+
+**做什么**：主人要「悬浮窗只保留桌宠」，所以把原来那颗圆形悬浮球整个删了。现在桌面上的唯一形象是桌宠（webm 动画包或网页 figure 包都行），打开面板、看气泡、拖位置、右键菜单全由她承担。
+
+**怎么删的**（三层都要动，少一层就会留下空白或死代码）
+
+- 渲染端 `assets/orb-app/index.html`：删整段 `#ball`（含 `#ballAvatar`、`#badge`）。
+- `assets/orb-app/orb.css`：删 `#ball` 及其 `::after` 尖角、`:hover/.hot`、`:active`、`.dragging`、`.thinking`、`@keyframes pulse`、`.avatar`、`.badge`，还有 `#ball.hidden` / `#root.expanded #ball` 两条规则。
+- `assets/orb-app/orb.js`：删 `ball`/`avatarEl`/`badge` 三个元素引用、`applyAvatar()`、点球展开、悬停高亮、中键滚轮缩放、整段球拖动（`ballDrag`/`endBallDrag`/右键退出）与 `thinking` 转圈；`lastDragMoved`、`DRAG_MIN_PX` 留下给桌宠拖动用。
+- `assets/orb-app/main.js`：`baseSize()` 不再有「球」分支，永远按桌宠尺寸算（`petSize` 记忆 + 气泡撑宽的 `bubbleWidth`）；删掉 `applyBallSize()` 与 ready-to-show 里把窗口宽度写进 `ballSize` 的那行；`orb:resize` 保留成空壳（老渲染端调用不报错）；DOM 自检改成问 `#petStage`。
+- 插件侧 `lib/orb.js`：`DEFAULT_ORB.ball` 去掉 `mode`，`petInfo()` 恒 `mode:'pet'`、`wantMode:'pet'`，figure 包给 `manifest:null`；素材没装时 `fallbackReason` 改成「先显示静态形象」（`pet.js` 的 `showFallbackAvatar()` 兜底），不再回落成球。
+- `lib/client.js`：外观页删「形象」下拉与「球大小 / 透明度 / 停靠 / 主题 / 头像」五行，桌宠设置恒显示；`lib/index.js` 自检项「悬浮球进程」改「桌宠进程」。
+- 文案：系统提示里的「待在屏幕边上的悬浮球里」改成「桌宠（一只会动的小人）」；面板说明改成「桌面上的那只桌宠：点她打开面板」。
+
+**注意（踩过的坑）**
+
+- `ball.*` 剩下的 `size/opacity/dock/theme/avatar` 只是兼容旧配置，界面不再暴露；`orb-api.js` 里 `cfg.ball.theme` 仍在用（窗口主题）。
+- 桌宠窗口的「收起态」变量还叫 `ballRect`/`ballSize`（历史名），语义已经是「收起后的矩形」，改名字会牵动一堆自愈/贴边逻辑，先留着。
+- 只删一层会退化成「窗口在、屏幕空白」：`pet.js` 在没有 manifest 时会 `showFallbackAvatar()`，所以渲染端仍然有东西可画。
+
+**验证**：`node scripts/test-orb.mjs`（329 项，含「只剩桌宠拖动状态」「悬浮球已删除」）、`node scripts/test-orb-window-state.mjs`（28 项）；装完看 `~/.dsh/surfcore/orb/app/index.html` 里没有 `id="ball"`、`orb.js` 里没有 `ballDrag`。
+
 ## 新增功能时按这个格式补一条
 
 1. 在总表加一行（功能 / 入口 / 代码 / 配置键）；

@@ -136,10 +136,11 @@ console.log(`✓ test-orb：${pass} 项全过`);
 // ── 6. 桌宠形象（dsh-pet 素材 + 面板气泡）────────────────────────────────
 // 这一批不依赖 Electron：只验配置钳制、素材服务的目录约定、静态契约。
 const petCfg = normalizeOrbConfig({ ball: { mode: 'ball', petSize: 999 }, pet: { singleClickOpens: true, idleMinMs: 100, idleMaxMs: 10 } });
-eq('形象可选悬浮球', petCfg.ball.mode, 'ball');
+ok('悬浮球已删除：ball.mode 不再是配置项', petCfg.ball.mode === undefined, String(petCfg.ball.mode));
 eq('桌宠大小上限 320', petCfg.ball.petSize, 320);
 eq('桌宠大小下限 120', normalizeOrbConfig({ ball: { petSize: 1 } }).ball.petSize, 120);
-ok('默认形象是桌宠', def.ball.mode === 'pet', def.ball.mode);
+ok('桌宠是唯一形象（默认配置里没有 mode）', def.ball.mode === undefined);
+ok('默认没有小球尺寸配置项', def.ball.size === 64);
 eq('单击开会话默认关', def.pet.singleClickOpens, false);
 ok('空闲间隔有上限保护', normalizeOrbConfig({ pet: { idleMinMs: 999999 } }).pet.idleMinMs <= 120000);
 ok('空闲间隔 min 不大于 max', petCfg.pet.idleMaxMs >= petCfg.pet.idleMinMs);
@@ -358,7 +359,7 @@ ok('设置页有「聊天外观」段与清头像缓存', orbHas(clientJs, '聊�
   ok('生图直接调 codex 脚本', h(httpSrc, 'codex-gen.mjs', 'function generateNow(', 'spawn(process.execPath'));
   ok('生图失败仍可让 agent 补图', h(httpSrc, 'needGenerate: true', "suffix === '/pic/image'"));
   ok('画图忙时不并发', h(httpSrc, 'let genBusy = false', '上一张还在画'));
-  ok('聊天知道刚发过什么图', h(httpSrc, 'freshPics(3)') && h(chatSrc, '【你刚在悬浮球里发过的图】'));
+  ok('聊天知道刚发过什么图', h(httpSrc, 'freshPics(3)') && h(chatSrc, '【你刚在桌宠面板里发过的图】'));
   ok('safe-fetch 支持域名白名单 + 代理', h(fetchSrc, 'allowHosts', 'hostMatchesAllowList', "method: 'CONNECT'"));
   ok('QQ 图床走代理隧道', h(bridgeSrc, 'QQ_MEDIA_HOSTS', 'MEDIA_FETCH_OPTS', 'proxy: MEDIA_PROXY'));
   ok('拖拽留 60px 可抓边', h(mainSrc, 'const PET_KEEP = 60', 'const keepX', 'const keepY'));
@@ -465,8 +466,8 @@ ok('设置页有「聊天外观」段与清头像缓存', orbHas(clientJs, '聊�
   ok('气泡带按内容动态申请（不再写死 110）', h(petJs, 'state.bubbleBand = gotBand || needBand', '[bubble] fit pass=', 'function requestBubbleSpace('));
   ok('气泡尾巴尖指向头顶中心', h(petJs, "setProperty('--tail-x'") && h(petCss, 'var(--tail-x, var(--bubble-tail-x, 50%))'));
   ok('命中区按真实身体算（气泡撑宽的透明边不算她）', h(orbSrc, 'Number(window.SurfPet?.size) || 200', 'const bodyW =', 'window.SurfPet?.bubbleBand?.()'));
-  ok('小球与桌宠各自独立的拖动状态', h(orbSrc, 'let ballDrag = null', 'let petDrag = null') && !/\blet drag = null\b/.test(orbSrc));
-  ok('拖动只在左键按住时生效', h(orbSrc, 'if (!(ev.buttons & 1)) { endPetDrag(); return; }', 'if (!(ev.buttons & 1)) { endBallDrag(); return; }'));
+  ok('只剩桌宠拖动状态（悬浮球已删）', h(orbSrc, 'let petDrag = null') && !/\blet (drag|ballDrag) = null\b/.test(orbSrc));
+  ok('拖动只在左键按住时生效', h(orbSrc, 'if (!(ev.buttons & 1)) { endPetDrag(); return; }'));
   ok('移动超过 6px 才算拖（划过只算 hover）', h(orbSrc, 'const DRAG_MIN_PX = 6', 'petDrag.moved = true'));
   ok('按下鼠标不立刻播拖动动画', (() => {
     const start = orbSrc.indexOf("petStage.addEventListener('mousedown'");
@@ -474,10 +475,10 @@ ok('设置页有「聊天外观」段与清头像缓存', orbHas(clientJs, '聊�
     return start >= 0 && /petDrag = \{/.test(blk) && !/SurfPet\?\.drag\(\)/.test(blk);
   })());
   ok('松手 / 失焦 / 指针取消都收尾', h(orbSrc,
-    "window.addEventListener('mouseup', () => { endPetDrag(); endBallDrag(); })",
-    "window.addEventListener('blur', () => { endPetDrag(); endBallDrag(); })",
-    "window.addEventListener('pointercancel', () => { endPetDrag(); endBallDrag(); })"));
-  ok('Esc 也把拖动状态收掉', h(orbSrc, "if (ev.key !== 'Escape') return;", 'endPetDrag();', 'endBallDrag();'));
+    "window.addEventListener('mouseup', () => { endPetDrag(); })",
+    "window.addEventListener('blur', () => { endPetDrag(); })",
+    "window.addEventListener('pointercancel', () => { endPetDrag(); })"));
+  ok('Esc 也把拖动状态收掉', h(orbSrc, "if (ev.key !== 'Escape') return;", 'endPetDrag();') && !/endBallDrag\(\)/.test(orbSrc));
   ok('拖动中不弹右键菜单', h(orbSrc, 'if (petDrag) { ev.preventDefault(); return; }'));
   ok('「现在看一眼」只报一两句短的', h(orbSrc, 'const clip = (value, max = 18)', '在用 ${clip(app)}', '在听 ${clip(track)}'));
   // D. 双击图片看大图

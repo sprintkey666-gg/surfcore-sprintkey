@@ -829,7 +829,7 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
     const s = settings();
     const lines = [];
     if (isOrb) {
-      lines.push(`你是「${role.name}」，此刻待在${owner}电脑屏幕边上的一个悬浮球里——不是 QQ 群里的群友，也不是 B站 的账号。`);
+      lines.push(`你是「${role.name}」，此刻待在${owner}电脑桌面上（一只会动的小人，叫「桌宠」）——不是 QQ 群里的群友，也不是 B站 的账号。`);
       lines.push(`${owner}会在桌面上的这个球里跟你说话（点开才看得见）。你们是一对一说话，用平时聊天的口吻。`);
     } else {
       lines.push(`你是「${role.name}」，此刻待在${owner}自己的电脑桌面上——一只透明的桌宠，不是 QQ 群里的群友，也不是 B站 的账号。`);
@@ -1004,7 +1004,7 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
   async function chat({ text = '', modality = 'text', desktop = null, image = null, images = [], pics = [], screenMode = '', allowPic = false, archive = true, remember = true, channel = '', replyMode = '' } = {}) {
     const s = settings();
     if (!s.chat.enabled) {
-      return { ok: false, error: isOrb ? '悬浮球对话已关闭（设置 → 悬浮窗 → 互动）' : '桌宠对话已关闭（设置 → 桌宠 → 对话）' };
+      return { ok: false, error: '桌宠对话已关闭（设置 → 悬浮窗 → 互动）' };
     }
     const say = String(text ?? '').trim().slice(0, MAX_INPUT_CHARS);
     if (!say) return { ok: false, error: '说点什么吧' };
@@ -1031,13 +1031,13 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
     // 悬浮球里她发过的图只有图、没有字；不告诉模型，她会说「我没发过图」。
     const picList = (Array.isArray(pics) ? pics : []).map((x) => String(x ?? '').trim()).filter(Boolean).slice(-3);
     const picBlock = picList.length
-      ? ['【你刚在悬浮球里发过的图】', ...picList.map((note) => `- ${note.slice(0, 120)}`),
+      ? ['【你刚在桌宠面板里发过的图】', ...picList.map((note) => `- ${note.slice(0, 120)}`),
         '（图已经在气泡里发出去了，别再说“我没发过图”，也别把图复述成文字；他问起就当你发过。）'].join('\n')
       : '';
     const user = [
       history.messages.length ? '【最近聊天】' : '',
       history.messages.length ? formatHistory(history, s.chat.historyTurns, say, owner.name) : say,
-      history.messages.length ? '' : (isOrb ? `（${owner.name}在桌面的悬浮球里对你说）${say}` : `（${owner.name}在桌面上对你说）${say}`),
+      history.messages.length ? '' : (isOrb ? `（${owner.name}在桌面上的桌宠面板里对你说）${say}` : `（${owner.name}在桌面上对你说）${say}`),
       picBlock,
     ].filter(Boolean).join('\n');
 
@@ -1069,7 +1069,7 @@ export function createPetChatService({ ctx, stateDir, pluginLog = () => {}, toke
                 `【提醒】你还是${role.name || '她'}，人设没变（这一条只是一次性提醒）。`,
                 memoryNow ? `【最新的记忆卡】\n${memoryNow}` : '',
               ].filter(Boolean).join('\n');
-            const where = channel === 'companion' ? '屏幕上的字幕框' : '桌面的悬浮球';
+            const where = channel === 'companion' ? '屏幕上的字幕框' : '桌面的桌宠面板';
             const parts = await buildPromptParts({
               system: systemForTurn,
               user: `（${owner.name}在${where}里对你说）${say}`,

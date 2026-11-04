@@ -1,7 +1,7 @@
 // SurfCore 悬浮窗（Orb）宿主
 //
 // 这是一个**独立的 Electron 进程**，由插件（lib/orb.js）spawn 起来。它只做三件事：
-//   1. 在桌面右缘放一个半透明小球（无边框、透明、始终置顶、不进任务栏）；
+//   1. 在桌面放一只桌宠（无边框、透明、始终置顶、不进任务栏；0.12.21 起没有悬浮小球了）；
 //   2. 悬停展开成对话面板，把 `state.json` 里的消息画出来、把用户输入交给插件；
 //   3. 跟插件（/dsh-surfcore/orb-api）通信，DSH 退出或端口漂移时自己收拾干净。
 //
@@ -111,19 +111,18 @@ function currentWorkArea() {
   }
 }
 
-/** 收起状态下的窗口尺寸：桌宠是「宠物 + 头顶气泡 + 一点余量」，球就是球。 */
+/**
+ * 收起状态下的窗口尺寸：永远是「宠物 + 头顶气泡 + 一点余量」。
+ * 2026-11-04 主人要求去掉悬浮小球，只留桌宠，所以这里不再有 ball 分支；
+ * 素材没装时渲染端会显示静态形象（pet.js 的 showFallbackAvatar），窗口尺寸照旧。
+ */
 function baseSize() {
   const pet = readPet();
-  // figure 包没有 manifest（靠 index.html 自绘），判据要看 packKind。
-  if (pet && pet.mode === 'pet' && (pet.manifest || pet.packKind === 'figure')) {
-    const wanted = Number(prefs.petSize) || Number(pet.size) || 200;
-    const size = Math.min(Math.max(Math.round(wanted), PET_MIN), PET_MAX);
-    // 气泡显示时窗口可以更宽：宠物 video 在窗口里居中，中心不动她就没动。
-    const width = Math.max(size + PET_SIDE_SPACE, bubbleWidthFor(currentWorkArea()));
-    return { width, height: size + bandFor(), pet: true };
-  }
-  const size = Math.min(Math.max(Math.round(prefs.ballSize || COLLAPSED), MIN_BALL), MAX_BALL);
-  return { width: size, height: size, pet: false };
+  const wanted = Number(prefs.petSize) || Number(pet?.size) || 200;
+  const size = Math.min(Math.max(Math.round(wanted), PET_MIN), PET_MAX);
+  // 气泡显示时窗口可以更宽：宠物 video 在窗口里居中，中心不动她就没动。
+  const width = Math.max(size + PET_SIDE_SPACE, bubbleWidthFor(currentWorkArea()));
+  return { width, height: size + bandFor(), pet: true };
 }
 
 /** host.json 里插件写的形象配置（球/桌宠 + 素材目录 + 动画清单）。 */
@@ -546,23 +545,6 @@ function collapseTarget() {
   return { ...clampToDisplay(cur.x + cur.width - base.width, cur.y, base.width, base.height), width: base.width, height: base.height };
 }
 
-function applyBallSize(px) {
-  if (!win || win.isDestroyed()) return prefs.ballSize;
-  if (baseSize().pet) return prefs.ballSize; // 桌宠大小走配置，不用滚轮改
-  const size = Math.min(Math.max(Math.round(px), MIN_BALL), MAX_BALL);
-  writePrefs({ ballSize: size });
-  if (!expanded) {
-    const cur = win.getBounds();
-    const area = screen.getDisplayNearestPoint({ x: cur.x, y: cur.y }).workArea;
-    // 以「右边缘和垂直中心」为锚点缩放，视觉上球是原地变大变小。
-    const cx = cur.x + cur.width;
-    const cy = cur.y + cur.height / 2;
-    const pos = clampToDisplay(cx - size, cy - size / 2, size, size);
-    animateTo({ ...pos, width: size, height: size }, { duration: 110 }).then(rememberBall);
-    ballRect = { ...pos, width: size, height: size };
-  }
-  return size;
-}
 
 async function setExpanded(on) {
   if (!win || win.isDestroyed()) return false;
@@ -805,19 +787,20 @@ function createWindow() {
       const b = win.getBounds();
       log('[orb] ready-to-show', `bounds=${b.x},${b.y},${b.width}x${b.height}`, `visible=${win.isVisible()}`);
       ballRect = { x: b.x, y: b.y, width: b.width, height: b.height };
-      writePrefs({ ballSize: b.width, x: b.x, y: b.y });
+      writePrefs({ x: b.x, y: b.y });
     } catch {}
-    // 自检：DOM 有没有真的画出来。球「窗口可见但屏幕上一片空」时，
+    // 自检：DOM 有没有真的画出来。桌宠「窗口可见但屏幕上一片空」时，
     // 十有八九是脚本/样式被 CSP 拦了（file:// 下 'self' 不认），这里直接问页面。
     win.webContents.executeJavaScript(`(() => {
-      const ball = document.getElementById('ball');
+      const stage = document.getElementById('petStage');
       const css = [...document.styleSheets].map(s => s.href || 'inline');
       return {
         title: document.title,
         ready: document.readyState,
-        ball: ball ? { w: ball.offsetWidth, h: ball.offsetHeight, bg: getComputedStyle(ball).backgroundImage.slice(0, 60) } : null,
+        pet: stage ? { w: stage.offsetWidth, h: stage.offsetHeight } : null,
         sheets: css,
         hasOrb: typeof window.orb,
+        hasPet: typeof window.SurfPet,
         bodyChildren: document.body ? document.body.children.length : 0,
       };
     })()`).then((info) => log('[orb] dom', JSON.stringify(info))).catch((e) => log('[orb] dom check failed', String(e?.message ?? e)));
@@ -1320,18 +1303,8 @@ ipcMain.handle('orb:expand', async (_event, on) => {
   return { ok: true, expanded: result };
 });
 
-/** 中键滚轮缩放球：传 size 就直接用，传 delta 就相对调。 */
-ipcMain.handle('orb:resize', (_event, payload = {}) => {
-  const current = prefs.ballSize;
-  const rawDelta = Number(payload.delta);
-  const rawSize = Number(payload.size);
-  // 一次滚轮最多 ±16：万一渲染端传了个离谱的 delta（长按、连发），也不能把球一口气吹到天上
-  const delta = Number.isFinite(rawDelta) ? Math.min(Math.max(rawDelta, -16), 16) : 0;
-  const size = Number.isFinite(rawSize) ? Math.min(Math.max(rawSize, MIN_BALL), MAX_BALL) : NaN;
-  const next = Number.isFinite(size) ? size : current + delta;
-  const applied = applyBallSize(next);
-  return { ok: true, size: applied };
-});
+/** 老的「滚轮缩放球」通道：球已经没了（0.12.21），留着这个 handler 只为兼容旧渲染端，不再改尺寸。 */
+ipcMain.handle('orb:resize', () => ({ ok: true, size: baseSize().width, removed: true }));
 
 ipcMain.handle('orb:prefs', () => ({ ...prefs, expanded, ball: ballRect, bubbleBand: bandFor(), bubbleWidth: baseSize().width }));
 

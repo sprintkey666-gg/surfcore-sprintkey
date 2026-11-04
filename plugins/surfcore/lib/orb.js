@@ -38,8 +38,8 @@ export const DEFAULT_ORB = {
   // 默认关闭：悬浮窗会一直在屏幕上，得主人自己点开。
   enabled: false,
   ball: {
-    // 形象：pet = dsh-pet 的小鲸鱼桌宠（默认），ball = 原来那颗球。素材没装会自动回落 ball。
-    mode: 'pet',
+    // 2026-11-04 起只有桌宠一种形象（悬浮球已删除）。剩下的 size/opacity/dock/theme/avatar
+    // 只是给旧配置留的兼容字段，界面不再暴露，渲染端也不再读。
     size: 64,
     petSize: 200,
     opacity: 0.92,
@@ -180,8 +180,7 @@ export function normalizeOrbConfig(raw) {
   return {
     enabled: src.enabled === true,
     ball: {
-      mode: ball.mode === 'ball' ? 'ball' : 'pet',
-      size: clampNum(ball.size, DEFAULT_ORB.ball.size, 44, 96, { integer: true }),
+        size: clampNum(ball.size, DEFAULT_ORB.ball.size, 44, 96, { integer: true }),
       petSize: clampNum(ball.petSize, DEFAULT_ORB.ball.petSize, 120, 320, { integer: true }),
       opacity: clampNum(ball.opacity, DEFAULT_ORB.ball.opacity, 0.4, 1),
       dock: ball.dock === 'left' ? 'left' : 'right',
@@ -300,19 +299,22 @@ export function createOrbService({ stateDir, pluginLog = () => {}, getSubprocess
 
   fs.mkdirSync(root, { recursive: true });
 
-  /** 形象是球还是桌宠——素材没装就回落球，别让用户对着空白窗口。 */
+  /**
+   * 形象信息：2026-11-04 起只有桌宠一种（主人要求去掉悬浮小球）。
+   * 素材没装时仍然返回 mode:'pet'，渲染端会显示静态形象（pet.js 的 showFallbackAvatar），
+   * 而不是退回那颗球——球已经从 index.html / orb.js / main.js 里删干净了。
+   */
   function petInfo() {
     const cfg = readConfig();
     const assets = pets.status();
-    const wantPet = cfg.ball.mode === 'pet';
     let activePack = null;
     try { activePack = pets.activePack(); } catch (error) {
       pluginLog('[orb] 读生效皮肤包失败：', String(error?.message ?? error));
     }
     const packKind = activePack?.kind === 'figure' ? 'figure' : 'webm';
     return {
-      mode: wantPet && assets.installed ? 'pet' : 'ball',
-      wantMode: cfg.ball.mode,
+      mode: 'pet',
+      wantMode: 'pet',
       size: cfg.ball.petSize,
       singleClickOpens: cfg.pet.singleClickOpens,
       idleMinMs: cfg.pet.idleMinMs,
@@ -330,9 +332,10 @@ export function createOrbService({ stateDir, pluginLog = () => {}, getSubprocess
       tint: cfg.pet.tint || '',
       tints: Array.isArray(activePack?.tints) && activePack.tints.length ? activePack.tints : DEFAULT_TINTS,
       dir: pets.dir,
-      manifest: wantPet && assets.installed ? pets.manifest() : null,
+      // figure 包靠 index.html 自绘，没有 webm 清单；给 null 让渲染端走 iframe 分支。
+      manifest: packKind === 'figure' ? null : pets.manifest(),
       assets,
-      fallbackReason: wantPet && !assets.installed ? '桌宠素材没装（设置 → 悬浮窗 → 桌宠素材 → 下载）' : '',
+      fallbackReason: assets.installed ? '' : '桌宠素材没装（设置 → 悬浮窗 → 桌宠素材 → 下载）；现在先显示静态形象',
     };
   }
 
