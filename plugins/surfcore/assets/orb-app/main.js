@@ -1107,11 +1107,14 @@ ipcMain.handle('orb:pet-packs', async (_event, payload = {}) => {
 /** 渲染端拿形象配置：自己是不是桌宠、素材在哪、清单长什么样。 */
 ipcMain.handle('orb:petconfig', () => {
   const pet = readPet();
+  // 有效身高：右键滑条的 prefs.petSize 优先，其次是插件配置里的 pet.size。
+  // 渲染端以前拿「窗口高度 - 气泡带」反推，气泡一长窗口变高她就跟着变大——这里直接给死。
+  const effSize = Math.min(Math.max(Math.round(Number(prefs.petSize) || Number(pet?.size) || 200), PET_MIN), PET_MAX);
   return {
     pet: pet
       ? {
         mode: pet.mode,
-        size: pet.size,
+        size: effSize,
         dir: pet.dir,
         manifest: pet.manifest,
         singleClickOpens: Boolean(pet.singleClickOpens),

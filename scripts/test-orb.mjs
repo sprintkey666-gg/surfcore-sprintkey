@@ -490,6 +490,8 @@ ok('设置页有「聊天外观」段与清头像缓存', orbHas(clientJs, '聊�
   ) && h(mainSrc, 'let dragPinned = false', "ipcMain.handle('orb:drag'", 'if (dragPinned && Date.now() - dragPinnedAt < DRAG_PIN_TTL_MS) { setClickThrough(false); return; }'));
   ok('主进程只在「正在拖」时才按指针搬窗口（残留状态搬不动她）', h(mainSrc, "reason: 'not-dragging'", 'if (!dragPinned || Date.now() - dragPinnedAt > DRAG_PIN_TTL_MS)'));
   ok('每次搬窗口都记一行 [win] 日志（节流），便于从日志定位是谁挪的', h(mainSrc, 'log(`[win] ${reason', 'let lastMoveReason'));
+  ok('桌宠大小只认配置，绝不跟着窗口（气泡）变大', h(petJs, 'const petSize = num(pet?.size, 200)') && !petJs.includes('baseH > PET_BUBBLE_BAND') && h(mainSrc, 'const effSize = Math.min(Math.max(Math.round(Number(prefs.petSize)'));
+  ok('按住期间就划走的那一下不算拖（moved-before-hold 直接作废）', h(orbSrc, 'const DRAG_EARLY_TOLERANCE = 4', "endPetDrag('moved-before-hold')"));
   ok('「现在看一眼」只报一两句短的', h(orbSrc, 'const clip = (value, max = 18)', '在用 ${clip(app)}', '在听 ${clip(track)}'));
   // D. 双击图片看大图
   ok('双击图片打开查看器', h(orbSrc, "addEventListener('dblclick'", 'openViewer('));

@@ -1142,9 +1142,9 @@
     // 只作用在形象本体上，不影响气泡和菜单。
     const tint = typeof pet?.tint === 'string' ? pet.tint.trim() : '';
     if (stageInner) stageInner.style.setProperty('--pet-tint', tint || 'none');
-    const baseH = num(cfg?.base?.height, 0);
-    // 角色身高 = 窗口高度 - 头顶气泡带；窗口比宠物高出的那一条就是气泡带。
-    const petSize = baseH > PET_BUBBLE_BAND ? baseH - PET_BUBBLE_BAND : num(pet?.size, 200);
+    // 身高只认配置里的「她现在多大」，不再从窗口高度反推：
+    // 窗口会为了头顶气泡长高/加宽，一反推她就跟着变大（主人报「气泡变大桌宠也跟着变大」）。
+    const petSize = num(pet?.size, 200);
     setSize(petSize);
   }
 

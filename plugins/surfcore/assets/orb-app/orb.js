@@ -1054,6 +1054,8 @@
   // 现在 320ms + 10px，并且按住不动超过 1.2 秒就当「按住看」直接取消。
   const PET_DRAG_HOLD_MS = 320;
   const PET_DRAG_IDLE_CANCEL_MS = 1200;
+  // 按住这段时间里允许的手抖（超过就判「不是长按，是划过去/点一下」直接作废）
+  const DRAG_EARLY_TOLERANCE = 4;
   let petDragWatch = null;
   function startPetDragWatch() {
     if (petDragWatch) clearInterval(petDragWatch);
@@ -1083,10 +1085,14 @@
     if (petDrag) {
       // 左键已经松了却还收到 mousemove（mouseup 被穿透/焦点切换吞掉）：立刻放弃
       if (!(ev.buttons & 1)) { endPetDrag('button-up'); return; }
-      // 没按够时长：动得再多也不算拖（这样单击、双击、右键都还是原样）
-      if (Date.now() < petDrag.armAt) return;
       const dx = ev.screenX - petDrag.sx;
       const dy = ev.screenY - petDrag.sy;
+      // 还没按够时长：这期间手已经在动，就**直接作废这次按下**（判成点一下，不搬窗口）。
+      // 主人要的是「按住停一下再拖」，而不是「一按一划就跑」——后一种正是误拖的来源。
+      if (Date.now() < petDrag.armAt) {
+        if (Math.hypot(dx, dy) > DRAG_EARLY_TOLERANCE) endPetDrag('moved-before-hold');
+        return;
+      }
       petDrag.lastAt = Date.now();
       if (!petDrag.moved && Math.hypot(dx, dy) < DRAG_MIN_PX) {
         // 按住一直不动（比如只是按着她看）：超过 1.2 秒就作废，别等松手才判
