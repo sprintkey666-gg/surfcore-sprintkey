@@ -482,6 +482,12 @@ ok('设置页有「聊天外观」段与清头像缓存', orbHas(clientJs, '聊�
     "window.addEventListener('pointercancel', () => { endPetDrag('pointercancel'); })"));
   ok('Esc 也把拖动状态收掉', h(orbSrc, "if (ev.key !== 'Escape') return;", 'endPetDrag(') && !/endBallDrag\(\)/.test(orbSrc));
   ok('拖动中不弹右键菜单', h(orbSrc, 'if (petDrag) { ev.preventDefault(); return; }'));
+  ok('拖动时钉住穿透并捕获指针（mouseup 被吞就会一直跟着鼠标跑）', h(orbSrc,
+    'petStage.setPointerCapture?.(ev.pointerId)',
+    'window.orb?.drag?.(true)',
+    'window.orb?.drag?.(false)',
+    "petStage.addEventListener('lostpointercapture'",
+  ) && h(mainSrc, 'let dragPinned = false', "ipcMain.handle('orb:drag'", 'if (dragPinned && Date.now() - dragPinnedAt < DRAG_PIN_TTL_MS) { setClickThrough(false); return; }'));
   ok('「现在看一眼」只报一两句短的', h(orbSrc, 'const clip = (value, max = 18)', '在用 ${clip(app)}', '在听 ${clip(track)}'));
   // D. 双击图片看大图
   ok('双击图片打开查看器', h(orbSrc, "addEventListener('dblclick'", 'openViewer('));

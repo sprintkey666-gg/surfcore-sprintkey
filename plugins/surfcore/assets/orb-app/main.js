@@ -1176,6 +1176,12 @@ let clickThrough = false;
 let clickThroughTimer = null;
 let bubbleShown = false;
 let uiHold = false;
+// 「她正被拖着」：渲染端按下时钉住，松手才解。
+// 拖的时候窗口跟着指针走，指针很容易落在身体矩形之外；穿透轮询一旦把窗口切成穿透，
+// mouseup 就送不到渲染进程 → petDrag 残留 → 之后鼠标在哪儿她都被当成拖动（主人报的老 bug）。
+let dragPinned = false;
+let dragPinnedAt = 0;
+const DRAG_PIN_TTL_MS = 15000;
 
 function setClickThrough(flag) {
   if (!win || win.isDestroyed()) return;
@@ -1208,6 +1214,9 @@ function startClickWatch() {
     if (!win.isVisible()) { setClickThrough(false); return; }
     if (!baseSize().pet || displayMode === 'expanded') { setClickThrough(false); return; }
     if (uiHold) { setClickThrough(false); return; }
+    // 拖着的时候整窗必须保持可点：宁可桌面上多挡住一块，也不能把 mouseup 吞掉
+    if (dragPinned && Date.now() - dragPinnedAt < DRAG_PIN_TTL_MS) { setClickThrough(false); return; }
+    if (dragPinned) dragPinned = false; // 钉子超时自愈，防止渲染端异常退出后永远不穿透
     let bounds;
     let point;
     try { bounds = win.getBounds(); point = screen.getCursorScreenPoint(); } catch { return; }
@@ -1233,6 +1242,17 @@ ipcMain.handle('orb:hit', (_event, _hit) => {
   if (!win || win.isDestroyed()) return false;
   try { win.setIgnoreMouseEvents(false); } catch (error) { log('[orb] 设置鼠标穿透失败', String(error?.message ?? error)); }
   return true;
+});
+
+// 拖动期间钉住穿透状态（渲染端 mousedown 钉住、mouseup/失焦/丢捕获解锁）
+ipcMain.handle('orb:drag', (_event, flag) => {
+  if (!win || win.isDestroyed()) return false;
+  dragPinned = flag === true;
+  dragPinnedAt = Date.now();
+  if (dragPinned) {
+    try { win.setIgnoreMouseEvents(false); } catch (error) { log('[orb] 拖动钉住穿透失败', String(error?.message ?? error)); }
+  }
+  return dragPinned;
 });
 
 // 头顶气泡显示/隐藏：只在显示时把那一截留成可点

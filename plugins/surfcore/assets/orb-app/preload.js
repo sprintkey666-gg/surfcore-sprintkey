@@ -54,6 +54,8 @@ contextBridge.exposeInMainWorld('orb', {
   cursor: () => ipcRenderer.invoke('orb:cursor'),
   /** 鼠标是否在宠物/气泡身上——true 才有点击权，false 让给桌面。 */
   hit: (on) => ipcRenderer.invoke('orb:hit', Boolean(on)),
+  /** 正在拖她：主进程据此暂停「鼠标穿透」轮询，否则 mouseup 会被吞掉、拖动状态残留。 */
+  drag: (on) => ipcRenderer.invoke('orb:drag', Boolean(on)),
   bubbleShown: (on) => ipcRenderer.invoke('orb:bubble-shown', Boolean(on)),
   uiHold: (on) => ipcRenderer.invoke('orb:ui-hold', Boolean(on)),
   /** 右键菜单（打开会话 / 换个动作 / 隐藏）。 */

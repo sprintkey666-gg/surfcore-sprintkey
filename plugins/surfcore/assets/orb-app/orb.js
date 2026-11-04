@@ -1054,12 +1054,29 @@
   // 现在 320ms + 10px，并且按住不动超过 1.2 秒就当「按住看」直接取消。
   const PET_DRAG_HOLD_MS = 320;
   const PET_DRAG_IDLE_CANCEL_MS = 1200;
+  let petDragWatch = null;
+  function startPetDragWatch() {
+    if (petDragWatch) clearInterval(petDragWatch);
+    // 兜底：拖动状态挂了 1.5 秒拿不到任何移动事件，就当她已经被松手（防止 mouseup 被系统吞掉后一直跟着鼠标）
+    petDragWatch = setInterval(() => {
+      if (!petDrag) { clearInterval(petDragWatch); petDragWatch = null; return; }
+      if (Date.now() - (petDrag.lastAt || petDrag.armedAt || 0) > 1500) endPetDrag('stall');
+    }, 500);
+  }
+  function stopPetDragWatch() {
+    if (petDragWatch) { clearInterval(petDragWatch); petDragWatch = null; }
+  }
   function endPetDrag(reason = '') {
     if (!petDrag) return;
     if (reason) { try { window.orb?.log?.(`[drag] end ${reason} moved=${petDrag.moved ? 1 : 0}`); } catch {} }
+    const pointerId = petDrag.pointerId;
     lastDragMoved = petDrag.moved;
     petDrag = null;
+    stopPetDragWatch();
     root.classList.remove('petdragging');
+    // 两件事必须成对：解掉主进程的「正在拖」钉子、释放指针捕获，否则下一次鼠标移动还会被当成拖
+    try { window.orb?.drag?.(false); } catch {}
+    try { if (pointerId != null) petStage?.releasePointerCapture?.(pointerId); } catch {}
   }
 
   window.addEventListener('mousemove', (ev) => {
@@ -1070,6 +1087,7 @@
       if (Date.now() < petDrag.armAt) return;
       const dx = ev.screenX - petDrag.sx;
       const dy = ev.screenY - petDrag.sy;
+      petDrag.lastAt = Date.now();
       if (!petDrag.moved && Math.hypot(dx, dy) < DRAG_MIN_PX) {
         // 按住一直不动（比如只是按着她看）：超过 1.2 秒就作废，别等松手才判
         if (Date.now() - petDrag.armAt > PET_DRAG_IDLE_CANCEL_MS) endPetDrag('held-still');
@@ -1121,8 +1139,18 @@
       };
       // 按下就把命中钉住：拖动期间穿透轮询若把窗口切成穿透，mouseup 就收不到了
       try { window.orb?.hit?.(true); } catch {}
+      // 主进程钉住「正在拖」：90ms 的穿透轮询一旦把窗口切成穿透，mouseup 就送不到渲染进程，
+      // petDrag 会残留下来，之后鼠标在哪儿她都被当成拖动（主人报的「鼠标靠近就把她移走」）。
+      try { window.orb?.drag?.(true); } catch {}
+      // 指针捕获：窗口被她自己搬走时指针可能已经不在窗口上，捕获能保证 move/up 仍然送到这里。
+      try { petStage.setPointerCapture?.(ev.pointerId); petDrag.pointerId = ev.pointerId; } catch {}
+      petDrag.armedAt = Date.now();
+      petDrag.lastAt = Date.now();
+      startPetDragWatch();
       try { window.orb?.log?.(`[drag] arm x=${ev.screenX} y=${ev.screenY}`); } catch {}
     });
+    // 捕获丢 / 指针取消：收尾（没有这两条，状态会挂死下一个鼠标动作全被当成拖）
+    petStage.addEventListener('lostpointercapture', () => endPetDrag('lost-capture'));
     petStage.addEventListener('click', () => {
       if (lastDragMoved) { lastDragMoved = false; return; }
       if (expanded) return;
