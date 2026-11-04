@@ -51,6 +51,10 @@ let prefs = { ballSize: COLLAPSED, x: null, y: null, panelWidth: EXPANDED.width,
 let bubbleBand = 0;
 // 气泡申请的额外宽度（0 = 只给宠物本身那么宽）。见 bubbleWidthFor()。
 let bubbleWidth = 0;
+// 气泡长到头顶放不下时（她贴在屏幕最上面），整个窗口往下让一截，换气泡完整可见。
+// 这两个量记住「让之前她贴在哪条底线上、让了多少」，气泡收起时原样还回去。
+let bubbleOriginBottom = 0;
+let bubbleShiftApplied = 0;
 
 /** 当前窗口所在屏幕的点：没窗口时退回 prefs 里记的位置。 */
 function prefsPoint() {
@@ -1339,17 +1343,60 @@ ipcMain.handle('orb:bubble-space', (_event, payload = {}) => {
 
   bubbleBand = nextBand === PET_BUBBLE_SPACE ? 0 : nextBand;
   bubbleWidth = nextWidth <= size + PET_SIDE_SPACE ? 0 : nextWidth;
-  const next = baseSize();
-  if (next.width === cur.width && next.height === cur.height) {
-    return { ok: true, band: bandFor(), width: next.width, unchanged: true };
-  }
-  // 脚底（y+height）不动、水平中心（x+width/2）不动：窗口只会往上/往两边长。
+  let next = baseSize();
   const cx = cur.x + cur.width / 2;
   const bottom = cur.y + cur.height;
+
+  // 气泡收起（band/width 传 0）：把「下让」的那一截还回去。
+  // 只有窗口还停在当初让下去的位置才认——中间被拖过就别动她。
+  if (wantBand <= 0) {
+    const near = bubbleShiftApplied > 0 && Math.abs(bottom - (bubbleOriginBottom + bubbleShiftApplied)) <= 12;
+    const targetBottom = near ? bubbleOriginBottom : bottom;
+    bubbleOriginBottom = 0;
+    bubbleShiftApplied = 0;
+    const x0 = Math.round(cx - next.width / 2);
+    const y0 = Math.round(targetBottom - next.height);
+    const final0 = applyBounds({ x: x0, y: y0, width: next.width, height: next.height }, 'bubble-space');
+    return { ok: true, band: bandFor(), width: next.width, bounds: final0, restored: near };
+  }
+
+  // 关键：气泡不是「想长多高就长多高」。
+  // 她贴在屏幕顶上时，以前带高照长，窗口上半截直接跑到屏幕外——于是正文被屏幕边缘切掉
+  // （主人 2026-11-04：「消息内文字多就会截断文字显示不全」）。
+  // 现在的规则：头顶到工作区上沿就是能用的全部空间；还不够就把整个窗口往下让一截
+  // （她临时下移），让完再量一次，实在放不下才让正文滚动——永远不把字切在屏幕外。
+  const bodyH = Math.min(next.height, Math.max(48, Math.round(size * 1.22)));
+  const roomAbove = Math.max(0, Math.round(bottom - bodyH - area.y - 4));
+  const wantBandNow = Math.max(0, next.height - bodyH);
+  const shiftMax = Math.max(0, Math.round(area.y + area.height - bottom - 8));
+  const shift = wantBandNow > roomAbove ? Math.min(wantBandNow - roomAbove, shiftMax) : 0;
+  const fitBand = Math.min(wantBandNow, roomAbove + shift);
+  if (fitBand + 1 < wantBandNow) {
+    bubbleBand = fitBand <= PET_BUBBLE_SPACE ? 0 : fitBand;
+    next = baseSize();
+  }
+  const bottom2 = bottom + shift;
+  if (shift > 0) {
+    if (!bubbleOriginBottom) bubbleOriginBottom = bottom;
+    bubbleShiftApplied = shift;
+  } else if (bubbleShiftApplied > 0 && Math.abs(bottom - (bubbleOriginBottom + bubbleShiftApplied)) <= 12) {
+    bubbleOriginBottom = 0;
+    bubbleShiftApplied = 0;
+  }
   const x = Math.round(cx - next.width / 2);
-  const y = Math.round(bottom - next.height);
+  const y = Math.round(bottom2 - next.height);
+  if (x === cur.x && y === cur.y && next.width === cur.width && next.height === cur.height) {
+    return { ok: true, band: bandFor(), width: next.width, unchanged: true };
+  }
   const final = applyBounds({ x, y, width: next.width, height: next.height }, 'bubble-space');
-  return { ok: true, band: bandFor(), width: next.width, bounds: final };
+  return {
+    ok: true,
+    band: bandFor(),
+    width: next.width,
+    bounds: final,
+    shift,
+    clipped: fitBand + 1 < wantBandNow,
+  };
 });
 
 // ---- 面板边缘拖拽缩放 ----------------------------------------------------

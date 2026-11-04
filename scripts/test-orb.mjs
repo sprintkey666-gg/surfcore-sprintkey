@@ -440,7 +440,7 @@ ok('设置页有「聊天外观」段与清头像缓存', orbHas(clientJs, '聊�
   ok('消息列表允许滚动不被压扁', h(cssSrc, 'min-height: 0') && h(cssSrc, '.bubbles > .row', 'flex: 0 0 auto'));
   // B. 头顶气泡在窗口内浮层化：高度靠 --bubble-max，窗口尺寸不再跟着气泡变（0.12.15 起）
   ok('头顶气泡按可用余量折算高度', h(petSrc, 'function placeBubble()', "setProperty('--bubble-max'") && h(petCss, 'max-height: var(--bubble-max, 96px)'));
-  ok('气泡收起时窗口不回落', !/bubbleSpace\?\.\(0\)/.test(petSrc) && h(petSrc, '不需要 bubbleSpace(0) 复位'));
+  ok('气泡收起时窗口不回落（只有「为了放下长气泡往下让过」才复位）', !/bubbleSpace\?\.\(0\)/.test(petSrc) && h(petSrc, 'if (state.bubbleShift > 0)', 'requestBubbleSpace({ band: 0, width: 0 })'));
   ok('主进程能吃气泡带高度', h(mainSrc, "ipcMain.handle('orb:bubble-space'", 'function bandFor()', 'bubbleBand'));
   ok('窗口按带高向上长', h(mainSrc, 'size + bandFor()'));
   ok('preload 暴露 bubbleSpace（支持 band/width 对象）', h(preload, 'bubbleSpace: (opts)', 'band: Number(opts.band)', 'width: Number(opts.width)'));
@@ -460,25 +460,27 @@ ok('设置页有「聊天外观」段与清头像缓存', orbHas(clientJs, '聊�
   ok('面板收起时补冒延后那条', h(orbSrc, 'function flushDeferredBubble(', "bubbleFor(state?.messages, 'collapse')"));
   ok('展开时收到消息也不丢（收起后补）', h(orbSrc, "if (expanded) { bubbleSkip('panel-expanded-defer'); queueDeferredBubble(list); return; }"));
   // C3. task-8 真机反馈：气泡压在宠物身上 / 鼠标划过就搬窗口
-  ok('气泡有 240px 宽度下限，列宽 248→360', h(petJs, 'const BUBBLE_MIN_W = 240', 'const BUBBLE_COLUMN = 248', 'const BUBBLE_COLUMN_MAX = 360'));
+  ok('气泡有 240px 宽度下限，列宽 248→400', h(petJs, 'const BUBBLE_MIN_W = 240', 'const BUBBLE_COLUMN = 248', 'const BUBBLE_COLUMN_MAX = 400'));
   ok('气泡两趟测量后请主进程让 band / width', h(petJs, 'async function fitBubble(', 'band: needBand', 'width: needWidth', 'state.bubbleFitToken'));
   ok('气泡底边钉在头顶上方 10px', h(petJs, 'const BUBBLE_GAP = 10', 'headFromBottom() + BUBBLE_GAP'));
   ok('气泡带按内容动态申请（不再写死 110）', h(petJs, 'state.bubbleBand = gotBand || needBand', '[bubble] fit pass=', 'function requestBubbleSpace('));
+  ok('长气泡放不下时整窗往下让一截，绝不让屏幕切掉正文', h(mainSrc, 'const roomAbove =', 'const shift = wantBandNow > roomAbove', 'bubbleOriginBottom'));
+  ok('为了放下长气泡让过位置，气泡收起后要还回去', h(petJs, 'if (state.bubbleShift > 0)', 'requestBubbleSpace({ band: 0, width: 0 })'));
   ok('气泡尾巴尖指向头顶中心', h(petJs, "setProperty('--tail-x'") && h(petCss, 'var(--tail-x, var(--bubble-tail-x, 50%))'));
   ok('命中区按真实身体算（气泡撑宽的透明边不算她）', h(orbSrc, 'Number(window.SurfPet?.size) || 200', 'const bodyW =', 'window.SurfPet?.bubbleBand?.()'));
   ok('只剩桌宠拖动状态（悬浮球已删）', h(orbSrc, 'let petDrag = null') && !/\blet (drag|ballDrag) = null\b/.test(orbSrc));
-  ok('拖动只在左键按住时生效', h(orbSrc, 'if (!(ev.buttons & 1)) { endPetDrag(); return; }'));
-  ok('移动超过 6px 才算拖（划过只算 hover）', h(orbSrc, 'const DRAG_MIN_PX = 6', 'petDrag.moved = true'));
+  ok('拖动只在左键按住时生效', h(orbSrc, 'if (!(ev.buttons & 1)) { endPetDrag(', 'return; }'));
+  ok('移动超过 10px 才算拖，且要按住 320ms（划过只算 hover）', h(orbSrc, 'const DRAG_MIN_PX = 10', 'const PET_DRAG_HOLD_MS = 320', 'petDrag.moved = true'));
   ok('按下鼠标不立刻播拖动动画', (() => {
     const start = orbSrc.indexOf("petStage.addEventListener('mousedown'");
     const blk = start >= 0 ? orbSrc.slice(start, start + 800) : '';
     return start >= 0 && /petDrag = \{/.test(blk) && !/SurfPet\?\.drag\(\)/.test(blk);
   })());
   ok('松手 / 失焦 / 指针取消都收尾', h(orbSrc,
-    "window.addEventListener('mouseup', () => { endPetDrag(); })",
-    "window.addEventListener('blur', () => { endPetDrag(); })",
-    "window.addEventListener('pointercancel', () => { endPetDrag(); })"));
-  ok('Esc 也把拖动状态收掉', h(orbSrc, "if (ev.key !== 'Escape') return;", 'endPetDrag();') && !/endBallDrag\(\)/.test(orbSrc));
+    "window.addEventListener('mouseup', () => { endPetDrag('mouseup'); })",
+    "window.addEventListener('blur', () => { endPetDrag('blur'); })",
+    "window.addEventListener('pointercancel', () => { endPetDrag('pointercancel'); })"));
+  ok('Esc 也把拖动状态收掉', h(orbSrc, "if (ev.key !== 'Escape') return;", 'endPetDrag(') && !/endBallDrag\(\)/.test(orbSrc));
   ok('拖动中不弹右键菜单', h(orbSrc, 'if (petDrag) { ev.preventDefault(); return; }'));
   ok('「现在看一眼」只报一两句短的', h(orbSrc, 'const clip = (value, max = 18)', '在用 ${clip(app)}', '在听 ${clip(track)}'));
   // D. 双击图片看大图

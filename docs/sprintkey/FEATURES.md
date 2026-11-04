@@ -651,6 +651,31 @@
 
 **验证**：`node scripts/test-orb.mjs`（329 项，含「只剩桌宠拖动状态」「悬浮球已删除」）、`node scripts/test-orb-window-state.mjs`（28 项）；装完看 `~/.dsh/surfcore/orb/app/index.html` 里没有 `id="ball"`、`orb.js` 里没有 `ballDrag`。
 
+## 36. 长气泡不被屏幕切掉、鼠标划过不再搬走她（0.12.22）
+
+**做什么**：修主人反复报的两件事——「消息气泡文字多了就被截断显示不全」与「鼠标靠近桌宠就把她移走了，明明没拖」。
+
+**① 气泡被截断的真因**：她默认贴在屏幕最上沿（`ready-to-show y=34`），而 `main.js` 的 `clampForMode()` 里 `const minY = area.y - (height - bodyH)` 为了「气泡能到最上面」**故意允许气泡带跑出屏幕**。气泡越长 → 窗口越往上长 → 上半截直接出屏，正文被屏幕边缘切掉，`.bubbleBody` 的滚动层根本没机会生效。
+
+**修法（整窗往下让一截，收起再还回去）**
+
+- `assets/orb-app/main.js` 的 `orb:bubble-space`：新增 `bubbleOriginBottom` / `bubbleShiftApplied`。申请气泡带时算 `roomAbove`（她头顶到屏幕顶还有多少）、`wantBandNow`、`shiftMax`（往下还能挪多少），`shift = wantBandNow > roomAbove ? min(wantBandNow - roomAbove, shiftMax) : 0`，`fitBand = min(wantBandNow, roomAbove + shift)`；放不下时把 band 收到 `fitBand`，`bottom2 = bottom + shift` 再定位。返回值多 `shift` / `clipped`。
+- 收起时 `band <= 0`：只有「之前为了放下长气泡让过位置」才还位（`near` 判定容差 12px），否则不动，避免老的「一高一缩」抖动。
+- `assets/orb-app/pet.js`：`BUBBLE_COLUMN_MAX` 360→**400**、`BUBBLE_COLUMN_GROWTH_CHARS` 60→**30**、`BUBBLE_COLUMN_GROWTH_SPAN` 100→**80**（中文长句在 248px 会折 6~7 行，得早点放宽容器）；`fitBubble()` 记住 `res.shift`，`hideBubble()` 只在 `state.bubbleShift > 0` 时才申请复位。
+
+**② 误拖的真因与修法**
+
+- 日志实证：用户没拖的时候 `orb-app.log` 里也出现 `[pet] [layer] action 被鼠标拖拽悬空反馈 kind=drag`。全套代码里只有 `orb.js` 在 `petDrag.moved = true` 那一刻调 `SurfPet.drag()`，所以是 `petDrag` 被意外立起来了（点一下 / 按住看 / 手抖越过 6px 阈值都算）。
+- `assets/orb-app/orb.js`：`mousedown` 严格判 `ev.button !== 0 || ev.buttons !== 1 || expanded` → return；`PET_DRAG_HOLD_MS` 180→**320**；`DRAG_MIN_PX` 6→**10**；新增 `PET_DRAG_IDLE_CANCEL_MS = 1200`（按住不动 1.2 秒即判「只是按住看」，撤销这次按下）；`endPetDrag(reason)` 每次都记日志（`mouseup` / `blur` / `pointercancel` / `mouseleave` / `hidden` / `Escape` / `held-still` / `button-up`），方便下次从日志判断到底哪条路径触发的。
+
+**注意（踩过的坑）**
+
+- `orb.js` 里没有 `log()` 函数（只有 `window.orb.log`），直接写 `log(...)` 会 `ReferenceError` 把渲染进程打断；三处都改成 `try { window.orb?.log?.(...) } catch {}`。
+- `hideBubble()` 不能无条件 `bubbleSpace(0)`：窗口跟着气泡缩/长正是老「上下抖」的根因，只还「为了长气泡让出去的那一截」。
+- 改动只在「她贴边」时才会触发让位；在屏幕中间弹出的气泡仍然原地向上长（原行为不变）。
+
+**验证**：`node scripts/test-orb.mjs`（67 + 329 项，含「长气泡放不下整窗往下让」「收起要还位」「移动超过 10px 才算拖，且要按住 320ms」）、`node scripts/test-orb-window-state.mjs`（28 项）；真机看 `orb-app.log` 的 `[bubble] fit … shift=`、`[bubble] show`，以及拖不住时是否只出现 `[drag] arm` 而没有 `[drag] start`。
+
 ## 新增功能时按这个格式补一条
 
 1. 在总表加一行（功能 / 入口 / 代码 / 配置键）；

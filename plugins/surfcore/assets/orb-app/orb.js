@@ -842,7 +842,7 @@
   // 只有桌宠一种形象了：拖动状态只剩 petDrag（2026-11-04 去掉悬浮小球）。
   let lastDragMoved = false;
   // 拖动超过这个距离才算「拖」，以下算点击
-  const DRAG_MIN_PX = 6;
+  const DRAG_MIN_PX = 10;
 
   async function send() {
     const text = input.value.trim();
@@ -1049,10 +1049,14 @@
   // 状态就永远清不掉——这正是用户看到的「鼠标划过她就跟着跑」）。
   let petDrag = null;
   // 长按才算拖：主人明确要求「只有在她身上按住左键停一下再拖」才搬窗口。
-  // 以前按下就能拖，手一抖（点击时移动 6px）她就被拖走，看起来像「鼠标靠近就位移」。
-  const PET_DRAG_HOLD_MS = 180;
-  function endPetDrag() {
+  // 180ms 太短了——点一下她的反应动画还没走完，手一抖 6px 就已经拖走了，
+  // 实测日志里一天会冒出几十次「被鼠标拖拽悬空反馈」（她根本没被拖）。
+  // 现在 320ms + 10px，并且按住不动超过 1.2 秒就当「按住看」直接取消。
+  const PET_DRAG_HOLD_MS = 320;
+  const PET_DRAG_IDLE_CANCEL_MS = 1200;
+  function endPetDrag(reason = '') {
     if (!petDrag) return;
+    if (reason) { try { window.orb?.log?.(`[drag] end ${reason} moved=${petDrag.moved ? 1 : 0}`); } catch {} }
     lastDragMoved = petDrag.moved;
     petDrag = null;
     root.classList.remove('petdragging');
@@ -1061,15 +1065,20 @@
   window.addEventListener('mousemove', (ev) => {
     if (petDrag) {
       // 左键已经松了却还收到 mousemove（mouseup 被穿透/焦点切换吞掉）：立刻放弃
-      if (!(ev.buttons & 1)) { endPetDrag(); return; }
+      if (!(ev.buttons & 1)) { endPetDrag('button-up'); return; }
       // 没按够时长：动得再多也不算拖（这样单击、双击、右键都还是原样）
       if (Date.now() < petDrag.armAt) return;
       const dx = ev.screenX - petDrag.sx;
       const dy = ev.screenY - petDrag.sy;
-      if (!petDrag.moved && Math.hypot(dx, dy) < DRAG_MIN_PX) return;
+      if (!petDrag.moved && Math.hypot(dx, dy) < DRAG_MIN_PX) {
+        // 按住一直不动（比如只是按着她看）：超过 1.2 秒就作废，别等松手才判
+        if (Date.now() - petDrag.armAt > PET_DRAG_IDLE_CANCEL_MS) endPetDrag('held-still');
+        return;
+      }
       if (!petDrag.moved) {
         petDrag.moved = true;
         root.classList.add('petdragging');
+        try { window.orb?.log?.(`[drag] start dx=${Math.round(dx)} dy=${Math.round(dy)}`); } catch {}
         // 真的开始拖了才播拖动动画（单纯点一下不播）
         window.SurfPet?.drag();
       }
@@ -1079,12 +1088,12 @@
     if (!petMode || expanded) return;
     window.orb?.hit?.(petBodyHit(ev));
   });
-  window.addEventListener('mouseup', () => { endPetDrag(); });
-  window.addEventListener('blur', () => { endPetDrag(); });
-  window.addEventListener('pointercancel', () => { endPetDrag(); });
-  document.addEventListener('mouseleave', () => { endPetDrag(); });
+  window.addEventListener('mouseup', () => { endPetDrag('mouseup'); });
+  window.addEventListener('blur', () => { endPetDrag('blur'); });
+  window.addEventListener('pointercancel', () => { endPetDrag('pointercancel'); });
+  document.addEventListener('mouseleave', () => { endPetDrag('mouseleave'); });
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden) { endPetDrag(); }
+    if (document.hidden) { endPetDrag('hidden'); }
   });
 
   async function initPet() {
@@ -1096,7 +1105,8 @@
     if (!petMode) return false;
 
     petStage.addEventListener('mousedown', (ev) => {
-      if (ev.button !== 0 || expanded) return;
+      // 只认「左键按在她身上」：按钮不对 / 已经是展开面板 / 已经有拖动状态，直接不算。
+      if (ev.button !== 0 || ev.buttons !== 1 || expanded) return;
       // 窗口比宠物大（左右透明边 + 头顶气泡带），只有真的按在她身上才算拖她。
       if (!petBodyHit(ev)) return;
       if (petDrag) return;
@@ -1107,9 +1117,11 @@
         wx: window.screenX,
         wy: window.screenY,
         armAt: Date.now() + PET_DRAG_HOLD_MS,
+        wentFor: false,
       };
       // 按下就把命中钉住：拖动期间穿透轮询若把窗口切成穿透，mouseup 就收不到了
       try { window.orb?.hit?.(true); } catch {}
+      try { window.orb?.log?.(`[drag] arm x=${ev.screenX} y=${ev.screenY}`); } catch {}
     });
     petStage.addEventListener('click', () => {
       if (lastDragMoved) { lastDragMoved = false; return; }

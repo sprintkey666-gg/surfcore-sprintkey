@@ -48,6 +48,7 @@
     bubbleBody: null,    // .bubbleBody：正文的限高/滚动层（运行时包出来的）
     bubbleBand: 0,       // 主进程当前给的气泡带高度（0 = 还没申请过）
     bubbleWidth: 0,      // 主进程当前给的窗口宽度
+    bubbleShift: 0,      // 为了放下长气泡，主进程把窗口往下让了多少（>0 才需要复位）
     bubbleFitToken: 0,   // 两趟测量的代次：迟到的测量结果作废
     moveBias: 0,        // 撞到屏幕边以后反过来走
     lastTurnAt: 0,
@@ -81,11 +82,12 @@
   const BUBBLE_EDGE_PAD = 12;
   // 再窄就变成竖条了：用户实测被窗口 174px 卡成每行两三个字
   const BUBBLE_MIN_W = 240;
-  // 参考实现的列宽：短句 248px，超过 60 字开始放宽，再长 100 字到 360px 封顶
+  // 参考实现的列宽：短句 248px，超过 30 字就开始放宽（以前是 60 字，中文长句
+  // 在 248px 里要折 6~7 行，竖着顶到屏幕外就被切了），最宽 400px。
   const BUBBLE_COLUMN = 248;
-  const BUBBLE_COLUMN_MAX = 360;
-  const BUBBLE_COLUMN_GROWTH_CHARS = 60;
-  const BUBBLE_COLUMN_GROWTH_SPAN = 100;
+  const BUBBLE_COLUMN_MAX = 400;
+  const BUBBLE_COLUMN_GROWTH_CHARS = 30;
+  const BUBBLE_COLUMN_GROWTH_SPAN = 80;
   // 主进程那边的带高上限（跟 main.js 的 600 对齐）
   const BUBBLE_BAND_MAX = 600;
   // 尾巴尖离气泡圆角边缘的最小距离
@@ -369,8 +371,13 @@
       const gotWidth = Math.round(Number(res?.width) || 0);
       state.bubbleBand = gotBand || needBand;
       state.bubbleWidth = gotWidth || needWidth;
+      // 主进程为了放下长气泡，可能把整个窗口往下让了一截（她临时下移）。
+      // 记下来，气泡收起时再让主进程把位置还回去。
+      const gotShift = Math.round(Number(res?.shift) || 0);
+      if (gotShift > 0) state.bubbleShift = gotShift;
       const clamped = gotWidth > 0 && gotWidth + 4 < needWidth;
-      log(`[bubble] fit pass=${pass + 1} chars=${chars} colW=${Math.round(colW)} contentH=${contentH} -> band=${state.bubbleBand} width=${state.bubbleWidth}${clamped ? '（width 被工作区夹小）' : ''}${res ? '' : '（bubbleSpace 不可用）'}`);
+      const clipped = res?.clipped === true;
+      log(`[bubble] fit pass=${pass + 1} chars=${chars} colW=${Math.round(colW)} contentH=${contentH} -> band=${state.bubbleBand} width=${state.bubbleWidth}${gotShift ? ` shift=${gotShift}` : ''}${clipped ? '（屏幕放不下，正文改为滚动）' : ''}${clamped ? '（width 被工作区夹小）' : ''}${res ? '' : '（bubbleSpace 不可用）'}`);
       if (!res) log('[bubble] space api 没生效：preload/main 没有回 band/width');
       await settleFrames();
       if (token !== state.bubbleFitToken) return false;
@@ -1482,8 +1489,15 @@
     state.bubbleClick = null;
     const textEl = document.getElementById('bubbleText');
     if (textEl) { textEl.textContent = ''; textEl.title = ''; }
-    // 窗口高度不再跟着气泡变，所以这里不需要 bubbleSpace(0) 复位——
-    // 一高一缩的根因就是那两次调用，去掉以后窗口是稳的。
+    // 窗口高度不跟着气泡反复变（一高一缩就是以前抖动的根因）。
+    // 唯一例外：为了放下超长气泡，主进程把她整个人往下让过一截——那种情况必须还回去，
+    // 否则她会一直待在被挤下来的位置。shift=0 的普通气泡不收窗口。
+    if (state.bubbleShift > 0) {
+      state.bubbleShift = 0;
+      state.bubbleBand = 0;
+      state.bubbleWidth = 0;
+      void requestBubbleSpace({ band: 0, width: 0 });
+    }
   }
 
   // ── 生命周期 ───────────────────────────────────────────────────────────────
