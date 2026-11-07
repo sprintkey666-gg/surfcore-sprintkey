@@ -722,6 +722,20 @@
 
 **验证**：`node scripts/test-prompt-inject-mode.mjs`（含用 `git show pre-sync-0.6.22-sprintkey:src/bridge.js` 取旧源码做逐字对照）、`node scripts/test-persona-wake-injection.mjs`、`node plugins/surfcore/scripts/test-client-contract.mjs`；真机：设置页切换三档后，`GET /api/socialV2/persona-preview` 的 `lastWake.chars` 应随之变化。
 
+## 39. Sprintkey 设置页改成「卡片 → 点开专页」（2026-11-08）
+
+**为什么要有**：Sprintkey 扩展原来 9 个页签把几十行参数平铺在页面里，一屏塞不下、也看不出重点。主人要求「参考 QQ 侧回复速度那种设计：每个大设置项点进去弹出专门界面改参数」。
+
+**做法**：每个页签里只放一排卡片（`.qbw-cards` 网格），每张卡片 = 一个功能域（标题 + 一行摘要 + 说明），点开走 `SprintkeyArea` → `AreaModalCard` → `SettingsModal`（760px 宽、84vh 高、点遮罩关闭、底部「关闭」），里面才是真正的 `Row`/`Field` 控件。改完关掉弹层，回到页面底部点「保存」写入 `config.json`，与 QQ 侧完全一致（弹层里不做保存，避免半套状态）。
+
+**改动面**：`plugins/surfcore/lib/client.js` 的 `SprintkeyTab` —— 9 个 `Section` 内各包一个 `h("div", { className: "qbw-cards" }, …)`，共 21 张卡片（模型/思考强度/思考范围、唤醒注入四张、记忆系统四张、声线四张、跨会话两张、世界树两张、工具投递两张、投递上限一张、投递接口一张）。复用既有 `SprintkeyArea`（原本已在文件里、但没人用）。
+
+**顺带**：`GET /api/socialV2/persona-preview` 之前没进插件转发白名单，设置页显示「未放行的社交接口」—— 已在 `plugins/surfcore/lib/index.js` 的 `SOCIAL_V2_PROXY_GET` 里补上。
+
+**验证**：`node plugins/surfcore/scripts/test-client-contract.mjs`（页签 id 数组 / `h(SubTabs, { tabs: SPRINTKEY_PAGES` / 每页 `hidden: activePage !== "<id>"` / `socialV2.crossMemory.enabled` 只出现一次）、`test-ui-contrast.mjs`；真机重启 DSH 后进「Sprintkey 扩展」逐页点卡片。
+
+**顺手修的测试坑（重要）**：`scripts/test-pic-auto.mjs` 与 `scripts/test-pic-wiring.mjs` 里写死了默认安静时段 `01:00→07:00` 又用 `Date.now()` 当「现在」，**凌晨跑审计必然红**（凌晨 01:xx 实测红了 3 项，差点当成回归）。现在 `test-pic-auto` 用固定的下午三点时间戳、`test-pic-wiring` 的夹具把安静时段设成 `00:00→00:00`（`from==to` 即关闭）。以后写涉及时间窗的单测别用真实时钟。
+
 ## 新增功能时按这个格式补一条
 
 1. 在总表加一行（功能 / 入口 / 代码 / 配置键）；

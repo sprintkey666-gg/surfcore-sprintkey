@@ -9,6 +9,12 @@
 - 升级手册：**[docs/sprintkey/CUSTOM-FORK-UPGRADE.md](CUSTOM-FORK-UPGRADE.md)** —— 下次升级照它做
 - 我们自己的文档区：`docs/sprintkey/`（本日志、升级手册、以后的说明都放这里，不碰上游 `docs/*.md`）
 
+- **2026-11-08 01:00–01:45 · Sprintkey 设置页改成「卡片 → 点开专页」**
+  - 9 个页签（model / prompt / memory / voice / cross / tree / tools / limits / api）里平铺的几十行参数，改成每页一排卡片（21 张），点开用 `SprintkeyArea` + `SettingsModal` 在 760px 弹层里改，改完回页面底部「保存」——与 QQ 侧「回复速度」那套完全一致。
+  - 修掉 `GET /api/socialV2/persona-preview` 没进插件转发白名单导致的「未放行的社交接口」（`plugins/surfcore/lib/index.js` 的 `SOCIAL_V2_PROXY_GET`）。
+  - 修测试坑：`test-pic-auto` / `test-pic-wiring` 写死安静时段 `01:00→07:00` 又用真实时钟，凌晨跑审计必红；改成固定下午时间戳 / 夹具里 `00:00→00:00`（等长即关闭）。
+  - 验证：`test-audit` 173/174（唯一 `test-release-manifest` 是「提交后重生成」的老规矩）、插件链 40/42（红项为既有）。
+
 - **2026-11-07 23:10–2026-11-08 00:40 · 唤醒提示词注入方式可切换（card / trim / pointer）**
   - 触发：主人问「怎么新版本比旧版本更消耗 token」。实测同一轮唤醒 7,553 字里人格占 6,978 字（上游 v0.8.9 改成 `personaWakeBlockV2` 直接印整卡），升级前 p50 ≈ 10,839 字、升级后 ≈ 18,083 字（+67%）。
   - 做法：新增 `src/persona-wake-inject.js`（纯组装 + 归一化）；`bridge.js` 每轮现读 `persona.wakeInject` / `persona.wakeTrimChars`，新增只读接口 `GET /api/socialV2/persona-preview`（三档字数 + 最近一次唤醒体量）；Sprintkey 设置页新增「提示词注入」页签（三档下拉 + 缩卡上限 + 实时字数 + 前 300 字预览 + B站简报开关 + 人格注入上限）。

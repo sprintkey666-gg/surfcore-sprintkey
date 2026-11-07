@@ -2959,7 +2959,7 @@ ${body}`;
   // 社交 V2 的通用转发（设置页要看「共享记忆预览」「世界树统计」「记忆系统状态」）。
   // 只放行白名单里的几条，避免变成一个任意代理。
   // 自动发图（设置页「发图」tab）用 pic-status / pic-config / pic-pause / send-pic 四条。
-  const SOCIAL_V2_PROXY_GET = new Set(['/api/socialV2/memory-tree', '/api/socialV2/cross-memory', '/api/socialV2/memory/status', '/api/socialV2/memory-card-backup', '/api/socialV2/self-expression', '/api/socialV2/diary', '/api/socialV2/voice', '/api/socialV2/voice/preview', '/api/socialV2/prompt-preview', '/api/socialV2/pic-status', '/api/socialV2/friend-requests', '/api/socialV2/latency']);
+  const SOCIAL_V2_PROXY_GET = new Set(['/api/socialV2/memory-tree', '/api/socialV2/cross-memory', '/api/socialV2/memory/status', '/api/socialV2/memory-card-backup', '/api/socialV2/self-expression', '/api/socialV2/diary', '/api/socialV2/voice', '/api/socialV2/voice/preview', '/api/socialV2/prompt-preview', '/api/socialV2/persona-preview', '/api/socialV2/pic-status', '/api/socialV2/friend-requests', '/api/socialV2/latency']);
   const SOCIAL_V2_PROXY_POST = new Set(['/api/socialV2/memory-tree/grow', '/api/socialV2/memory-card-backup', '/api/socialV2/self-expression', '/api/socialV2/diary', '/api/socialV2/voice', '/api/socialV2/pic-config', '/api/socialV2/pic-pause', '/api/socialV2/send-pic', '/api/socialV2/friend-config', '/api/socialV2/friend-decide', '/api/socialV2/session']);
   async function handleSocialV2Proxy(req, res, url) {
     const target = url.pathname.slice(API_PREFIX.length); // /socialV2/...

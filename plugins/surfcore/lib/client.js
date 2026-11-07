@@ -111,6 +111,12 @@ window.__ModuleLoader__.load({
 .qbw-row[data-tip]{position:relative}
 .qbw-row[data-tip]:hover::after{content:attr(data-tip);position:absolute;left:0;top:100%;z-index:80;max-width:520px;margin-top:4px;padding:7px 9px;border-radius:8px;background:var(--qbw-surface);color:var(--qbw-text);border:1px solid var(--qbw-line);font-size:11.5px;line-height:16px;box-shadow:0 8px 24px rgba(0,0,0,.28);white-space:normal;pointer-events:none}
 .qbw-area-btn{position:relative}
+/* Sprintkey 页面的入口卡片网格：一页只放卡片，点进去改参数（2026-11-08） */
+.qbw-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:8px;margin:6px 0 4px}
+.qbw-area-cell .qbw-area-btn{margin:0;height:100%}
+.qbw-area-cell .qbw-area-btn .qbw-badge{max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.qbw-area-cell .qbw-hint{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+@media (max-width: 560px){.qbw-cards{grid-template-columns:1fr}}
 
 
 
@@ -577,14 +583,27 @@ select.qbw-select option{background:var(--qbw-surface);color:var(--qbw-text)}
         h("span", { className: "qbw-area-arrow" }, "›"));
     }
 
-    function AreaModalCard({ title, note, onSave, busy, children, badge }) {
+    function AreaModalCard({ title, note, onSave, busy, children, badge, closeLabel, footNote }) {
       const [open, setOpen] = useState(false);
       return h("div", null,
         h(AreaButton, { title, note, badge, onClick: () => setOpen(true) }),
-        open ? h(SettingsModal, { title, note, onClose: () => setOpen(false), onSave, busy }, children) : null);
+        open ? h(SettingsModal, { title, note, onClose: () => setOpen(false), onSave, busy, closeLabel, footNote }, children) : null);
     }
 
-    function SettingsModal({ title, note, onClose, onSave, busy, children }) {
+    // Sprintkey 扩展插件的设置入口：一页只放卡片，点进去在弹层里改（2026-11-08 主人要求，
+    // 和 QQ 侧「回复速度」等高级设置同一套交互）。关闭不落盘，回页面底部点「保存」才写 config.json。
+    function SprintkeyArea({ title, note, summary, children }) {
+      return h("div", { className: "qbw-area-cell" },
+        h(AreaModalCard, {
+          title,
+          note,
+          badge: summary,
+          closeLabel: "关闭",
+          footNote: "改完关掉，回页面底部点「保存」写入 config.json 后才生效。",
+        }, h("div", { className: "qbw-rows" }, children)));
+    }
+
+    function SettingsModal({ title, note, onClose, onSave, busy, children, closeLabel = "取消", footNote = "" }) {
       const [saving, setSaving] = useState(false);
       const save = async () => {
         if (!onSave) { onClose?.(); return; }
@@ -597,9 +616,10 @@ select.qbw-select option{background:var(--qbw-surface);color:var(--qbw-text)}
           h("h3", null, title),
           note ? h("p", { className: "qbw-hint" }, note) : null,
           h("div", { className: "qbw-settings-body" }, children),
+          footNote ? h("div", { className: "qbw-hint", style: { marginTop: "6px" } }, footNote) : null,
           h("div", { className: "qbw-actions qbw-settings-foot" },
             onSave ? h(Btn, { onClick: save, disabled: saving || !!busy }, saving || busy === "save" ? "保存中…" : "保存") : null,
-            h(Btn, { kind: "qbw-btn2", onClick: onClose, disabled: saving }, "取消"))));
+            h(Btn, { kind: "qbw-btn2", onClick: onClose, disabled: saving }, closeLabel))));
     }
 
     function Section({ title, note, children, defaultOpen = false, collapsible = true, hidden = false }) {
@@ -8134,266 +8154,297 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
       return h("div", null,
         h("div", { className: "qbw-infobox" }, "Sprintkey 自己的设置：扩展包启用/重载在「扩展」页；改完点底部「保存」，模型/投递这类再点「保存并重启 QQ 桥接」。"),
         h(SubTabs, { tabs: SPRINTKEY_PAGES, value: activePage, onChange: goPage }),
+        ...[
         h(Section, { title: "模型与思考强度", collapsible: false, hidden: activePage !== "model", note: "这些是「插件默认值」：新开的 QQ 会话用它。单个会话可以在会话里自己换成别的模型 / 档位，不受这里强制" },
-          h(Row, { label: "模型", hint: catalogState.loading ? "正在从 DSH 读取模型清单…" : (catalogState.error ? `读取失败：${catalogState.error}（可手动填 id）` : "从 DSH 当前公布的模型清单里选；换模型会顺带切 provider") },
-            modelChoices.length
-              ? h("select", {
-                  className: "qbw-select",
-                  value: currentModelId,
-                  onChange: (e) => {
-                    const hit = modelChoices.find((m) => m.id === e.target.value);
-                    if (hit) set(p("dsh.provider"), hit.provider);
-                    set(p("dsh.model"), e.target.value);
-                  },
-                },
-                  modelChoices.map((m) => h("option", { key: `${m.provider}/${m.id}`, value: m.id }, `${m.name}（${m.group}）`)))
-              : h("input", { className: "qbw-input", type: "text", value: dsh.model ?? "deepseek-flash", placeholder: "deepseek-flash", onChange: (e) => set(p("dsh.model"), e.target.value.trim() || "deepseek-flash") })),
-          h(Row, { label: "思考强度", hint: `跟着选中的模型走：${effortOptions.map((id) => effortLabels[id]?.name ? `${id}（${effortLabels[id].name}）` : id).join(" / ")}${currentModel?.defaultEffort ? ` · 该模型默认 ${currentModel.defaultEffort}` : ""}` },
-            h("select", { className: "qbw-select", value: dsh.reasoningEffort ?? "max", onChange: (e) => set(p("dsh.reasoningEffort"), e.target.value) },
-              effortOptions.map((id) => h("option", { key: id, value: id }, effortLabels[id]?.name ? `${id}（${effortLabels[id].name}）` : id)))),
-          h(Row, { label: "思考强度应用范围", hint: "只作用于思考强度；模型在任何模式下都可以按会话单独换" },
-            h("select", { className: "qbw-select", value: dsh.reasoningEffortMode ?? "session", onChange: (e) => set(p("dsh.reasoningEffortMode"), e.target.value) },
-              h("option", { value: "session" }, "各会话自定义（默认跟随这里，会话里可改）"),
-              h("option", { value: "all" }, "全部会话统一（强制这一档）"))),
-          h("div", { className: "qbw-hint" }, "改完点底部「保存」，再点「保存并重启 QQ 桥接」——桥接启动时才读这几个值；已在跑的会话下一条消息自动换。"),
-          h("div", { className: "qbw-hint" }, "会话内换模型/档位：让模型调 qq_set_reasoning_effort（传 model 换模型、传 effort 换档位、传 inherit 恢复跟随）；不知道有哪些模型时先 qq_get_model_catalog。")),
+          h("div", { className: "qbw-cards" },
+            h(SprintkeyArea, { title: "模型", note: "新会话默认用哪个模型；换模型会顺带切 provider", summary: `${dsh.model ?? "deepseek-flash"}${currentModel?.name ? ` · ${currentModel.name}` : ""}` },
+              h(Row, { label: "模型", hint: catalogState.loading ? "正在从 DSH 读取模型清单…" : (catalogState.error ? `读取失败：${catalogState.error}（可手动填 id）` : "从 DSH 当前公布的模型清单里选；换模型会顺带切 provider") },
+                modelChoices.length
+                  ? h("select", {
+                      className: "qbw-select",
+                      value: currentModelId,
+                      onChange: (e) => {
+                        const hit = modelChoices.find((m) => m.id === e.target.value);
+                        if (hit) set(p("dsh.provider"), hit.provider);
+                        set(p("dsh.model"), e.target.value);
+                      },
+                    },
+                      modelChoices.map((m) => h("option", { key: `${m.provider}/${m.id}`, value: m.id }, `${m.name}（${m.group}）`)))
+                  : h("input", { className: "qbw-input", type: "text", value: dsh.model ?? "deepseek-flash", placeholder: "deepseek-flash", onChange: (e) => set(p("dsh.model"), e.target.value.trim() || "deepseek-flash") }))),
+            h(SprintkeyArea, { title: "思考强度", note: "默认档位，以及允许不允许会话自己改", summary: `${dsh.reasoningEffort ?? "max"} · ${(dsh.reasoningEffortMode ?? "session") === "all" ? "全部会话统一" : "各会话自定义"}` },
+              h(Row, { label: "思考强度", hint: `跟着选中的模型走：${effortOptions.map((id) => effortLabels[id]?.name ? `${id}（${effortLabels[id].name}）` : id).join(" / ")}${currentModel?.defaultEffort ? ` · 该模型默认 ${currentModel.defaultEffort}` : ""}` },
+                h("select", { className: "qbw-select", value: dsh.reasoningEffort ?? "max", onChange: (e) => set(p("dsh.reasoningEffort"), e.target.value) },
+                  effortOptions.map((id) => h("option", { key: id, value: id }, effortLabels[id]?.name ? `${id}（${effortLabels[id].name}）` : id)))),
+              h(Row, { label: "思考强度应用范围", hint: "只作用于思考强度；模型在任何模式下都可以按会话单独换" },
+                h("select", { className: "qbw-select", value: dsh.reasoningEffortMode ?? "session", onChange: (e) => set(p("dsh.reasoningEffortMode"), e.target.value) },
+                  h("option", { value: "session" }, "各会话自定义（默认跟随这里，会话里可改）"),
+                  h("option", { value: "all" }, "全部会话统一（强制这一档）"))),
+              h("div", { className: "qbw-hint" }, "改完点底部「保存」，再点「保存并重启 QQ 桥接」——桥接启动时才读这几个值；已在跑的会话下一条消息自动换。")),
+            h(SprintkeyArea, { title: "会话里怎么换", note: "单个会话单独换模型 / 档位，不改这里的默认值", summary: "qq_set_reasoning_effort" },
+              h("div", { className: "qbw-hint" }, "让模型调 qq_set_reasoning_effort（传 model 换模型、传 effort 换档位、传 inherit 恢复跟随）；不知道有哪些模型时先 qq_get_model_catalog。"),
+              h("div", { className: "qbw-hint" }, "这里的三个值是「新会话默认值」，会话里改过的那个会话不受影响。")))),
         h(Section, { title: "提示词注入方式（省 token）", collapsible: false, hidden: activePage !== "prompt", note: "QQ 每条唤醒都会拼一大段提示词。这里只切换「人格卡怎么进提示词」——记忆卡、B站简报、本次消息快照都不受影响" },
-          h(Row, { label: "唤醒时怎么注入人格", hint: "切换即时生效：桥接每次拼唤醒词都现读配置，不用重启 DSH；已存在的 DSH 会话历史不会重写" },
-            h("select", {
-              className: "qbw-select",
-              value: personaWakeInject,
-              onChange: (e) => setUnified(p("persona.wakeInject"), e.target.value),
-            },
-              h("option", { value: "card" }, "新版整卡（0.8.9 原样）· 最完整，最费"),
-              h("option", { value: "trim" }, "折中缩卡（0.8.9 新增，旧版没有）· 人设保留、按字数截短"),
-              h("option", { value: "pointer" }, "真·旧版指针（0.6.22 原样）· 最省，但她要自己查 qq_get_prompt"))),
-          h(Row, { label: "缩卡上限（字）", hint: "只在「折中缩卡」档生效；800~6000，默认 2500。整卡档吃「人格注入上限」，指针档不用上限" },
-            h("input", {
-              className: "qbw-input", type: "number", min: 800, max: 6000,
-              value: personaWakeTrimChars, disabled: personaWakeInject !== "trim",
-              onChange: (e) => setUnified(p("persona.wakeTrimChars"), Math.min(6000, Math.max(800, Math.round(Number(e.target.value) || 2500)))),
-            })),
-          h(Row, { label: "实测体量", hint: personaPreview.loading ? "正在问桥接…" : (personaPreview.error ? `桥接没响应：${personaPreview.error}` : "来自 GET /socialV2/persona-preview；「最近一次唤醒」是桥接内存里的真实长度") },
-            h("button", { className: "qbw-btn", type: "button", onClick: loadPersonaPreview }, "重新量一次")),
-          h("div", { className: "qbw-hint" }, personaPreview.loading
-            ? "正在读取…"
-            : (personaPreview.data?.ok
-              ? `整卡 ≈ ${personaPreview.data.card?.chars ?? "—"} 字 · 缩卡（${personaPreview.data.wakeTrimChars}）≈ ${personaPreview.data.trim?.chars ?? "—"} 字 · 指针 ≈ ${personaPreview.data.pointer?.chars ?? "—"} 字；换成指针每条省 ≈ ${personaPreview.data.saving?.chars ?? "—"} 字（≈${personaPreview.data.saving?.tokensEstimate ?? "—"} tokens）${personaPreview.data.lastWake ? `｜最近一次唤醒 ${personaPreview.data.lastWake.chars} 字（${personaPreview.data.lastWake.inject}）` : ""}`
-              : `暂不可用：${personaPreview.error || "桥接没在跑"}`)),
-          personaPreview.data?.ok ? h("details", null,
-            h("summary", { className: "qbw-label", style: { cursor: "pointer" } }, "看看这一档实际注入的人格卡（前 300 字）"),
-            h("pre", { className: "qbw-code", style: { whiteSpace: "pre-wrap", maxHeight: "220px", overflow: "auto" } },
-              personaPreview.data?.[personaWakeInject]?.preview || personaPreview.data?.card?.preview || "")) : null,
-          h("div", { className: "qbw-hint" }, "对照（2026-11-07 实测 session-40f35dc1）：整卡那一轮唤醒 7,553 字（人格段 6,978 字）→ 指针约 575 字；缩卡 2500 约 3,100 字。一天几十条，差的是十几万到几十万 tokens。"),
-          h(Row, { label: "B站记忆简报", hint: "每次唤醒约 4.3k 字；和上面那个开关不是一件事，关掉只影响 B站 简报（走 QQ config.json）" },
-            h("input", { className: "qbw-switch", type: "checkbox", checked: biliMemoryEnabled, onChange: (e) => set(p("biliBridge.memory.enabled"), e.target.checked) })),
-          h(Row, { label: "人格注入上限（字）", hint: "只在整卡档生效（role.maxInjectChars，1000~20000，默认 6000）；指针档完全不用它" },
-            h("input", { className: "qbw-input", type: "number", min: 1000, max: 20000, value: roleMaxInjectChars, onChange: (e) => set(p("role.maxInjectChars"), Math.min(20000, Math.max(1000, Math.round(Number(e.target.value) || 6000)))) })),
-          h("div", { className: "qbw-hint" }, "改完点底部「保存」。注入方式每轮现读，保存后下一轮唤醒就是新形态；页签本身是插件前端，装了新版本要重启一次 DSH 才会出现。")),
-        h(Section, { title: "记忆系统", collapsible: false, hidden: activePage !== "memory", note: "会话记忆 / 跨会话共享 / 世界树三层怎么注入，在这里统一切换；记忆卡固定整卡注入" },
-          h(Row, { label: "记忆引擎", hint: "只影响会话记忆的衰减与呈现，不改动写入" },
-            h("select", { className: "qbw-select", value: memoryCfg.engine, onChange: (e) => set(p("socialV2.memory.engine"), e.target.value) },
-              h("option", { value: "curve" }, "Sprintkey 记忆曲线"),
-              h("option", { value: "legacy" }, "插件原有规则"))),
-          h(Row, { label: "跨会话共享", hint: "开 = 主人环内双向带；关 = 只看本会话，本会话记忆照常读写，不删除任何东西" },
-            h(Btn, { kind: "qbw-btn2", onClick: () => goPage("cross") }, "去「跨会话共享」页调")),
-          h(Row, { label: "三层总额度（字）", hint: `当前 ${memoryCfg.injectMaxChars}；会话记忆 + 共享 + 世界树共用；记忆卡整卡注入不占这个额度，默认 4000，最高 10000` },
-            h("input", {
-              className: "qbw-input", type: "number", min: 800, max: 10000, value: memoryCfg.injectMaxChars,
-              onChange: (e) => set(p("socialV2.memory.injectMaxChars"), Math.min(10000, Math.max(800, Math.round(Number(e.target.value) || 4000)))),
-            })),
-          h(Row, { label: "当前状态", hint: memStatus.loading ? "正在读取…" : (memStatus.error ? `不可用：${memStatus.error}` : "只读状态，来自桥接实时统计") },
-            h("button", { className: "qbw-btn", type: "button", onClick: loadMemStatus }, "刷新")),
-          h("div", { className: "qbw-hint" }, memStatusText),
-          h("div", { className: "qbw-hint" }, "记忆卡固定整卡注入；改完点底部「保存」写入 config.json，再点「保存并重启 QQ 桥接」才生效。")),
-        h(Section, { title: "全量记忆卡 + 聊天存档（本地 + QQ）", collapsible: false, hidden: activePage !== "memory", note: "全量卡镜像 + 每条聊天原文（QQ 私聊/群聊 + 桌宠/字幕，按 channel 区分、同目录分文件）。存档不压缩、不删除，单文件满上限自动换新文件；发送只认 config.json 里的主人 QQ，不发群" },
-          h(Row, { label: "启用备份", hint: "开 = 按间隔自动把全量卡镜像到备份目录；关 = 只保留手动备份" },
-            h("input", { className: "qbw-switch", type: "checkbox", checked: backupCfg.enabled, onChange: (e) => set(p("socialV2.memoryCardBackup.enabled"), e.target.checked) })),
-          h(Row, { label: "备份目录", hint: backupCfg.dir ? "当前草稿路径；留空 = 用默认目录" : "留空 = 用默认目录（路径由桥接按当前角色算）" },
-            h("div", { style: { display: "flex", gap: "8px", alignItems: "center" } },
-              h("input", {
-                className: "qbw-input", type: "text", value: backupCfg.dir,
-                placeholder: backupData?.dir || "默认：<.dsh>\\surfcore\\memory-backups\\<角色ID>",
-                onChange: (e) => set(p("socialV2.memoryCardBackup.dir"), e.target.value),
-              }),
-              h(Btn, {
-                kind: "qbw-btn2",
-                onClick: async () => {
-                  const r = await browseNative("dir", "选择全量记忆卡备份目录").catch((e) => ({ ok: false, error: e.message }));
-                  if (r.ok && r.path) set(p("socialV2.memoryCardBackup.dir"), String(r.path));
-                  else if (!r.cancelled) toast(String(r.error || "打不开选择框，请手动填写"));
+          h("div", { className: "qbw-cards" },
+            h(SprintkeyArea, { title: "人格注入方式", note: "三档：整卡 / 缩卡 / 指针；切完下一轮唤醒就生效", summary: `${personaWakeInject === "card" ? "整卡" : personaWakeInject === "trim" ? `缩卡 ${personaWakeTrimChars}` : "指针"} · ${personaWakeInject}` },
+              h(Row, { label: "唤醒时怎么注入人格", hint: "切换即时生效：桥接每次拼唤醒词都现读配置，不用重启 DSH；已存在的 DSH 会话历史不会重写" },
+                h("select", {
+                  className: "qbw-select",
+                  value: personaWakeInject,
+                  onChange: (e) => setUnified(p("persona.wakeInject"), e.target.value),
                 },
-              }, "浏览…"))),
-          h(Row, { label: "同步间隔（天）", hint: "默认 1 天；关机错过的，下次启动 15 秒后补一次" },
-            h("input", { className: "qbw-input", type: "number", min: 1, max: 365, value: backupCfg.syncEveryDays, onChange: (e) => set(p("socialV2.memoryCardBackup.syncEveryDays"), Math.min(365, Math.max(1, Math.round(Number(e.target.value) || 1)))) })),
-          h(Row, { label: "发送到主人 QQ", hint: "开 = 按间隔把全量卡私聊给主人；只发给 admin.qq / ownerQQ，不发群" },
-            h("input", { className: "qbw-switch", type: "checkbox", checked: backupCfg.sendEnabled, onChange: (e) => set(p("socialV2.memoryCardBackup.send.enabled"), e.target.checked) })),
-          h(Row, { label: "每次发送全部记忆文件", hint: "开 = 每次把全量卡 + 全部聊天存档都发给主人；关 = 只发新增/追加的存档（全量卡仍每次发）" },
-            h("input", { className: "qbw-switch", type: "checkbox", checked: backupCfg.fullArchive, onChange: (e) => set(p("socialV2.memoryCardBackup.send.fullArchive"), e.target.checked) })),
-          h(Row, { label: "发送间隔（天）", hint: "默认 7 天；QQ 不在线不算失败，上线后自动补发" },
-            h("input", { className: "qbw-input", type: "number", min: 1, max: 365, value: backupCfg.sendEveryDays, onChange: (e) => set(p("socialV2.memoryCardBackup.send.everyDays"), Math.min(365, Math.max(1, Math.round(Number(e.target.value) || 7)))) })),
-          h(Row, { label: "单次发送上限（MB）", hint: "超过上限的单个文件不发送（不会偷偷压缩），默认 90" },
-            h("input", { className: "qbw-input", type: "number", min: 1, max: 100, value: backupCfg.maxSendMB, onChange: (e) => set(p("socialV2.memoryCardBackup.send.maxSendMB"), Math.min(100, Math.max(1, Math.round(Number(e.target.value) || 90)))) })),
-          h(Row, { label: "启用聊天全量存档", hint: "开 = 每条私聊/群聊原文都写到备份目录；关 = 只保留全量卡镜像。默认开" },
-            h("input", { className: "qbw-switch", type: "checkbox", checked: backupCfg.archiveEnabled, onChange: (e) => set(p("socialV2.memoryCardBackup.archive.enabled"), e.target.checked) })),
-          h(Row, { label: "聊天单文件上限（MB）", hint: `当前 ${backupCfg.archiveMaxFileMB}；一个文件写到上限就新建下一个，不压缩、不删除（1~512）` },
-            h("input", { className: "qbw-input", type: "number", min: 1, max: 512, value: backupCfg.archiveMaxFileMB, onChange: (e) => set(p("socialV2.memoryCardBackup.archive.maxFileMB"), Math.min(512, Math.max(1, Math.round(Number(e.target.value) || 16)))) })),
-          h(Row, { label: "立即执行", hint: `手动执行不受开关限制；备份读源文件，发送 = 全量卡 + ${backupCfg.fullArchive ? "全部" : "未发送的"}聊天存档` },
-            h("div", { style: { display: "flex", gap: "8px", flexWrap: "wrap" } },
-              h("button", { className: "qbw-btn2", type: "button", disabled: Boolean(backupBusy), onClick: () => runBackupAction("backup") }, backupBusy === "backup" ? "备份中…" : "立即备份"),
-              h("button", { className: "qbw-btn2", type: "button", disabled: Boolean(backupBusy), onClick: () => runBackupAction("send") }, backupBusy === "send" ? "发送中…" : "立即发送"),
-              h("button", { className: "qbw-btn", type: "button", onClick: loadBackupStatus }, "刷新"))),
-          h("div", { className: "qbw-hint" }, backupLine),
-          h("div", { className: "qbw-hint" }, archiveLine),
-          h("div", { className: "qbw-hint" }, `备份目录：${backupData?.dir || "尚未生成（保存后由桥接计算）"}${backupState.lastBackupError ? ` · 上次备份失败：${backupState.lastBackupError}` : ""}${backupState.lastSendError ? ` · 发送状态：${backupState.lastSendError}` : ""}`),
-          h("div", { className: "qbw-hint" }, "开关和间隔改完点底部「保存」写入 config.json；备份设置约 1 分钟内生效，不需要重启桥接。")),
+                  h("option", { value: "card" }, "新版整卡（0.8.9 原样）· 最完整，最费"),
+                  h("option", { value: "trim" }, "折中缩卡（0.8.9 新增，旧版没有）· 人设保留、按字数截短"),
+                  h("option", { value: "pointer" }, "真·旧版指针（0.6.22 原样）· 最省，但她要自己查 qq_get_prompt"))),
+              h(Row, { label: "缩卡上限（字）", hint: "只在「折中缩卡」档生效；800~6000，默认 2500。整卡档吃「人格注入上限」，指针档不用上限" },
+                h("input", {
+                  className: "qbw-input", type: "number", min: 800, max: 6000,
+                  value: personaWakeTrimChars, disabled: personaWakeInject !== "trim",
+                  onChange: (e) => setUnified(p("persona.wakeTrimChars"), Math.min(6000, Math.max(800, Math.round(Number(e.target.value) || 2500)))),
+                }))),
+            h(SprintkeyArea, { title: "实测体量", note: "三档各自多少字、最近一条唤醒实际多长", summary: personaPreview.data?.ok ? `整卡 ${personaPreview.data.card?.chars ?? "—"} 字` : (personaPreview.loading ? "正在量…" : "点开量一次") },
+              h(Row, { label: "实测体量", hint: personaPreview.loading ? "正在问桥接…" : (personaPreview.error ? `桥接没响应：${personaPreview.error}` : "来自 GET /socialV2/persona-preview；「最近一次唤醒」是桥接内存里的真实长度") },
+                h("button", { className: "qbw-btn", type: "button", onClick: loadPersonaPreview }, "重新量一次")),
+              h("div", { className: "qbw-hint" }, personaPreview.loading
+                ? "正在读取…"
+                : (personaPreview.data?.ok
+                  ? `整卡 ≈ ${personaPreview.data.card?.chars ?? "—"} 字 · 缩卡（${personaPreview.data.wakeTrimChars}）≈ ${personaPreview.data.trim?.chars ?? "—"} 字 · 指针 ≈ ${personaPreview.data.pointer?.chars ?? "—"} 字；换成指针每条省 ≈ ${personaPreview.data.saving?.chars ?? "—"} 字（≈${personaPreview.data.saving?.tokensEstimate ?? "—"} tokens）${personaPreview.data.lastWake ? `｜最近一次唤醒 ${personaPreview.data.lastWake.chars} 字（${personaPreview.data.lastWake.inject}）` : ""}`
+                  : `暂不可用：${personaPreview.error || "桥接没在跑"}`)),
+              personaPreview.data?.ok ? h("details", null,
+                h("summary", { className: "qbw-label", style: { cursor: "pointer" } }, "看看这一档实际注入的人格卡（前 300 字）"),
+                h("pre", { className: "qbw-code", style: { whiteSpace: "pre-wrap", maxHeight: "220px", overflow: "auto" } },
+                  personaPreview.data?.[personaWakeInject]?.preview || personaPreview.data?.card?.preview || "")) : null,
+              h("div", { className: "qbw-hint" }, "对照（2026-11-07 实测 session-40f35dc1）：整卡那一轮唤醒 7,553 字（人格段 6,978 字）→ 指针约 575 字；缩卡 2500 约 3,100 字。一天几十条，差的是十几万到几十万 tokens。")),
+            h(SprintkeyArea, { title: "其他省 token 旋钮", note: "B站记忆简报、人格注入上限", summary: `B站简报 ${biliMemoryEnabled ? "开" : "关"} · 上限 ${roleMaxInjectChars}` },
+              h(Row, { label: "B站记忆简报", hint: "每次唤醒约 4.3k 字；和上面那个开关不是一件事，关掉只影响 B站 简报（走 QQ config.json）" },
+                h("input", { className: "qbw-switch", type: "checkbox", checked: biliMemoryEnabled, onChange: (e) => set(p("biliBridge.memory.enabled"), e.target.checked) })),
+              h(Row, { label: "人格注入上限（字）", hint: "只在整卡档生效（role.maxInjectChars，1000~20000，默认 6000）；指针档完全不用它" },
+                h("input", { className: "qbw-input", type: "number", min: 1000, max: 20000, value: roleMaxInjectChars, onChange: (e) => set(p("role.maxInjectChars"), Math.min(20000, Math.max(1000, Math.round(Number(e.target.value) || 6000)))) })),
+              h("div", { className: "qbw-hint" }, "改完点底部「保存」。注入方式每轮现读，保存后下一轮唤醒就是新形态；页签本身是插件前端，装了新版本要重启一次 DSH 才会出现。")))),
+        h(Section, { title: "记忆系统", collapsible: false, hidden: activePage !== "memory", note: "会话记忆 / 跨会话共享 / 世界树三层怎么注入，在这里统一切换；记忆卡固定整卡注入" },
+          h("div", { className: "qbw-cards" },
+            h(SprintkeyArea, { title: "三层记忆注入", note: "会话记忆走哪套规则、三层加起来多少字", summary: `${memoryCfg.engine === "legacy" ? "插件原有规则" : "记忆曲线"} · ${memoryCfg.injectMaxChars} 字` },
+              h(Row, { label: "记忆引擎", hint: "只影响会话记忆的衰减与呈现，不改动写入" },
+                h("select", { className: "qbw-select", value: memoryCfg.engine, onChange: (e) => set(p("socialV2.memory.engine"), e.target.value) },
+                  h("option", { value: "curve" }, "Sprintkey 记忆曲线"),
+                  h("option", { value: "legacy" }, "插件原有规则"))),
+              h(Row, { label: "三层总额度（字）", hint: `当前 ${memoryCfg.injectMaxChars}；会话记忆 + 共享 + 世界树共用；记忆卡整卡注入不占这个额度，默认 4000，最高 10000` },
+                h("input", {
+                  className: "qbw-input", type: "number", min: 800, max: 10000, value: memoryCfg.injectMaxChars,
+                  onChange: (e) => set(p("socialV2.memory.injectMaxChars"), Math.min(10000, Math.max(800, Math.round(Number(e.target.value) || 4000)))),
+                })),
+              h(Row, { label: "跨会话共享", hint: "开 = 主人环内双向带；关 = 只看本会话，本会话记忆照常读写，不删除任何东西" },
+                h(Btn, { kind: "qbw-btn2", onClick: () => goPage("cross") }, "去「跨会话共享」页调")),
+              h(Row, { label: "当前状态", hint: memStatus.loading ? "正在读取…" : (memStatus.error ? `不可用：${memStatus.error}` : "只读状态，来自桥接实时统计") },
+                h("button", { className: "qbw-btn", type: "button", onClick: loadMemStatus }, "刷新")),
+              h("div", { className: "qbw-hint" }, memStatusText),
+              h("div", { className: "qbw-hint" }, "记忆卡固定整卡注入；改完点底部「保存」写入 config.json，再点「保存并重启 QQ 桥接」才生效。")),
+            h(SprintkeyArea, { title: "全量卡备份", note: "把全量记忆卡镜像到本地目录", summary: `${backupCfg.enabled ? "开" : "关"} · 每 ${backupCfg.syncEveryDays} 天` },
+              h(Row, { label: "启用备份", hint: "开 = 按间隔自动把全量卡镜像到备份目录；关 = 只保留手动备份" },
+                h("input", { className: "qbw-switch", type: "checkbox", checked: backupCfg.enabled, onChange: (e) => set(p("socialV2.memoryCardBackup.enabled"), e.target.checked) })),
+              h(Row, { label: "备份目录", hint: backupCfg.dir ? "当前草稿路径；留空 = 用默认目录" : "留空 = 用默认目录（路径由桥接按当前角色算）" },
+                h("div", { style: { display: "flex", gap: "8px", alignItems: "center" } },
+                  h("input", {
+                    className: "qbw-input", type: "text", value: backupCfg.dir,
+                    placeholder: backupData?.dir || "默认：<.dsh>\\surfcore\\memory-backups\\<角色ID>",
+                    onChange: (e) => set(p("socialV2.memoryCardBackup.dir"), e.target.value),
+                  }),
+                  h(Btn, {
+                    kind: "qbw-btn2",
+                    onClick: async () => {
+                      const r = await browseNative("dir", "选择全量记忆卡备份目录").catch((e) => ({ ok: false, error: e.message }));
+                      if (r.ok && r.path) set(p("socialV2.memoryCardBackup.dir"), String(r.path));
+                      else if (!r.cancelled) toast(String(r.error || "打不开选择框，请手动填写"));
+                    },
+                  }, "浏览…"))),
+              h(Row, { label: "同步间隔（天）", hint: "默认 1 天；关机错过的，下次启动 15 秒后补一次" },
+                h("input", { className: "qbw-input", type: "number", min: 1, max: 365, value: backupCfg.syncEveryDays, onChange: (e) => set(p("socialV2.memoryCardBackup.syncEveryDays"), Math.min(365, Math.max(1, Math.round(Number(e.target.value) || 1)))) }))),
+            h(SprintkeyArea, { title: "发到主人 QQ", note: "按间隔把全量卡私聊给主人；只发给 admin.qq / ownerQQ，不发群", summary: `${backupCfg.sendEnabled ? "开" : "关"} · 每 ${backupCfg.sendEveryDays} 天` },
+              h(Row, { label: "发送到主人 QQ", hint: "开 = 按间隔把全量卡私聊给主人；只发给 admin.qq / ownerQQ，不发群" },
+                h("input", { className: "qbw-switch", type: "checkbox", checked: backupCfg.sendEnabled, onChange: (e) => set(p("socialV2.memoryCardBackup.send.enabled"), e.target.checked) })),
+              h(Row, { label: "每次发送全部记忆文件", hint: "开 = 每次把全量卡 + 全部聊天存档都发给主人；关 = 只发新增/追加的存档（全量卡仍每次发）" },
+                h("input", { className: "qbw-switch", type: "checkbox", checked: backupCfg.fullArchive, onChange: (e) => set(p("socialV2.memoryCardBackup.send.fullArchive"), e.target.checked) })),
+              h(Row, { label: "发送间隔（天）", hint: "默认 7 天；QQ 不在线不算失败，上线后自动补发" },
+                h("input", { className: "qbw-input", type: "number", min: 1, max: 365, value: backupCfg.sendEveryDays, onChange: (e) => set(p("socialV2.memoryCardBackup.send.everyDays"), Math.min(365, Math.max(1, Math.round(Number(e.target.value) || 7)))) })),
+              h(Row, { label: "单次发送上限（MB）", hint: "超过上限的单个文件不发送（不会偷偷压缩），默认 90" },
+                h("input", { className: "qbw-input", type: "number", min: 1, max: 100, value: backupCfg.maxSendMB, onChange: (e) => set(p("socialV2.memoryCardBackup.send.maxSendMB"), Math.min(100, Math.max(1, Math.round(Number(e.target.value) || 90)))) }))),
+            h(SprintkeyArea, { title: "聊天存档 + 立即执行", note: "每条私聊/群聊原文都落盘；也能手动跑一次备份或发送", summary: `${backupCfg.archiveEnabled ? "存档中" : "存档关"} · ${backupCfg.archiveMaxFileMB} MB/文件` },
+              h(Row, { label: "启用聊天全量存档", hint: "开 = 每条私聊/群聊原文都写到备份目录；关 = 只保留全量卡镜像。默认开" },
+                h("input", { className: "qbw-switch", type: "checkbox", checked: backupCfg.archiveEnabled, onChange: (e) => set(p("socialV2.memoryCardBackup.archive.enabled"), e.target.checked) })),
+              h(Row, { label: "聊天单文件上限（MB）", hint: `当前 ${backupCfg.archiveMaxFileMB}；一个文件写到上限就新建下一个，不压缩、不删除（1~512）` },
+                h("input", { className: "qbw-input", type: "number", min: 1, max: 512, value: backupCfg.archiveMaxFileMB, onChange: (e) => set(p("socialV2.memoryCardBackup.archive.maxFileMB"), Math.min(512, Math.max(1, Math.round(Number(e.target.value) || 16)))) })),
+              h(Row, { label: "立即执行", hint: `手动执行不受开关限制；备份读源文件，发送 = 全量卡 + ${backupCfg.fullArchive ? "全部" : "未发送的"}聊天存档` },
+                h("div", { style: { display: "flex", gap: "8px", flexWrap: "wrap" } },
+                  h("button", { className: "qbw-btn2", type: "button", disabled: Boolean(backupBusy), onClick: () => runBackupAction("backup") }, backupBusy === "backup" ? "备份中…" : "立即备份"),
+                  h("button", { className: "qbw-btn2", type: "button", disabled: Boolean(backupBusy), onClick: () => runBackupAction("send") }, backupBusy === "send" ? "发送中…" : "立即发送"),
+                  h("button", { className: "qbw-btn", type: "button", onClick: loadBackupStatus }, "刷新"))),
+              h("div", { className: "qbw-hint" }, backupLine),
+              h("div", { className: "qbw-hint" }, archiveLine),
+              h("div", { className: "qbw-hint" }, `备份目录：${backupData?.dir || "尚未生成（保存后由桥接计算）"}${backupState.lastBackupError ? ` · 上次备份失败：${backupState.lastBackupError}` : ""}${backupState.lastSendError ? ` · 发送状态：${backupState.lastSendError}` : ""}`),
+              h("div", { className: "qbw-hint" }, "开关和间隔改完点底部「保存」写入 config.json；备份设置约 1 分钟内生效，不需要重启桥接。")))),
         h(Section, { title: "声线（群聊/私聊同一个人）", collapsible: false, hidden: activePage !== "voice", note: "每轮唤醒都带「人设锚 + 你自己说过的原话」，群聊再多一条私下节奏；不再只靠记忆撑人设" },
-          h(Row, { label: "注入声线", hint: "关 = 回到只带角色名；开 = 群聊和私聊都用同一套说话方式" },
-            h("input", { className: "qbw-switch", type: "checkbox", checked: voiceCfg.enabled, onChange: (e) => set(p("socialV2.voiceProfile.enabled"), e.target.checked) })),
-          h(Row, { label: "原文样本条数", hint: `当前 ${voiceCfg.maxSamples}；越多越像，也越占上下文（1~10）` },
-            h("input", {
-              className: "qbw-input", type: "number", min: 1, max: 10, value: voiceCfg.maxSamples,
-              onChange: (e) => set(p("socialV2.voiceProfile.maxSamples"), Math.min(10, Math.max(1, Math.round(Number(e.target.value) || 6)))),
-            })),
-          h(Row, { label: "声线字数预算", hint: `当前 ${voiceCfg.maxChars}；样本 + 人设锚一共占多少字（120~1200）` },
-            h("input", {
-              className: "qbw-input", type: "number", min: 120, max: 1200, value: voiceCfg.maxChars,
-              onChange: (e) => set(p("socialV2.voiceProfile.maxChars"), Math.min(1200, Math.max(120, Math.round(Number(e.target.value) || 480)))),
-            })),
-          h(Row, { label: "群聊带「私下节奏」", hint: "开 = 群里额外补一条你私下说话的句子，让语气不那么客气" },
-            h("input", { className: "qbw-switch", type: "checkbox", checked: voiceCfg.groupAnchor, onChange: (e) => set(p("socialV2.voiceProfile.groupAnchor"), e.target.checked) })),
-          h(Row, { label: "自动学习原话", hint: "开 = 每次你发出去的话都算样本（路径/链接/报错会被自动过滤）" },
-            h("input", { className: "qbw-switch", type: "checkbox", checked: voiceCfg.autoMine, onChange: (e) => set(p("socialV2.voiceProfile.autoMine"), e.target.checked) })),
-          h(Row, { label: "对答样本", hint: "开 = 从聊天记录里挖「对方说什么 → 你怎么回」，只有句式没有上下文，最能压住客服腔" },
-            h("input", { className: "qbw-switch", type: "checkbox", checked: voiceCfg.pairs, onChange: (e) => set(p("socialV2.voiceProfile.pairs"), e.target.checked) })),
-          h(Row, { label: "末尾声线 gate", hint: "开 = 整段 prompt 的最末尾再补三行「就这样说话」（顶部的声音会被后面的流程指令压掉）" },
-            h("input", { className: "qbw-switch", type: "checkbox", checked: voiceCfg.tail, onChange: (e) => set(p("socialV2.voiceProfile.tail"), e.target.checked) })),
-          h(Row, { label: "末尾只给群聊", hint: "开 = 私聊不加末尾（私聊本来就够像），群聊才补" },
-            h("input", { className: "qbw-switch", type: "checkbox", checked: voiceCfg.tailGroupOnly, onChange: (e) => set(p("socialV2.voiceProfile.tailGroupOnly"), e.target.checked) })),
-          h(Row, { label: "看一眼现在的声线", hint: "拉一段真实的声线注入文本；导出的整段 prompt 落在 state/prompt-dump/ 里" },
-            h("button", {
-              className: "qbw-btn", type: "button",
-              onClick: async () => {
-                setVoicePreview({ loading: true, text: "", error: "" });
-                try {
-                  const r = await api("/socialV2/voice/preview");
-                  const text = [r.voice || "", r.anchor || "", r.tail || ""].filter(Boolean).join("\n");
-                  setVoicePreview({ loading: false, text: text || "（当前没有可注入的声线）", error: "" });
-                } catch (e) {
-                  setVoicePreview({ loading: false, text: "", error: String(e?.message ?? e) });
-                }
-              },
-            }, "看声线"),
-            h("button", {
-              className: "qbw-btn", type: "button",
-              onClick: async () => {
-                try {
-                  const r = await api("/socialV2/prompt-preview");
-                  toast(`已导出：${r.file || "(未知路径)"}（${r.chars || 0} 字）`);
-                } catch (e) {
-                  toast(`导出失败：${String(e?.message ?? e)}`);
-                }
-              },
-            }, "导出整段 prompt")),
-          voicePreview.error ? h("div", { className: "qbw-hint" }, `预览失败：${voicePreview.error}`) : null,
-          voicePreview.loading ? h("div", { className: "qbw-hint" }, "正在组装…") : null,
-          voicePreview.text ? h("pre", { className: "qbw-code", style: { whiteSpace: "pre-wrap", maxHeight: "260px", overflow: "auto" } }, voicePreview.text) : null,
-          h(Row, { label: "当前状态", hint: voiceStatus.loading ? "正在读取…" : (voiceStatus.error ? `不可用：${voiceStatus.error}` : "只读状态，来自桥接实时统计") },
-            h("button", { className: "qbw-btn", type: "button", onClick: loadVoiceStatus }, "刷新")),
-          h("div", { className: "qbw-hint" }, voiceStatusText),
-          (voiceData?.samples || []).slice(0, 8).map((sample) => h("div", { className: "qbw-hint", key: sample.id },
-            `「${sample.text}」 · 权重 ${sample.weight ?? "-"} · `,
-            h("button", {
-              className: "qbw-btn", type: "button",
-              onClick: async () => { try { await api("/socialV2/voice", { method: "POST", body: { action: "remove", id: sample.id } }); await loadVoiceStatus(); toast("已移出这条样本"); } catch (e) { toast(`删除失败：${String(e?.message ?? e)}`); } },
-            }, "不用这条"))),
-          h(Row, { label: "手动补一句", hint: "觉得哪句特别像你，就贴进来（4~60 字最合适）" },
-            h("input", { className: "qbw-input", type: "text", value: voiceDraft, placeholder: "例：行吧，你开心就好", onChange: (e) => setVoiceDraft(e.target.value) }),
-            h("button", {
-              className: "qbw-btn", type: "button",
-              onClick: async () => {
-                const text = String(voiceDraft || "").trim();
-                if (!text) { toast("先写一句"); return; }
-                try {
-                  const r = await api("/socialV2/voice", { method: "POST", body: { action: "note", text } });
-                  toast(r?.added ? "已入库" : "这句被过滤了（含路径/链接/报错时）");
-                  setVoiceDraft("");
-                  await loadVoiceStatus();
-                } catch (e) { toast(`添加失败：${String(e?.message ?? e)}`); }
-              },
-            }, "加入")),
-          h("div", { className: "qbw-hint" }, "开关改完点底部「保存」，再「保存并重启 QQ 桥接」；样本增删立即生效，不用重启。")),
-
+          h("div", { className: "qbw-cards" },
+            h(SprintkeyArea, { title: "注入与预算", note: "开不开、带几条原话、一共占多少字", summary: `${voiceCfg.enabled ? "开" : "关"} · ${voiceCfg.maxSamples} 条 / ${voiceCfg.maxChars} 字` },
+              h(Row, { label: "注入声线", hint: "关 = 回到只带角色名；开 = 群聊和私聊都用同一套说话方式" },
+                h("input", { className: "qbw-switch", type: "checkbox", checked: voiceCfg.enabled, onChange: (e) => set(p("socialV2.voiceProfile.enabled"), e.target.checked) })),
+              h(Row, { label: "原文样本条数", hint: `当前 ${voiceCfg.maxSamples}；越多越像，也越占上下文（1~10）` },
+                h("input", {
+                  className: "qbw-input", type: "number", min: 1, max: 10, value: voiceCfg.maxSamples,
+                  onChange: (e) => set(p("socialV2.voiceProfile.maxSamples"), Math.min(10, Math.max(1, Math.round(Number(e.target.value) || 6)))),
+                })),
+              h(Row, { label: "声线字数预算", hint: `当前 ${voiceCfg.maxChars}；样本 + 人设锚一共占多少字（120~1200）` },
+                h("input", {
+                  className: "qbw-input", type: "number", min: 120, max: 1200, value: voiceCfg.maxChars,
+                  onChange: (e) => set(p("socialV2.voiceProfile.maxChars"), Math.min(1200, Math.max(120, Math.round(Number(e.target.value) || 480)))),
+                }))),
+            h(SprintkeyArea, { title: "语气细节", note: "私下节奏、自动学原话、对答样本、末尾 gate", summary: `${voiceCfg.pairs ? "对答样本 ✓" : "无对答"} · ${voiceCfg.tail ? "末尾 gate ✓" : "无末尾 gate"}` },
+              h(Row, { label: "群聊带「私下节奏」", hint: "开 = 群里额外补一条你私下说话的句子，让语气不那么客气" },
+                h("input", { className: "qbw-switch", type: "checkbox", checked: voiceCfg.groupAnchor, onChange: (e) => set(p("socialV2.voiceProfile.groupAnchor"), e.target.checked) })),
+              h(Row, { label: "自动学习原话", hint: "开 = 每次你发出去的话都算样本（路径/链接/报错会被自动过滤）" },
+                h("input", { className: "qbw-switch", type: "checkbox", checked: voiceCfg.autoMine, onChange: (e) => set(p("socialV2.voiceProfile.autoMine"), e.target.checked) })),
+              h(Row, { label: "对答样本", hint: "开 = 从聊天记录里挖「对方说什么 → 你怎么回」，只有句式没有上下文，最能压住客服腔" },
+                h("input", { className: "qbw-switch", type: "checkbox", checked: voiceCfg.pairs, onChange: (e) => set(p("socialV2.voiceProfile.pairs"), e.target.checked) })),
+              h(Row, { label: "末尾声线 gate", hint: "开 = 整段 prompt 的最末尾再补三行「就这样说话」（顶部的声音会被后面的流程指令压掉）" },
+                h("input", { className: "qbw-switch", type: "checkbox", checked: voiceCfg.tail, onChange: (e) => set(p("socialV2.voiceProfile.tail"), e.target.checked) })),
+              h(Row, { label: "末尾只给群聊", hint: "开 = 私聊不加末尾（私聊本来就够像），群聊才补" },
+                h("input", { className: "qbw-switch", type: "checkbox", checked: voiceCfg.tailGroupOnly, onChange: (e) => set(p("socialV2.voiceProfile.tailGroupOnly"), e.target.checked) }))),
+            h(SprintkeyArea, { title: "试听与样本", note: "看现在的声线、导出整段 prompt、增删原话样本", summary: voiceStatus.data?.ok ? `已入库 ${voiceStatus.data.stats?.total ?? 0} 条` : "点开看" },
+              h(Row, { label: "看一眼现在的声线", hint: "拉一段真实的声线注入文本；导出的整段 prompt 落在 state/prompt-dump/ 里" },
+                h("button", {
+                  className: "qbw-btn", type: "button",
+                  onClick: async () => {
+                    setVoicePreview({ loading: true, text: "", error: "" });
+                    try {
+                      const r = await api("/socialV2/voice/preview");
+                      const text = [r.voice || "", r.anchor || "", r.tail || ""].filter(Boolean).join("\n");
+                      setVoicePreview({ loading: false, text: text || "（当前没有可注入的声线）", error: "" });
+                    } catch (e) {
+                      setVoicePreview({ loading: false, text: "", error: String(e?.message ?? e) });
+                    }
+                  },
+                }, "看声线"),
+                h("button", {
+                  className: "qbw-btn", type: "button",
+                  onClick: async () => {
+                    try {
+                      const r = await api("/socialV2/prompt-preview");
+                      toast(`已导出：${r.file || "(未知路径)"}（${r.chars || 0} 字）`);
+                    } catch (e) {
+                      toast(`导出失败：${String(e?.message ?? e)}`);
+                    }
+                  },
+                }, "导出整段 prompt")),
+              voicePreview.error ? h("div", { className: "qbw-hint" }, `预览失败：${voicePreview.error}`) : null,
+              voicePreview.loading ? h("div", { className: "qbw-hint" }, "正在组装…") : null,
+              voicePreview.text ? h("pre", { className: "qbw-code", style: { whiteSpace: "pre-wrap", maxHeight: "260px", overflow: "auto" } }, voicePreview.text) : null,
+              h(Row, { label: "当前状态", hint: voiceStatus.loading ? "正在读取…" : (voiceStatus.error ? `不可用：${voiceStatus.error}` : "只读状态，来自桥接实时统计") },
+                h("button", { className: "qbw-btn", type: "button", onClick: loadVoiceStatus }, "刷新")),
+              h("div", { className: "qbw-hint" }, voiceStatusText),
+              (voiceData?.samples || []).slice(0, 8).map((sample) => h("div", { className: "qbw-hint", key: sample.id },
+                `「${sample.text}」 · 权重 ${sample.weight ?? "-"} · `,
+                h("button", {
+                  className: "qbw-btn", type: "button",
+                  onClick: async () => { try { await api("/socialV2/voice", { method: "POST", body: { action: "remove", id: sample.id } }); await loadVoiceStatus(); toast("已移出这条样本"); } catch (e) { toast(`删除失败：${String(e?.message ?? e)}`); } },
+                }, "不用这条"))),
+              h(Row, { label: "手动补一句", hint: "觉得哪句特别像你，就贴进来（4~60 字最合适）" },
+                h("input", { className: "qbw-input", type: "text", value: voiceDraft, placeholder: "例：行吧，你开心就好", onChange: (e) => setVoiceDraft(e.target.value) }),
+                h("button", {
+                  className: "qbw-btn", type: "button",
+                  onClick: async () => {
+                    const text = String(voiceDraft || "").trim();
+                    if (!text) { toast("先写一句"); return; }
+                    try {
+                      const r = await api("/socialV2/voice", { method: "POST", body: { action: "note", text } });
+                      toast(r?.added ? "已入库" : "这句被过滤了（含路径/链接/报错时）");
+                      setVoiceDraft("");
+                      await loadVoiceStatus();
+                    } catch (e) { toast(`添加失败：${String(e?.message ?? e)}`); }
+                  },
+                }, "加入")),
+              h("div", { className: "qbw-hint" }, "开关改完点底部「保存」，再「保存并重启 QQ 桥接」；样本增删立即生效，不用重启。")))),
         h(Section, { title: "跨会话共享记忆", collapsible: false, hidden: activePage !== "cross", note: "主人环内双向：私聊↔群聊都记得对方聊过什么，按记忆强度衰减，不再有「最多几条」" },
-          h(Row, { label: "启用共享记忆", hint: "开 = 唤醒时带上环内其他会话的记忆；关 = 每个会话只看自己的" },
-            h("input", { className: "qbw-switch", type: "checkbox", checked: crossMemory.enabled !== false, onChange: (e) => set(p("socialV2.crossMemory.enabled"), e.target.checked) })),
-          h(Row, { label: "共享方向", hint: "双向 = 群聊内容私聊也记得、私聊内容群里也记得；单向 = 只把私聊带进群" },
-            h("select", { className: "qbw-select", value: crossMemory.direction, onChange: (e) => set(p("socialV2.crossMemory.direction"), e.target.value) },
-              h("option", { value: "both" }, "双向（私聊 ↔ 群聊）"),
-              h("option", { value: "private-to-group" }, "单向（只把私聊带进群）"))),
-          h(Row, { label: "记忆注入预算（字）", hint: `当前 ${crossMemory.budgetChars}；越大记得越多、也越占上下文；默认 6000，最高 16000` },
-            h("input", {
-              className: "qbw-input", type: "number", min: 100, max: 16000, value: crossMemory.budgetChars,
-              onChange: (e) => set(p("socialV2.crossMemory.budgetChars"), Math.min(16000, Math.max(100, Math.round(Number(e.target.value) || 6000)))),
-            })),
-          h(Row, { label: "记忆淡忘速度（小时）", hint: `当前 ${crossMemory.decayHours}；每过这么久清晰度减半（不删除，只是变淡），默认 24` },
-            h("input", {
-              className: "qbw-input", type: "number", min: 1, max: 720, value: crossMemory.decayHours,
-              onChange: (e) => set(p("socialV2.crossMemory.decayHours"), Math.min(720, Math.max(1, Math.round(Number(e.target.value) || 24)))),
-            })),
-          h(Row, { label: "话头勾出旧记忆", hint: "聊天里提到旧事时，把已经变淡的记忆翻出来（列表回忆）；关掉就只按强度挑" },
-            h("input", { className: "qbw-switch", type: "checkbox", checked: crossMemory.associate !== false, onChange: (e) => set(p("socialV2.crossMemory.associate"), e.target.checked) })),
-          h(Row, { label: "主人环范围（天）", hint: `当前 ${crossMemory.ringDays} 天内活跃过的群 + 私聊；默认 14` },
-            h("input", {
-              className: "qbw-input", type: "number", min: 1, max: 365, value: crossMemory.ringDays,
-              onChange: (e) => set(p("socialV2.crossMemory.ringDays"), Math.min(365, Math.max(1, Math.round(Number(e.target.value) || 14)))),
-            })),
-          h(Row, { label: "只带主人相关", hint: "只注入主人参与过的记忆；关掉则群友之间的也算（更热闹，也更容易串味）" },
-            h("input", { className: "qbw-switch", type: "checkbox", checked: crossMemory.onlyOwnerInvolved !== false, onChange: (e) => set(p("socialV2.crossMemory.onlyOwnerInvolved"), e.target.checked) })),
-          h("div", { className: "qbw-hint" }, "机制：记忆按「最近提起时间」算强度（半衰期 = 上面那个小时数），越远越淡但不会消失；被提起会被强化、重新变清晰。注入时按强度和相关性挑，直到用完预算。"),
-          h("div", { className: "qbw-hint" }, "改完点底部「保存」，再点「保存并重启 QQ 桥接」——桥接启动时才读这个配置。")),
+          h("div", { className: "qbw-cards" },
+            h(SprintkeyArea, { title: "开关与方向", note: "开不开共享、谁往谁带、只带主人相关还是全都带", summary: `${crossMemory.enabled ? "开" : "关"} · ${crossMemory.direction === "both" ? "双向" : "单向"}` },
+              h(Row, { label: "启用共享记忆", hint: "开 = 唤醒时带上环内其他会话的记忆；关 = 每个会话只看自己的" },
+                h("input", { className: "qbw-switch", type: "checkbox", checked: crossMemory.enabled !== false, onChange: (e) => set(p("socialV2.crossMemory.enabled"), e.target.checked) })),
+              h(Row, { label: "共享方向", hint: "双向 = 群聊内容私聊也记得、私聊内容群里也记得；单向 = 只把私聊带进群" },
+                h("select", { className: "qbw-select", value: crossMemory.direction, onChange: (e) => set(p("socialV2.crossMemory.direction"), e.target.value) },
+                  h("option", { value: "both" }, "双向（私聊 ↔ 群聊）"),
+                  h("option", { value: "private-to-group" }, "单向（只把私聊带进群）"))),
+              h(Row, { label: "话头勾出旧记忆", hint: "聊天里提到旧事时，把已经变淡的记忆翻出来（列表回忆）；关掉就只按强度挑" },
+                h("input", { className: "qbw-switch", type: "checkbox", checked: crossMemory.associate !== false, onChange: (e) => set(p("socialV2.crossMemory.associate"), e.target.checked) })),
+              h(Row, { label: "只带主人相关", hint: "只注入主人参与过的记忆；关掉则群友之间的也算（更热闹，也更容易串味）" },
+                h("input", { className: "qbw-switch", type: "checkbox", checked: crossMemory.onlyOwnerInvolved !== false, onChange: (e) => set(p("socialV2.crossMemory.onlyOwnerInvolved"), e.target.checked) }))),
+            h(SprintkeyArea, { title: "预算与衰减", note: "注入多少字、多久变淡一半、环内算几天", summary: `${crossMemory.budgetChars} 字 · 半衰 ${crossMemory.decayHours}h` },
+              h(Row, { label: "记忆注入预算（字）", hint: `当前 ${crossMemory.budgetChars}；越大记得越多、也越占上下文；默认 6000，最高 16000` },
+                h("input", {
+                  className: "qbw-input", type: "number", min: 100, max: 16000, value: crossMemory.budgetChars,
+                  onChange: (e) => set(p("socialV2.crossMemory.budgetChars"), Math.min(16000, Math.max(100, Math.round(Number(e.target.value) || 6000)))),
+                })),
+              h(Row, { label: "记忆淡忘速度（小时）", hint: `当前 ${crossMemory.decayHours}；每过这么久清晰度减半（不删除，只是变淡），默认 24` },
+                h("input", {
+                  className: "qbw-input", type: "number", min: 1, max: 720, value: crossMemory.decayHours,
+                  onChange: (e) => set(p("socialV2.crossMemory.decayHours"), Math.min(720, Math.max(1, Math.round(Number(e.target.value) || 24)))),
+                })),
+              h(Row, { label: "主人环范围（天）", hint: `当前 ${crossMemory.ringDays} 天内活跃过的群 + 私聊；默认 14` },
+                h("input", {
+                  className: "qbw-input", type: "number", min: 1, max: 365, value: crossMemory.ringDays,
+                  onChange: (e) => set(p("socialV2.crossMemory.ringDays"), Math.min(365, Math.max(1, Math.round(Number(e.target.value) || 14)))),
+                })),
+              h("div", { className: "qbw-hint" }, "机制：记忆按「最近提起时间」算强度（半衰期 = 上面那个小时数），越远越淡但不会消失；被提起会被强化、重新变清晰。注入时按强度和相关性挑，直到用完预算。"),
+              h("div", { className: "qbw-hint" }, "改完点底部「保存」，再点「保存并重启 QQ 桥接」——桥接启动时才读这个配置。")))),
         h(Section, { title: "世界树（本地长期记忆）", collapsible: false, hidden: activePage !== "tree", note: "人设常驻、知识分叉生长；纯文本存在 state/memory-tree，可备份、可手改" },
-          h(Row, { label: "启用世界树", hint: "开 = 唤醒时带上人设 + 当前话题相关的几片叶子；关 = 不注入" },
-            h("input", { className: "qbw-switch", type: "checkbox", checked: treeCfg.enabled !== false, onChange: (e) => set(p("socialV2.worldTree.enabled"), e.target.checked) })),
-          h(Row, { label: "知识注入预算（字）", hint: `当前 ${treeCfg.budgetChars}；默认 1200，装不下就宁可不带` },
-            h("input", {
-              className: "qbw-input", type: "number", min: 0, max: 4000, value: treeCfg.budgetChars,
-              onChange: (e) => set(p("socialV2.worldTree.budgetChars"), Math.min(4000, Math.max(0, Math.round(Number(e.target.value) || 1200)))),
-            })),
-          h(Row, { label: "知识淡忘半衰期（天）", hint: `当前 ${treeCfg.tauDays} 天；不用的知识会变淡，但不会消失；默认 30` },
-            h("input", {
-              className: "qbw-input", type: "number", min: 1, max: 365, value: treeCfg.tauDays,
-              onChange: (e) => set(p("socialV2.worldTree.tauDays"), Math.min(365, Math.max(1, Math.round(Number(e.target.value) || 30)))),
-            })),
-          h(Row, { label: "落叶权重", hint: `当前 ${treeCfg.fallWeight}；超过「落叶期」的知识按这个权重重新排队（给它一次被想起来的运气），默认 0.05` },
-            h("input", {
-              className: "qbw-input", type: "number", min: 0, max: 1, step: 0.01, value: treeCfg.fallWeight,
-              onChange: (e) => set(p("socialV2.worldTree.fallWeight"), Math.min(1, Math.max(0, Number(e.target.value) || 0.05))),
-            })),
-          h(Row, { label: "落叶期（天）", hint: `当前 ${treeCfg.fallDays} 天；默认 90` },
-            h("input", {
-              className: "qbw-input", type: "number", min: 1, max: 3650, value: treeCfg.fallDays,
-              onChange: (e) => set(p("socialV2.worldTree.fallDays"), Math.min(3650, Math.max(1, Math.round(Number(e.target.value) || 90)))),
-            })),
-          h(Row, { label: "当前树", hint: treeInfo.loading ? "正在读取…" : (treeInfo.error ? `读取失败：${treeInfo.error}` : `${treeInfo.stats?.branches ?? 0} 个分支 / ${treeInfo.stats?.leaves ?? 0} 片叶子 / ${treeInfo.stats?.nutrients ?? 0} 份养分`) },
-            h("button", { className: "qbw-btn", type: "button", onClick: loadTree }, "刷新")),
-          h("div", { className: "qbw-hint" }, treeInfo.dir ? `目录：${treeInfo.dir}（nodes/<分支>/<id>.md + nutrients/<日期>.md，都是普通 md）` : "目录：state/memory-tree（纯文本）"),
-          h("div", { className: "qbw-hint" }, "模型自己种：让它调 qq_memory_tree_grow（记一条知识）/ qq_memory_tree_view（看树）。")),
+          h("div", { className: "qbw-cards" },
+            h(SprintkeyArea, { title: "开关与预算", note: "开不开、每次带多少字知识", summary: `${treeCfg.enabled ? "开" : "关"} · ${treeCfg.budgetChars} 字` },
+              h(Row, { label: "启用世界树", hint: "开 = 唤醒时带上人设 + 当前话题相关的几片叶子；关 = 不注入" },
+                h("input", { className: "qbw-switch", type: "checkbox", checked: treeCfg.enabled !== false, onChange: (e) => set(p("socialV2.worldTree.enabled"), e.target.checked) })),
+              h(Row, { label: "知识注入预算（字）", hint: `当前 ${treeCfg.budgetChars}；默认 1200，装不下就宁可不带` },
+                h("input", {
+                  className: "qbw-input", type: "number", min: 0, max: 4000, value: treeCfg.budgetChars,
+                  onChange: (e) => set(p("socialV2.worldTree.budgetChars"), Math.min(4000, Math.max(0, Math.round(Number(e.target.value) || 1200)))),
+                }))),
+            h(SprintkeyArea, { title: "衰减与落叶", note: "不用的知识怎么变淡、多久算落叶", summary: `τ ${treeCfg.tauDays}d · 落叶 ${treeCfg.fallDays}d` },
+              h(Row, { label: "知识淡忘半衰期（天）", hint: `当前 ${treeCfg.tauDays} 天；不用的知识会变淡，但不会消失；默认 30` },
+                h("input", {
+                  className: "qbw-input", type: "number", min: 1, max: 365, value: treeCfg.tauDays,
+                  onChange: (e) => set(p("socialV2.worldTree.tauDays"), Math.min(365, Math.max(1, Math.round(Number(e.target.value) || 30)))),
+                })),
+              h(Row, { label: "落叶权重", hint: `当前 ${treeCfg.fallWeight}；超过「落叶期」的知识按这个权重重新排队（给它一次被想起来的运气），默认 0.05` },
+                h("input", {
+                  className: "qbw-input", type: "number", min: 0, max: 1, step: 0.01, value: treeCfg.fallWeight,
+                  onChange: (e) => set(p("socialV2.worldTree.fallWeight"), Math.min(1, Math.max(0, Number(e.target.value) || 0.05))),
+                })),
+              h(Row, { label: "落叶期（天）", hint: `当前 ${treeCfg.fallDays} 天；默认 90` },
+                h("input", {
+                  className: "qbw-input", type: "number", min: 1, max: 3650, value: treeCfg.fallDays,
+                  onChange: (e) => set(p("socialV2.worldTree.fallDays"), Math.min(3650, Math.max(1, Math.round(Number(e.target.value) || 90)))),
+                }))),
+            h(SprintkeyArea, { title: "当前树", note: "看树有多少分支/叶子，以及文件在哪儿", summary: treeInfo.loading ? "读取中…" : `${treeInfo.stats?.leaves ?? 0} 片叶子` },
+              h(Row, { label: "当前树", hint: treeInfo.loading ? "正在读取…" : (treeInfo.error ? `读取失败：${treeInfo.error}` : `${treeInfo.stats?.branches ?? 0} 个分支 / ${treeInfo.stats?.leaves ?? 0} 片叶子 / ${treeInfo.stats?.nutrients ?? 0} 份养分`) },
+                h("button", { className: "qbw-btn", type: "button", onClick: loadTree }, "刷新")),
+              h("div", { className: "qbw-hint" }, treeInfo.dir ? `目录：${treeInfo.dir}（nodes/<分支>/<id>.md + nutrients/<日期>.md，都是普通 md）` : "目录：state/memory-tree（纯文本）"),
+              h("div", { className: "qbw-hint" }, "模型自己种：让它调 qq_memory_tree_grow（记一条知识）/ qq_memory_tree_view（看树）。")))),
         h(Section, { title: "扩展工具投递", collapsible: false, hidden: activePage !== "tools", note: "让模型把图片 / 文件 / 视频 / 语音直接发到 QQ" },
-          h(Row, { label: "发图片 / 文件 / 视频", hint: "qq_send_image · qq_send_file · qq_send_video；关掉即从模型工具面移除" },
-            h("input", { className: "qbw-switch", type: "checkbox", checked: tools.sendMedia !== false, onChange: (e) => set(p("socialV2.tools.sendMedia"), e.target.checked) })),
-          h(Row, { label: "发语音条", hint: "qq_send_voice；语音库目录和响度在「语音」页调" },
-            h("input", { className: "qbw-switch", type: "checkbox", checked: tools.sendVoice !== false, onChange: (e) => set(p("socialV2.tools.sendVoice"), e.target.checked) }))),
+          h("div", { className: "qbw-cards" },
+            h(SprintkeyArea, { title: "媒体工具", note: "关掉即从模型工具面移除；改完保存并重启桥接", summary: `${tools.sendMedia !== false ? "图/文件/视频 ✓" : "图/文件/视频 ✗"} · ${tools.sendVoice !== false ? "语音 ✓" : "语音 ✗"}` },
+              h(Row, { label: "发图片 / 文件 / 视频", hint: "qq_send_image · qq_send_file · qq_send_video；关掉即从模型工具面移除" },
+                h("input", { className: "qbw-switch", type: "checkbox", checked: tools.sendMedia !== false, onChange: (e) => set(p("socialV2.tools.sendMedia"), e.target.checked) })),
+              h(Row, { label: "发语音条", hint: "qq_send_voice；语音库目录和响度在「语音」页调" },
+                h("input", { className: "qbw-switch", type: "checkbox", checked: tools.sendVoice !== false, onChange: (e) => set(p("socialV2.tools.sendVoice"), e.target.checked) }))))),
         h(Section, { title: "投递上限", collapsible: false, hidden: activePage !== "limits", note: "超过上限直接拒绝，不会偷偷压缩或改格式" },
-          h(Row, { label: "图片上限（MB）", hint: `当前 ${imageMb} MB；默认 20` },
-            h("input", { className: "qbw-input", type: "number", min: 1, max: 100, value: imageMb, onChange: (e) => set(p("socialV2.media.maxImageMB"), Math.max(1, Math.round(Number(e.target.value) || 20))) })),
-          h(Row, { label: "其它文件上限（MB）", hint: `当前 ${fileMb} MB；视频和普通文件共用，默认 100` },
-            h("input", { className: "qbw-input", type: "number", min: 1, max: 500, value: fileMb, onChange: (e) => set(p("socialV2.media.maxFileMB"), Math.max(1, Math.round(Number(e.target.value) || 100))) }))),
+          h("div", { className: "qbw-cards" },
+            h(SprintkeyArea, { title: "体积上限", note: "单张图片 / 单个文件的硬上限", summary: `图 ${imageMb}MB · 文件 ${fileMb}MB` },
+              h(Row, { label: "图片上限（MB）", hint: `当前 ${imageMb} MB；默认 20` },
+                h("input", { className: "qbw-input", type: "number", min: 1, max: 100, value: imageMb, onChange: (e) => set(p("socialV2.media.maxImageMB"), Math.max(1, Math.round(Number(e.target.value) || 20))) })),
+              h(Row, { label: "其它文件上限（MB）", hint: `当前 ${fileMb} MB；视频和普通文件共用，默认 100` },
+                h("input", { className: "qbw-input", type: "number", min: 1, max: 500, value: fileMb, onChange: (e) => set(p("socialV2.media.maxFileMB"), Math.max(1, Math.round(Number(e.target.value) || 100))) }))))),
         h(Section, { title: "投递接口", collapsible: false, hidden: activePage !== "api", note: "任何插件把产物路径丢进来就能落到 QQ" },
-          h("div", { className: "qbw-hint" }, h("code", { className: "qbw-code" }, "POST /api/socialV2/send-media")),
-          h("div", { className: "qbw-hint" }, "body：{ key, token, path | url, name?, kind?, dryRun? }"),
-          h("div", { className: "qbw-hint" }, "本地绝对路径和 http(s) 链接都行；file 段会自动带上文件名（中文也行）。"),
-          h("div", { className: "qbw-hint" }, "护栏全保留：reserved2 + agent token 校验、只能发自己的会话、鱼群保护、每分钟/每小时限流。")));
+          h("div", { className: "qbw-cards" },
+            h(SprintkeyArea, { title: "投递接口", note: "给别的插件用的 HTTP 入口，点开看用法", summary: "POST /api/socialV2/send-media" },
+              h("div", { className: "qbw-hint" }, h("code", { className: "qbw-code" }, "POST /api/socialV2/send-media")),
+              h("div", { className: "qbw-hint" }, "body：{ key, token, path | url, name?, kind?, dryRun? }"),
+              h("div", { className: "qbw-hint" }, "本地绝对路径和 http(s) 链接都行；file 段会自动带上文件名（中文也行）。"),
+              h("div", { className: "qbw-hint" }, "护栏全保留：reserved2 + agent token 校验、只能发自己的会话、鱼群保护、每分钟/每小时限流。"))))
+        ]);
     }
 
     // ── 全部参数 ────────────────────────────────────────────────────────────
