@@ -14,9 +14,31 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { wavDurationMs } from './voice-tts.js';
+import { stripCloudCredentials } from './voice-pack-secrets.js';
+import {
+  IMPORT_CODES,
+  ImportError,
+  inspectImportSource,
+  rewriteVenvConfig,
+  prepareConfig,
+  copyTree,
+  dirSize,
+  missingPackFiles,
+  validateConfigText,
+  renameWithRetry,
+  removeWithRetry,
+} from './voice-pack-import.js';
 import { fileURLToPath } from 'node:url';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+/** 启动日志可能是 Windows GBK（cmd/Python 控制台），不能一律按 UTF-8 解。 */
+function decodeProcessLog(buffer) {
+  const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(String(buffer ?? ''), 'utf8');
+  const utf8 = buf.toString('utf8');
+  if (!utf8.includes('\uFFFD')) return utf8;
+  try { return new TextDecoder('gbk').decode(buf); } catch { return utf8; }
+}
 
 /**
  * 开发期的默认安装源：**仓库同级的** `voice/packages/<id>`。
@@ -71,9 +93,12 @@ export const DEFAULT_MANIFESTS = [
     id: 'voice-cloud',
     name: '云端语音包',
     version: '1.0.0',
-    sizeBytes: 60_000_000,
+    sizeBytes: 280_000_000,
     port: 8767,
     startScript: 'run.bat',
+    // 云端包不需要 run.bat 里的 `start`：直接拉 python，桥接才能收到 stderr，
+    // 否则 Python 崩在独立窗口里，桥接只能等 60 秒后报“端口没起来”。
+    directStart: { python: '.venv/Scripts/python.exe', args: ['-m', 'voxd', '--config', 'config.toml'] },
     stopScript: 'stop.bat',
     repo: 'Mieksido/surfvoicecloud',
     postInstall: ['scripts/fetch-models.mjs', 'scripts/bootstrap-env.mjs'],
@@ -83,7 +108,7 @@ export const DEFAULT_MANIFESTS = [
     voices: [{ id: 'age12-cloud', label: '小语（云端 · 女童声）' }],
     about: {
       summary: '调用火山引擎声音复刻服务，音质最好。',
-      pros: ['延迟 0.5~1.1 秒', '不占显卡', '安装约 60MB，1~3 分钟'],
+      pros: ['延迟 0.5~1.1 秒', '不占显卡', '安装约 280MB，1~3 分钟'],
       cons: ['按字符计费（火山引擎收取，与本插件无关）', '必须联网', '要自己申请两个密钥'],
       billing: '按字符计费。每天直播 3 小时约 135 万字符/月。不想付费就装本地包，效果接近且不要钱。',
       disclaimer: '这不是推销：两个包功能对等，装哪个都不影响插件其他功能。',
@@ -277,29 +302,57 @@ export async function flattenSingleDir(destDir) {
   return true;
 }
 
-async function fetchToLocal(cfg, id, src, destDir, onProgress = () => {}) {
+async function fetchToLocal(cfg, id, src, destDir, onProgress = () => {}, { mirror = '' } = {}) {
   if (/^https?:\/\//i.test(src)) {
     await fsp.mkdir(destDir, { recursive: true });
-    const tmp = path.join(os.tmpdir(), `surfcore-${id}-${Date.now()}.zip`);
-    const res = await fetch(src);
-    if (!res.ok) throw new Error(`下载失败：HTTP ${res.status}`);
-    const total = Number(res.headers.get('content-length') || 0);
-    let got = 0;
-    const file = fs.createWriteStream(tmp);
-    for await (const chunk of res.body) {
-      got += chunk.length;
-      file.write(chunk);
-      if (total) onProgress(Math.min(99, Math.round((got / total) * 100)), '下载中');
+    // 代码 zip 也走用户选的镜像；镜像失败再回原地址，不能只让模型下载吃镜像。
+    const urls = [];
+    const m = String(mirror || '').trim().replace(/\/+$/, '');
+    if (/^https?:\/\//i.test(m)) urls.push(`${m}/${src}`);
+    urls.push(src);
+    let lastError = null;
+    for (const url of urls) {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const tmp = path.join(os.tmpdir(), `surfcore-${id}-${Date.now()}-${attempt}.zip`);
+        try {
+          const res = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+          if (!res.ok) {
+            const error = new Error(`HTTP ${res.status}`);
+            error.status = res.status;
+            throw error;
+          }
+          const total = Number(res.headers.get('content-length') || 0);
+          let got = 0;
+          const file = fs.createWriteStream(tmp);
+          for await (const chunk of res.body) {
+            got += chunk.length;
+            file.write(chunk);
+            if (total) onProgress(Math.min(99, Math.round((got / total) * 90)), '下载中');
+          }
+          await new Promise((r) => file.end(r));
+          onProgress(96, '解压中');
+          await new Promise((resolve, reject) => {
+            const p = spawn('tar', ['-xf', tmp, '-C', destDir], { stdio: 'ignore' });
+            p.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`解压失败（exit ${code}）`))));
+            p.on('error', reject);
+          });
+          await fsp.rm(tmp, { force: true });
+          return;
+        } catch (error) {
+          lastError = error;
+          try { await fsp.rm(tmp, { force: true }); } catch {}
+          // 4xx 不是网络抖动，重试没意义；5xx/429/连接超时才重试。
+          const status = Number(error?.status) || 0;
+          if (status && status < 500 && status !== 429) break;
+          if (attempt < 1) await new Promise((r) => setTimeout(r, 800));
+        }
+      }
     }
-    await new Promise((r) => file.end(r));
-    onProgress(99, '解压中');
-    await new Promise((resolve, reject) => {
-      const p = spawn('tar', ['-xf', tmp, '-C', destDir], { stdio: 'ignore' });
-      p.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`解压失败（exit ${code}）`))));
-      p.on('error', reject);
-    });
-    await fsp.rm(tmp, { force: true });
-    return;
+    const cause = lastError?.cause?.code || lastError?.code || lastError?.name || '';
+    const detail = cause ? `${lastError?.message || '下载失败'}（${cause}）` : (lastError?.message || '下载失败');
+    const error = new Error(`下载安装包失败：${detail}。检查网络、代理或换一个下载镜像后重试。`);
+    error.cause = lastError;
+    throw error;
   }
 
   // 本地目录 / 本地 zip
@@ -369,6 +422,32 @@ export async function ensureDefaultVoice(dir, voices = []) {
   return { changed: true, from: current, to: wanted };
 }
 
+// ── 云端凭据边界（2026-10-29）──────────────────────────────────────────────
+//
+// 实现已抽到 voice-pack-secrets.js：安装、离线导入、测试共用同一份清洗规则；
+// 这里保留 re-export，旧调用方/测试不用改 import 路径。
+export { stripCloudCredentials } from './voice-pack-secrets.js';
+
+/**
+ * 装完后的 `config.toml`：仓库只带 `config.example.toml` 时复制一份；
+ * 新装一律清掉云端凭据（见上面的背景）。返回是否新建/是否清过，供进度条显示。
+ */
+export async function ensurePackConfig(dir, { hadOwnConfig = false } = {}) {
+  const file = path.join(dir, 'config.toml');
+  let created = false;
+  if (!(await exists(file))) {
+    const example = path.join(dir, 'config.example.toml');
+    if (!(await exists(example))) throw new Error('包里没有 config.toml，可能下载的是错的文件');
+    await fsp.copyFile(example, file);
+    created = true;
+  }
+  if (hadOwnConfig) return { created, sanitized: false, file };
+  const raw = await fsp.readFile(file, 'utf8');
+  const cleaned = stripCloudCredentials(raw);
+  if (cleaned !== raw) await fsp.writeFile(file, cleaned, 'utf8');
+  return { created, sanitized: cleaned !== raw, file };
+}
+
 export function createVoicePacks(cfg) {
   const activeInstalls = new Map(); // id → {progress, phase, startedAt, error}
   const activeEnvInstalls = new Map(); // id → 正在补装 Python 环境（.venv）的记录
@@ -394,6 +473,330 @@ export function createVoicePacks(cfg) {
       gsvNeeded,
       bootstrap: await exists(path.join(dir, 'scripts', 'bootstrap-env.mjs')),
     };
+  }
+
+  const activeImports = new Map(); // id → 导入进度/错误（离线包复制与切换）
+
+  function importTarget(id) {
+    return path.join(packsDir(cfg), id);
+  }
+
+  function importSnapshot(rec) {
+    if (!rec) return null;
+    return {
+      progress: rec.progress,
+      phase: rec.phase,
+      startedAt: rec.startedAt,
+      error: rec.error || null,
+      code: rec.code || null,
+      hint: rec.hint || '',
+      missing: Array.isArray(rec.missing) ? rec.missing : [],
+      cancelled: Boolean(rec.cancelled),
+      sourceDir: rec.sourceDir,
+      targetDir: rec.targetDir,
+      backupDir: rec.backupDir || null,
+      verified: Boolean(rec.verified),
+      result: rec.result || null,
+    };
+  }
+
+  async function inspectImport(id, sourceDir) {
+    const m = manifests(cfg).find((x) => x.id === id);
+    if (!m) throw new ImportError(IMPORT_CODES.PACK_NOT_FOUND, `未知语音包：${id}`, { hint: '刷新设置页后重试。' });
+    return inspectImportSource({ id, sourceDir, targetDir: importTarget(id) });
+  }
+
+  async function checkFreeSpace(dir, need) {
+    try {
+      await fsp.mkdir(dir, { recursive: true });
+      const s = await fsp.statfs(dir);
+      const free = Number(s.bavail) * Number(s.bsize);
+      if (Number.isFinite(free) && free < need + 256 * 1024 * 1024) {
+        throw new ImportError(IMPORT_CODES.DISK_FULL, '磁盘空间不足，无法导入离线包', {
+          hint: `需要至少 ${(need / 1024 ** 3).toFixed(1)} GB，当前可用 ${(free / 1024 ** 3).toFixed(1)} GB。请清理磁盘，或把语音包安装目录换到空间更大的盘。`,
+          detail: { freeBytes: free, needBytes: need },
+        });
+      }
+    } catch (e) {
+      if (e instanceof ImportError) throw e;
+      // statfs 在个别文件系统上不可用：不阻塞导入，结构性错误仍会在复制时暴露。
+    }
+  }
+
+  async function startImport(id, { sourceDir, allowUnverified = false } = {}) {
+    const m = manifests(cfg).find((x) => x.id === id);
+    if (!m) throw new ImportError(IMPORT_CODES.PACK_NOT_FOUND, `未知语音包：${id}`, { hint: '刷新设置页后重试。' });
+    const prev = activeImports.get(id);
+    if (prev && prev.phase !== '完成' && prev.phase !== '失败') {
+      throw new ImportError('IMPORT_BUSY', '这个语音包正在导入中', {
+        hint: '等当前导入结束，或先点「取消导入」。',
+        status: 409,
+      });
+    }
+    if (prev) activeImports.delete(id);
+
+    const info = await inspectImport(id, sourceDir);
+    if (!info.verified && !allowUnverified) {
+      throw new ImportError(IMPORT_CODES.UNVERIFIED, '离线包没有完整性清单', {
+        hint: '该包未经完整性验证，可能不完整或被替换。确认来源可信后点「仍要导入」。',
+        status: 409,
+        detail: { warnings: info.warnings || [] },
+      });
+    }
+    const target = importTarget(id);
+    if (await probePort(m.port)) {
+      throw new ImportError(IMPORT_CODES.TARGET_RUNNING, '目标语音包正在运行，不能覆盖', {
+        hint: '先在设置页停止这个语音包，再重新导入。',
+        status: 409,
+        detail: { port: m.port, targetDir: target },
+      });
+    }
+    if (m.enginePort && await probePort(m.enginePort)) {
+      throw new ImportError(IMPORT_CODES.TARGET_RUNNING, '音色引擎仍在运行，不能覆盖', {
+        hint: `先停止本地音色引擎（端口 ${m.enginePort}），或点「先停止语音包」后再导入。`,
+        status: 409,
+        detail: { port: m.enginePort, targetDir: target },
+      });
+    }
+    const source = info.sourceDir;
+    const inPlace = path.resolve(source) === path.resolve(target);
+    if (!inPlace) await checkFreeSpace(path.dirname(target), info.sizeBytes);
+    const targetExists = await exists(target);
+    const oldConfigPath = targetExists && (await exists(path.join(target, 'config.toml')))
+      ? path.join(target, 'config.toml') : '';
+    if (oldConfigPath) {
+      let oldText = '';
+      try { oldText = await fsp.readFile(oldConfigPath, 'utf8'); } catch (e) {
+        throw new ImportError(IMPORT_CODES.CONFIG_INVALID, '读不到旧 config.toml，无法保留用户配置', {
+          hint: '先备份旧包并修复/删除旧 config.toml 后再导入；导入不会覆盖它。',
+          detail: { file: oldConfigPath, reason: String(e?.message || e) },
+        });
+      }
+      const bad = validateConfigText(oldText);
+      if (bad) {
+        throw new ImportError(IMPORT_CODES.CONFIG_INVALID, `旧 config.toml 格式不对（${bad}）`, {
+          hint: '旧配置不会被覆盖。请先备份并修复/删除旧 config.toml，再重新导入。',
+          detail: { file: oldConfigPath },
+        });
+      }
+    }
+    const rec = {
+      progress: 2,
+      phase: '校验通过',
+      startedAt: Date.now(),
+      error: null,
+      code: null,
+      hint: '',
+      missing: [],
+      cancelled: false,
+      sourceDir: source,
+      targetDir: target,
+      backupDir: null,
+      verified: info.verified,
+      result: null,
+    };
+    activeImports.set(id, rec);
+
+    (async () => {
+      let temp = '';
+      let switched = false;
+      try {
+        if (!inPlace) {
+          temp = path.join(packsDir(cfg), `.import-${id}-${Date.now()}`);
+          await copyTree(source, temp, {
+            onProgress: (pct, phase) => { rec.progress = pct; rec.phase = phase; },
+            isCancelled: () => rec.cancelled,
+          });
+          if (rec.cancelled) throw new ImportError(IMPORT_CODES.CANCELLED, '导入已取消', { hint: '没有改动旧包；可以重新导入。', status: 409 });
+          // 源目录若自带 config.toml，先立刻清掉凭据，避免临时目录里长时间留 key；
+          // 有旧配置时下一步 prepareConfig 会用用户旧配置覆盖它。
+          const tempConfig = path.join(temp, 'config.toml');
+          if (await exists(tempConfig)) {
+            const raw = await fsp.readFile(tempConfig, 'utf8').catch(() => '');
+            if (raw) await fsp.writeFile(tempConfig, stripCloudCredentials(raw), 'utf8');
+          }
+          rec.phase = '处理配置';
+          rec.progress = 78;
+          await prepareConfig(temp, oldConfigPath);
+          const missing = await missingPackFiles(id, temp);
+          if (missing.length) {
+            throw new ImportError(IMPORT_CODES.PACK_INCOMPLETE, '复制后的离线包不完整', {
+              hint: '重新下载完整离线包后再导入。',
+              missing,
+            });
+          }
+          if (rec.cancelled) throw new ImportError(IMPORT_CODES.CANCELLED, '导入已取消', { hint: '没有改动旧包；可以重新导入。', status: 409 });
+          rec.phase = '切换安装目录';
+          rec.progress = 94;
+          if (targetExists) {
+            rec.backupDir = `${target}.backup-${Date.now()}`;
+            await renameWithRetry(target, rec.backupDir);
+          }
+          await renameWithRetry(temp, target);
+          temp = '';
+          switched = true;
+          // 必须在 rename 之后改写：pyvenv.cfg 的 home 要指向最终目录，
+          // 指向 .import-* 临时目录的话，重命名后解释器直接找不到 runtime。
+          rec.phase = '修复 Python 环境';
+          rec.progress = 96;
+          await rewriteVenvConfig(target, { versions: id === 'voice-local' ? ['313', '312'] : ['313'] });
+        } else {
+          rec.phase = '修复 Python 环境（就地）';
+          rec.progress = 70;
+          await rewriteVenvConfig(target, { versions: id === 'voice-local' ? ['313', '312'] : ['313'] });
+          if (!oldConfigPath) {
+            rec.phase = '处理配置（就地）';
+            await prepareConfig(target, '');
+          }
+          switched = true;
+        }
+
+        const state = await readState(cfg);
+        state.packs = state.packs || {};
+        state.packs[id] = {
+          ...(state.packs[id] || {}),
+          enabled: true,
+          installedAt: new Date().toISOString(),
+          importedAt: new Date().toISOString(),
+          version: info.version || m.version,
+          importSource: inPlace ? null : source,
+          backupDir: rec.backupDir || null,
+          verified: Boolean(info.verified),
+        };
+        await writeState(cfg, state);
+        rec.phase = '完成';
+        rec.progress = 100;
+        rec.result = {
+          ok: true,
+          imported: !inPlace,
+          alreadyInPlace: inPlace,
+          sourceDir: source,
+          targetDir: target,
+          backupDir: rec.backupDir || null,
+          verified: Boolean(info.verified),
+          runtimeVerified: false,
+          version: info.version || m.version,
+        };
+      } catch (e) {
+        const err = e instanceof ImportError ? e : new ImportError(IMPORT_CODES.COPY_FAILED, String(e?.message || e), {
+          hint: '检查源目录、磁盘空间和文件占用后重试。',
+        });
+        rec.error = err.message;
+        rec.code = err.code;
+        rec.hint = err.hint;
+        rec.missing = err.missing;
+        rec.phase = '失败';
+        rec.progress = Math.min(rec.progress, 99);
+
+        if (temp) {
+          try { await removeWithRetry(temp); } catch (cleanup) {
+            rec.hint = `${rec.hint || ''}\n临时目录清理失败：${temp}（${String(cleanup?.message || cleanup)}）`.trim();
+          }
+        }
+        if (switched) {
+          try {
+            const failed = `${target}.failed-${Date.now()}`;
+            if (await exists(target)) await renameWithRetry(target, failed);
+            if (rec.backupDir) {
+              await renameWithRetry(rec.backupDir, target);
+              rec.backupDir = null;
+            }
+            rec.hint = `${rec.hint || ''}\n新包已验证失败，已回滚旧包。`.trim();
+          } catch (rollback) {
+            rec.code = IMPORT_CODES.ROLLBACK_FAILED;
+            rec.error = '导入失败，且旧包回滚失败';
+            rec.hint = `旧包备份在：${rec.backupDir || '（未知路径）'}。请先不要删除它，手动把备份改回 voice-${id === 'voice-local' ? 'local' : 'cloud'} 目录。原因：${String(rollback?.message || rollback)}`;
+          }
+        } else if (rec.backupDir) {
+          try {
+            await renameWithRetry(rec.backupDir, target);
+            rec.backupDir = null;
+          } catch (rollback) {
+            rec.code = IMPORT_CODES.ROLLBACK_FAILED;
+            rec.error = '导入失败，且旧包回滚失败';
+            rec.hint = `旧包备份在：${rec.backupDir}。请手动恢复，不要删除。原因：${String(rollback?.message || rollback)}`;
+          }
+        }
+      }
+    })();
+
+    return { ok: true, import: importSnapshot(rec) };
+  }
+
+  function cancelImport(id) {
+    const rec = activeImports.get(id);
+    if (!rec || rec.phase === '完成' || rec.phase === '失败') {
+      return { ok: false, error: '没有进行中的导入', code: 'IMPORT_NOT_RUNNING' };
+    }
+    rec.cancelled = true;
+    rec.phase = '取消中';
+    return { ok: true };
+  }
+
+  async function deleteImportSource(id, sourceDir) {
+    const state = await readState(cfg);
+    const recorded = state.packs?.[id]?.importSource || '';
+    const target = importTarget(id);
+    const source = path.resolve(String(sourceDir || ''));
+    if (!recorded || path.resolve(recorded) !== source) {
+      throw new ImportError(IMPORT_CODES.SOURCE_DELETE_REFUSED, '这个目录不是本次导入的源目录，已拒绝删除', {
+        hint: '只允许删除刚刚导入时使用的原始文件夹；其他目录请手动处理。',
+        status: 409,
+      });
+    }
+    if (source === path.resolve(target) || target.startsWith(source + path.sep)) {
+      throw new ImportError(IMPORT_CODES.SOURCE_DELETE_REFUSED, '源目录就是安装目录，不能删除', {
+        hint: '源目录与标准安装目录相同，不需要删除。',
+        status: 409,
+      });
+    }
+    if (!(await exists(target))) {
+      throw new ImportError(IMPORT_CODES.SOURCE_DELETE_REFUSED, '标准安装目录不存在，已拒绝删除源目录', {
+        hint: '先确认导入成功；旧包/新包异常时不要删除源文件。',
+        status: 409,
+      });
+    }
+    const freedBytes = await dirSize(source).catch(() => 0);
+    try {
+      await fsp.rm(source, { recursive: true, force: true });
+    } catch (e) {
+      throw new ImportError(IMPORT_CODES.SOURCE_DELETE_REFUSED, '删除源文件夹失败', {
+        hint: `关闭占用该文件夹的程序后重试；残留位置：${source}`,
+        status: 409,
+        detail: { path: source, reason: String(e?.message || e) },
+      });
+    }
+    delete state.packs[id].importSource;
+    await writeState(cfg, state);
+    return { ok: true, freedBytes };
+  }
+
+  async function deleteImportBackup(id, backupDir) {
+    const state = await readState(cfg);
+    const recorded = state.packs?.[id]?.backupDir || '';
+    const target = importTarget(id);
+    const backup = path.resolve(String(backupDir || ''));
+    if (!recorded || path.resolve(recorded) !== backup) {
+      throw new ImportError(IMPORT_CODES.BACKUP_DELETE_REFUSED, '这个路径不是本次导入的旧包备份，已拒绝删除', {
+        hint: '只允许删除导入时记录的备份目录。',
+        status: 409,
+      });
+    }
+    if (backup === path.resolve(target)) {
+      throw new ImportError(IMPORT_CODES.BACKUP_DELETE_REFUSED, '备份路径等于当前安装目录，已拒绝删除', { status: 409 });
+    }
+    try {
+      await fsp.rm(backup, { recursive: true, force: true });
+    } catch (e) {
+      throw new ImportError(IMPORT_CODES.BACKUP_DELETE_REFUSED, '删除旧包备份失败', {
+        hint: `关闭占用该目录的程序后重试；残留位置：${backup}`,
+        status: 409,
+        detail: { path: backup, reason: String(e?.message || e) },
+      });
+    }
+    delete state.packs[id].backupDir;
+    await writeState(cfg, state);
+    return { ok: true };
   }
 
   async function statusOne(m) {
@@ -436,6 +839,7 @@ export function createVoicePacks(cfg) {
         const { child, ...rest } = rec;
         return { ...rest, logTail: String(rec.log || '').slice(-160) };
       })(),
+      import: importSnapshot(activeImports.get(m.id)),
     };
   }
 
@@ -467,13 +871,23 @@ export function createVoicePacks(cfg) {
   async function list() {
     const state = await readState(cfg);
     const packs = await Promise.all(manifests(cfg).map(statusOne));
+    // 云端包装好但凭据没填全：给设置页一个明确信号（新装不再预置任何凭据，见 PITFALLS #79）。
+    const withNeeds = await Promise.all(packs.map(async (p) => {
+      if (p.id !== 'voice-cloud' || !p.installed) return p;
+      const c = await readCloudConfig(p.id).catch(() => null);
+      return { ...p, needsCloudConfig: !c || !c.configured };
+    }));
     return {
       ok: true,
       packsDir: packsDir(cfg),
-      packs: packs.map((p) => ({
+      packs: withNeeds.map((p) => ({
         ...p,
         enabled: state.packs?.[p.id]?.enabled ?? false,
         installedAt: state.packs?.[p.id]?.installedAt ?? null,
+        importSource: state.packs?.[p.id]?.importSource ?? null,
+        backupDir: state.packs?.[p.id]?.backupDir ?? null,
+        importedAt: state.packs?.[p.id]?.importedAt ?? null,
+        verified: state.packs?.[p.id]?.verified ?? null,
       })),
     };
   }
@@ -615,7 +1029,8 @@ async function patchPackCode(dir) {
   return notes;
 }
 
-async function install(id, { force = false, mirror = '', jobs = 0 } = {}) {    const m = manifests(cfg).find((x) => x.id === id);
+async function install(id, { force = false, mirror = '', jobs = 0 } = {}) {
+    const m = manifests(cfg).find((x) => x.id === id);
     if (!m) throw new Error(`未知语音包：${id}`);
     // 上一次已经结束（完成/失败）的安装记录要清掉，否则会永远卡在"正在安装中"，
     // 用户失败后连重试都点不了（2026-10-27 反馈）。
@@ -640,6 +1055,9 @@ async function install(id, { force = false, mirror = '', jobs = 0 } = {}) {    c
             throw new Error(`磁盘不够：${path.dirname(dir)} 所在盘只剩 ${(free / 1073741824).toFixed(1)} GB，这个包要 ${(Number(m.minFreeBytes) / 1073741824).toFixed(0)} GB 左右。先清点空间或改安装目录`);
           }
         }
+        // 装之前先看有没有用户自己的 config.toml：有就是重装（下面会原样保留），
+        // 没有就是新装 → 凭据一律清空（见 stripCloudCredentials 的背景）。
+        const hadOwnConfig = await exists(path.join(dir, 'config.toml'));
         // 保留 models/vendor/.venv/config.toml：断点续传的 .part 在这里，不能一起删。
         await clearPackKeepingAssets(dir);
         // 安装源：本地开发目录 / 本地 zip / http(s)。开发目录在用户机器上不存在，
@@ -648,13 +1066,13 @@ async function install(id, { force = false, mirror = '', jobs = 0 } = {}) {    c
         const localDir = /^https?:/i.test(src) ? null : path.resolve(src || '.');
         if (localDir && !(await exists(localDir))) {
           if (!m.repo) throw new Error(`安装源不存在：${src}（这个包没有配置在线安装地址）`);
-          src = `https://github.com/${m.repo}/archive/refs/heads/main.zip`;
+          src = `https://codeload.github.com/${m.repo}/zip/refs/heads/main`;
           rec.phase = '改用在线源';
         }
         await fetchToLocal(cfg, id, src, dir, (p, phase) => {
           rec.progress = p;
           rec.phase = phase;
-        });
+        }, { mirror });
         await flattenSingleDir(dir);
         // GitHub archive 解压出来可能带只读属性，后面复制 config / 拉模型会写不进去。
         try {
@@ -668,13 +1086,11 @@ async function install(id, { force = false, mirror = '', jobs = 0 } = {}) {    c
         try { rec.phase = '修补包里的小坑'; await patchPackCode(dir); } catch {}
         // 仓库里只有 config.example.toml（真实配置不入库）：装完先复制成 config.toml，
         // 否则 voxd 起不来、用户看到"包里没有 config.toml"。
-        if (!(await exists(path.join(dir, 'config.toml'))) && (await exists(path.join(dir, 'config.example.toml')))) {
-          await fsp.copyFile(path.join(dir, 'config.example.toml'), path.join(dir, 'config.toml'));
-          rec.phase = '生成配置';
-        }
-        if (!(await exists(path.join(dir, 'config.toml')))) {
-          throw new Error('包里没有 config.toml，可能下载的是错的文件');
-        }
+        // 新装还会清空预置凭据——打包者可能把自己的火山 key 留在了包里，
+        // 不能让用户拿我们的额度计费（PITFALLS #79）。
+        const conf = await ensurePackConfig(dir, { hadOwnConfig });
+        if (conf.created) rec.phase = '生成配置';
+        if (conf.sanitized) rec.phase = '清空预置凭据（需自己填密钥）';
         // 1.0.x 老用户的 config.toml 默认音色可能还是 loli12-gsv（新包不带了）：
         // 不改的话第一次发语音就是「没有音色 loli12-gsv，可用：（空）」。
         try {
@@ -684,8 +1100,7 @@ async function install(id, { force = false, mirror = '', jobs = 0 } = {}) {    c
             rec.log = `${rec.log || ''}\n[config] [voice] default: ${migrated.from || '(空)'} → ${migrated.to}\n`.slice(-4000);
           }
         } catch {}
-        // 后置步骤：先拉声音模型/唱歌权重（都做 sha256 校验），再建 Python 环境，最后自检。
-        // 每一步按 postInstallWeights 分到一段进度条：不这样摊，用户看到的就是「卡在 99% 半小时」。
+        // 后置步骤：先拉模型/运行库（sha256 校验），再建 Python 环境（首次要几分钟）。
         const postScripts = (Array.isArray(m.postInstall) ? m.postInstall : (m.postInstall ? [m.postInstall] : []))
           .filter((x) => x);
         const weights = (Array.isArray(m.postInstallWeights) ? m.postInstallWeights : []).map((n) => Math.max(0, Number(n) || 0));
@@ -708,7 +1123,11 @@ async function install(id, { force = false, mirror = '', jobs = 0 } = {}) {    c
           rec.progress = Math.min(99, Math.round(90 + (weightDone / weightTotal) * 9));
           // 唱歌权重要下 2.6GB、本地语音包的 vendor+models 是 2.9GB：慢网 45 分钟不够，
           // 超时的表现只是「安装失败」，用户完全看不出是网速（2026-11-01）。
+          // 上游又按「1.84GB 国内 0.2~2MB/s 要 30~150 分钟」把默认拉到 3 小时：取较大值，
+          // 卡死交给包内 4 分钟无进展看门狗，这里只防脚本永久不退。
           const timeoutMs = (script.includes('fetch-svs') || script.includes('fetch-models') ? 150 : 45) * 60_000;
+          const capMs = Math.max(timeoutMs, Number(m.postInstallTimeoutMs) || 3 * 60 * 60_000);
+          rec.transferPct = null;
           const okPost = await new Promise((resolve) => {
             const env = { ...process.env };
             if (mirror) env.SURFCORE_GH_MIRROR = String(mirror);
@@ -718,7 +1137,7 @@ async function install(id, { force = false, mirror = '', jobs = 0 } = {}) {    c
             });
             rec.child = child;
             let out = '';
-            const timer = setTimeout(() => { try { child.kill(); } catch {} resolve(false); }, timeoutMs);
+            const timer = setTimeout(() => { try { child.kill(); } catch {} resolve(false); }, capMs);
             const onChunk = (d) => {
               const text = String(d);
               out = (out + text).slice(-4000); rec.log = out;
@@ -733,6 +1152,7 @@ async function install(id, { force = false, mirror = '', jobs = 0 } = {}) {    c
               if (m2) {
                 const pct = Math.min(100, Math.max(0, Number(m2[1])));
                 const here = weightDone + (weight * pct) / 100;
+                rec.transferPct = pct;
                 rec.progress = Math.min(99, Math.round(90 + (here / weightTotal) * 9));
                 rec.phase = `${phaseFor(script)} ${pct}%`;
               }
@@ -909,12 +1329,20 @@ async function install(id, { force = false, mirror = '', jobs = 0 } = {}) {    c
     }
     const dir = packDir(cfg, id);
     if (!(await exists(path.join(dir, 'config.toml')))) throw new Error('还没安装');
+    // 云端包：没填凭据就别启动——voxd 会起来，但每次合成都 401/403，
+    // 用户只会看到"启动成功、一说话就失败"。给一句能直接照做的提示。
+    if (id === 'voice-cloud') {
+      const conf = await readCloudConfig(id).catch(() => null);
+      if (!conf || !conf.configured) {
+        throw new Error('云端包还没填密钥：先在设置页「云端包：密钥与音色」填 AppID / Access Key / 音色 ID，再启动');
+      }
+    }
     // Python 环境缺失：不再让用户「卸载→安装」重来，直接自动补装（2026-10-28 主人反馈）。
     if (process.platform === 'win32' && !opts.skipEnvCheck) {
       const env = await envState(dir);
       if (!env.voxd) {
         if (!env.bootstrap) {
-          throw new Error('Python 环境缺失，包里也没有 scripts/bootstrap-env.mjs（旧版本）：先点「卸载」再「安装」一次');
+          throw new Error('Python 环境还没装好：先点「卸载」再「安装」重装一次（会自动创建 .venv 并装依赖）');
         }
         const r = await repairEnv(id);
         if (!r.ok) throw new Error(r.error || '自动安装 Python 环境失败');
@@ -954,28 +1382,63 @@ async function install(id, { force = false, mirror = '', jobs = 0 } = {}) {    c
       if (!engineUp) {
         const engineScript = path.join(dir, m.engineScript);
         if (await exists(engineScript)) {
-          const engineChild = spawn('cmd', ['/c', engineScript], { cwd: dir, detached: true, stdio: 'ignore', windowsHide: true });
+          const engineChild = spawn('cmd', ['/c', engineScript], { cwd: dir, detached: false, stdio: 'ignore', windowsHide: true });
           engineChild.unref();
           engineStarted = true;
         }
       }
     }
 
+    const direct = m.directStart && typeof m.directStart === 'object' ? m.directStart : null;
     const script = path.join(dir, m.startScript || 'run.bat');
-    if (!(await exists(script))) throw new Error(`包内缺少启动脚本：${m.startScript}`);
-    // stdio 必须给 stdin 一个空句柄：脚本里若还有 pause，'ignore' 会让它卡死不退。
-    // stderr 收进 rec.log，超时后杀进程树，避免留下僵尸。
-    const child = spawn('cmd', ['/c', script], {
-      cwd: dir,
-      detached: true,
-      stdio: ['ignore', 'ignore', 'pipe'],
-      windowsHide: true,
-    });
-    let startLog = '';
-    child.stderr?.on('data', (d) => { startLog = (startLog + String(d)).slice(-2000); });
+    if (!direct && !(await exists(script))) throw new Error(`包内缺少启动脚本：${m.startScript}`);
+    const logFile = path.join(dir, 'logs', 'startup.log');
+    try { fs.mkdirSync(path.dirname(logFile), { recursive: true }); fs.writeFileSync(logFile, ''); } catch {}
+    // 云端包直接拉 python，不经过 run.bat 的 start；否则 Python 的 stderr 不在桥接管道里，
+    // 只能看到 cmd 的一小段输出，超时后永远不知道真正原因。
+    let child;
+    if (direct) {
+      let python = path.join(dir, String(direct.python || '.venv/Scripts/python.exe'));
+      // Windows 的 python.exe 会创建控制台窗口（即使父进程 windowsHide）；
+      // venv 一般同时带 pythonw.exe，用它启动语音服务，彻底不弹黑框。
+      if (process.platform === 'win32') {
+        const pythonw = path.join(path.dirname(python), 'pythonw.exe');
+        if (fs.existsSync(pythonw)) python = pythonw;
+      }
+      const args = Array.isArray(direct.args) ? direct.args.map(String) : ['-m', 'voxd', '--config', 'config.toml'];
+      child = spawn(python, args, {
+        cwd: dir,
+        detached: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+        env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
+      });
+    } else {
+      child = spawn('cmd', ['/c', script], {
+        cwd: dir,
+        detached: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+        env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
+      });
+    }
+    const chunks = [];
+    let chunkBytes = 0;
+    let exitCode = null;
+    const collect = (d) => {
+      const b = Buffer.isBuffer(d) ? d : Buffer.from(String(d));
+      if (chunkBytes >= 8000) return;
+      const add = b.subarray(0, Math.max(0, 8000 - chunkBytes));
+      chunks.push(add);
+      chunkBytes += add.length;
+    };
+    child.stdout?.on('data', collect);
+    child.stderr?.on('data', collect);
+    child.on('error', (error) => { exitCode = -1; collect(Buffer.from(`spawn error: ${error?.message ?? error}\n`)); });
+    child.on('exit', (code) => { exitCode = code; });
     child.unref();
 
-    // 最多等 60 秒（本地包要加载模型）
+    // 最多等 60 秒（本地包要加载模型）；云端直连通常 1~3 秒。
     for (let i = 0; i < 60; i++) {
       await new Promise((r) => setTimeout(r, 1000));
       if (await probePort(m.port)) {
@@ -986,8 +1449,10 @@ async function install(id, { force = false, mirror = '', jobs = 0 } = {}) {    c
           ...(m.enginePort && !engineUp ? { warning: m.engineWarmupHint } : {}),
         };
       }
+      // 进程已经退出且端口没起来：没必要再傻等，马上把真实报错带回去。
+      if (exitCode !== null) break;
     }
-    // 超时：把这次拉起的进程树杀掉（cmd + python 子进程），别留占端口的僵尸。
+    // 超时/早退：把这次拉起的进程树杀掉（cmd + python 子进程），别留占端口的僵尸。
     try {
       if (child.pid) {
         await new Promise((resolve) => {
@@ -996,9 +1461,21 @@ async function install(id, { force = false, mirror = '', jobs = 0 } = {}) {    c
         });
       }
     } catch {}
+    const logText = decodeProcessLog(Buffer.concat(chunks)).trim();
+    const logTail = logText.slice(-1200);
+    try { fs.writeFileSync(logFile, `${logText}\n`, 'utf8'); } catch {}
+    const timedOut = exitCode === null;
     return {
-      ok: false, port: m.port,
-      error: `启动超时（60 秒内端口没起来）${startLog ? `；脚本输出：${startLog.slice(-300)}` : ''}`,
+      ok: false,
+      port: m.port,
+      code: timedOut ? 'VOICE_START_TIMEOUT' : 'VOICE_START_EXITED',
+      error: `${timedOut ? '启动超时（60 秒内端口没起来）' : `启动失败（进程已退出，exit ${exitCode}）`}`
+        + `${logTail ? `；脚本输出：${logTail}` : ''}；完整日志：${logFile}`,
+      hint: timedOut
+        ? '看完整日志里的最后一行；常见原因是端口被占用、.venv 依赖缺失或模型路径不对'
+        : '进程已经退出：看完整日志里的 Python traceback，按第一行错误修复；端口被占用时先停止旧进程',
+      logFile,
+      logTail,
     };
   }
 
@@ -1267,5 +1744,5 @@ async function install(id, { force = false, mirror = '', jobs = 0 } = {}) {    c
     return { ok: true, ms: Date.now() - t0, bytes: buf.length, seconds, duration: seconds };
   }
 
-  return { list, install, remove, start, stop, activate, cleanPartial, cancelInstall, repairEnv, cloudConfig, readCloudConfig, cloudStats, test, sampleFile, setEnabled, manifests, packsDir };
+  return { list, install, remove, start, stop, activate, cleanPartial, cancelInstall, repairEnv, cloudConfig, readCloudConfig, cloudStats, test, sampleFile, setEnabled, manifests, packsDir, inspectImport, startImport, cancelImport, deleteImportSource, deleteImportBackup };
 }

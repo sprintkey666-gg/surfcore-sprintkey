@@ -104,6 +104,25 @@ ok('解析 JSON / 纯文本 / skip', () => {
   assert.equal(plain.text, '今天就是很普通的一天。');
 });
 
+ok('解析容错：尾部句号 / 连续 JSON / 外层字符串 / 坏 JSON 不外发', () => {
+  const tail = parseExpressionDecision('{"action":"post","text":"今天风很好","reason":"开心"}。');
+  assert.equal(tail.action, 'post');
+  assert.equal(tail.text, '今天风很好');
+
+  const twice = parseExpressionDecision('{"action":"post","text":"第一句","reason":"a"}{"action":"post","text":"第二句","reason":"b"}');
+  assert.equal(twice.action, 'post');
+  assert.equal(twice.text, '第一句');
+
+  const inner = '{"action":"post","text":"外层字符串里的正文","reason":"r"}';
+  const wrapped = parseExpressionDecision(JSON.stringify(inner));
+  assert.equal(wrapped.action, 'post');
+  assert.equal(wrapped.text, '外层字符串里的正文');
+
+  const broken = parseExpressionDecision('{"action":"post","text":"换行没转义\n就坏了"}');
+  assert.equal(broken.action, 'skip');
+  assert.equal(broken.reason, 'unparsed-json');
+});
+
 ok('清洗链接、QQ 号、路径与媒体占位，并截断', () => {
   const text = sanitizeExpressionText('看这里 https://x.test/a 加我 123456789 路径 C:\\secret\\a.txt [图片] 结束', 'signature', 20);
   assert.equal(text.includes('https'), false);

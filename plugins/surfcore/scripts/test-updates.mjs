@@ -133,11 +133,16 @@ try {
     process.env.SURFCORE_UPDATE_NO_SPAWN = '1'; // 测试里不起"等宿主退出"的进程
     const result = await svc.apply(['core']);
     delete process.env.SURFCORE_UPDATE_NO_SPAWN;
-    ok(result.ok === true && result.updated === 1, `更新成功（updated=${result.updated}）`);
+    // 2026-10-29 起：暂存（staged）不算"已更新"，单列为 pendingRestart；updated 只统计真正落地的
+    ok(result.ok === true && result.updated === 0 && result.pendingRestart === 1,
+      `git 更新排队成功（updated=${result.updated} pendingRestart=${result.pendingRestart}）`);
     // 2026-10-28 起：git 更新也必须等宿主退出后再 merge（进程内 merge 会动正在加载的文件）
     ok(git(['rev-parse', 'HEAD'], work) === headBefore, '宿主进程内不改工作区（更新排队到退出后）');
     ok(result.results[0]?.staged === true, 'git 更新标记为 staged（退出后应用）');
     ok(result.restartRequired === true, '提示需要重启');
+    const afterStage = await svc.check({ fetch: true });
+    ok(afterStage.pendingCount === 0, 'staged 后再次检查不再把同一更新当 pending');
+    ok(afterStage.lastApply?.status === 'pending_restart', 'staged 状态显示为等待重启');
 
     // blocked 的组件不动
     const blockedSvc = createUpdatesService({
@@ -256,6 +261,14 @@ try {
     const svc = createUpdatesService({ stateDir, components: () => [{ id: 'x', name: 'X', dir: plain }] });
     const st = await svc.check({ fetch: false });
     ok(st.pendingCount === 0, '不可查的组件不会算进 pending');
+  }
+  {
+    const updatesSrc = fs.readFileSync(new URL('../lib/updates.js', import.meta.url), 'utf8');
+    const clientSrc = fs.readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+    ok(updatesSrc.includes('stagedTargets'), 'staged 用下载前捕获的目标键，不能从 no-fetch 结果算 vnull');
+    ok(updatesSrc.includes("phase: 'extract'") && updatesSrc.includes("'pending'"), '下载/解压/排队阶段可上报');
+    ok(clientSrc.includes('phaseText') && clientSrc.includes('onStaged') && clientSrc.includes('dl.percent') && clientSrc.includes('indeterminate: !dl || dl.percent == null'),
+      '进度条保留下载统计、有百分比时不再跑马灯，staged 后弹重启提示');
   }
 } finally {
   try { fs.rmSync(base, { recursive: true, force: true }); } catch {}
