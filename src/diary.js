@@ -14,6 +14,8 @@ export const DEFAULT_DIARY_CONFIG = Object.freeze({
   everyDays: 1,
   hour: 22,
   maxChars: 1200,
+  // 私密日记只落本地、只发给主人：默认允许真实姓名和私密细节；关掉则用代称。
+  allowPrivateDetails: true,
   // 一个文件放几篇：1 = 一篇一个文件（文件名就是那篇的时间）；
   // 5 = 五篇一个文件（文件名是起止时间跨度），第 6 篇另起新文件。
   perFile: 1,
@@ -56,6 +58,7 @@ export function normalizeDiaryConfig(raw) {
     everyDays: num(src.everyDays, def.everyDays, 1, 30),
     hour: num(src.hour, def.hour, 0, 23),
     maxChars: num(src.maxChars, def.maxChars, 200, 5000),
+    allowPrivateDetails: src.allowPrivateDetails !== false,
     perFile: num(src.perFile, def.perFile, 1, 50),
     send: {
       enabled: send.enabled === true,
@@ -425,6 +428,25 @@ export function isDiaryDue({ lastWriteAt, everyDays = 1, hour = 22, now = Date.n
   return { due: true, reason: 'slot' };
 }
 
+/**
+ * 日记素材里的人名标签。
+ * 私密日记允许真实姓名时直接用发送者昵称；公开日记/关闭开关时用代称，
+ * 避免把私聊对象带进空间动态或公开日记。
+ */
+export function diarySpeakerLabel(
+  { isSelf = false, isOwner = false, isGroup = false, sender = '' } = {},
+  { audience = 'owner', allowPrivateDetails = false } = {},
+) {
+  if (isSelf) return '我';
+  const name = String(sender ?? '').trim().slice(0, 40);
+  if (String(audience) === 'public') {
+    if (isOwner) return '主人';
+    return isGroup ? (name || '群友') : '对方';
+  }
+  if (allowPrivateDetails !== false) return name || (isOwner ? '主人' : '对方');
+  return isOwner ? '主人' : '对方';
+}
+
 export function buildDiaryPrompt({
   characterName,
   persona,
@@ -433,6 +455,7 @@ export function buildDiaryPrompt({
   now = Date.now(),
   audience = 'owner',
   allowNames = true,
+  allowPrivateDetails = true,
 }) {
   const name = String(characterName || '我').trim();
   const when = new Date(now).toLocaleString('zh-CN', { hour12: false });
@@ -441,6 +464,7 @@ export function buildDiaryPrompt({
   // 两本日记的「隐私线」不一样：
   // - 私密日记只发给主人，写得越真越好，所以允许点名、允许写谁说了什么；
   // - 公开日记会发到空间，人名可以留（不然整篇像公文），但钱/账号/证件/联系方式一律不写。
+  const privateDetails = allowPrivateDetails !== false;
   const rules = isPublic
     ? [
         allowNames ? '可以写谁说了什么、谁发起的（群里的人名可以出现）' : '不要写任何人的名字，用「有人」「一个朋友」指代',
@@ -450,11 +474,20 @@ export function buildDiaryPrompt({
         '不要照抄聊天原句，用自己的话讲',
         '不要提到这是从聊天记录里看来的',
       ]
-    : [
-        allowNames ? '可以写谁说了什么、谁发起的（想点名就点名，写具体才像日记）' : '不要写任何人的名字',
-        '只有一条底线：不写密码、验证码、银行卡、身份证、转账金额',
-        '不要提到这是从聊天记录里看来的',
-      ];
+    : privateDetails
+      ? [
+          '这是只给你和主人看的私密日记：可以写谁说了什么、真实姓名、昵称、关系、对话细节、具体时间地点、金额、工作/学校等私密信息，想点名就点名',
+          '不要编造没发生的事；不确定的细节就略过',
+          '不写密码、验证码、银行卡、身份证、转账金额',
+          '不要提到这是从聊天记录里看来的',
+          '整篇只写一遍；结尾不要重复开头或中间已经写过的段落',
+        ]
+      : [
+          '不要写任何人的名字，用「主人」「对方」「一个朋友」指代',
+          '不要写住址、单位、学校、金额、账号、联系方式等可识别信息',
+          '不要写密码、验证码、银行卡、身份证',
+          '不要提到这是从聊天记录里看来的',
+        ];
   return [
     `你是「${name}」，现在是 ${when}。`,
     persona ? `你的人物设定（节选）：${String(persona).replace(/\s+/g, ' ').trim().slice(0, 900)}` : '',

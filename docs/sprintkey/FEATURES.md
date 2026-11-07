@@ -126,7 +126,7 @@
 ## 11. 日记（本地 + 只发主人）
 
 - **做什么**：按间隔自动写一篇 Markdown 日记；可自定义目录；可只私聊发给主人。
-- **配置**：`socialV2.diary = { enabled, dir, everyDays(默认1), hour(默认22), maxChars(默认1200), send:{enabled,withFile} }`；默认全关。
+- **配置**：`socialV2.diary = { enabled, dir, everyDays(默认1), hour(默认22), maxChars(默认1200), allowPrivateDetails(默认true), send:{enabled,withFile} }`；自动写默认关；`allowPrivateDetails` 默认开。
 - **路径**：选目录后存 `<dir>/<角色ID>.md`；留空 = `<DSH_HOME>\surfcore\diary\<角色ID>.md`。
 - **目录选择器**：设置页「浏览…」打开自绘 `DirPicker`（列 C/D/E 等盘符、进目录、手输路径 + 前往），不再依赖系统 `FolderBrowserDialog`；后端 `GET /dsh-surfcore/api/browse-list?path=`。
 - **接口**：`GET/POST /api/socialV2/diary`，action=`status|write|send`；`force:true` 绕过开关。
@@ -135,7 +135,7 @@
 
 - **2026-11-02 起：一文一档**：每篇日记按时间建一个文件（`<目录>/<角色ID>/2026-11-01_21-30.md`），可设「每 N 篇合并成一档」，设置页只列最近 5 篇；老的 `<目录>/<角色ID>.md` 会转成 `*.legacy-<ts>.bak`。
 - **公开日记**：`socialV2.diary.public = { enabled, dir, everyDays, hour, maxChars, perFile, visibility(1/4/64), maxPerDay, allowNames }`，写完直接发 QQ 空间（`send_qzone_msg`）。人名可以留（群里的事、谁发起的可以用昵称），钱/账号/证件/手机号/QQ 号/链接/住址一律清洗。
-- **私密日记**：仍只私聊发给主人，可放开隐私（可以写真实的人和事），只禁密码/验证码/银行卡/身份证/转账金额。
+- **私密日记**：仍只私聊发给主人；`allowPrivateDetails`（默认开）打开时，素材里的人名用真实昵称、可写关系/细节/地点/金额，只禁密码/验证码/完整银行卡/身份证号；关掉则退回「主人/对方」代称并禁可识别信息。开关只管新日记，不重写旧文。
 
 ## 12. Sprintkey 子设置分页
 
@@ -501,7 +501,7 @@
 | `src/diary.js` | 日记配置、按角色文件、追加与状态 |
 | `scripts/test-memory-backup.mjs` | 记忆卡备份 + 聊天存档发送 18 项单测（含全发/增量切换） |
 | `scripts/test-chat-archive.mjs` | 聊天原文存档 10 项单测（schema2/channel/桌宠字幕/分文件/滚动/去重/关闭/出站/status） |
-| `scripts/test-self-expression.mjs` | 签名/动态/日记 16 项单测 |
+| `scripts/test-self-expression.mjs` | 签名/动态/日记 19 项单测 |
 | `plugins/surfcore/scripts/ui-sprintkey.mjs` | Sprintkey 8 页 CDP 验收 |
 | `plugins/surfcore/scripts/ui-self-expression.mjs` | QQ 签名卡 + 日记页 CDP 验收 |
 | `plugins/surfcore/scripts/ui-dir-picker.mjs` | 日记目录选择器 CDP 验收 |

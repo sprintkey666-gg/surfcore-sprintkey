@@ -11,7 +11,7 @@ import {
 } from '../src/self-expression.js';
 import {
   DEFAULT_DIARY_CONFIG, normalizeDiaryConfig, diaryBaseDir, diaryFileFor,
-  isDiaryDue, buildDiaryPrompt, cleanDiaryText, formatDiaryEntry,
+  isDiaryDue, buildDiaryPrompt, cleanDiaryText, diarySpeakerLabel, formatDiaryEntry,
   appendDiaryEntry, readDiaryTail, diaryStateFile, readDiaryState,
   writeDiaryState, characterDiaryState,
 } from '../src/diary.js';
@@ -147,12 +147,13 @@ ok('状态文件按角色读写', () => {
 
 console.log('diary');
 
-ok('日记默认：关、每 1 天、22 点、发主人、带文件', () => {
+ok('日记默认：关、每 1 天、22 点、发主人、带文件、私密细节开', () => {
   const cfg = normalizeDiaryConfig(undefined);
   assert.deepEqual(cfg, DEFAULT_DIARY_CONFIG);
   assert.equal(cfg.everyDays, 1);
   assert.equal(cfg.send.enabled, false);
   assert.equal(cfg.send.withFile, true);
+  assert.equal(cfg.allowPrivateDetails, true);
 });
 
 ok('日记坏值收敛', () => {
@@ -164,6 +165,8 @@ ok('日记坏值收敛', () => {
   assert.equal(cfg.maxChars, 200);
   assert.equal(cfg.send.enabled, false);
   assert.equal(cfg.send.withFile, true);
+  assert.equal(cfg.allowPrivateDetails, true);
+  assert.equal(normalizeDiaryConfig({ allowPrivateDetails: false }).allowPrivateDetails, false);
 });
 
 ok('目录与文件名：默认 / 自定义 / 角色名清洗', () => {
@@ -192,6 +195,25 @@ ok('prompt 与正文清洗', () => {
   const text = cleanDiaryText('日记：今天很好。\n\n第二段。', 1200);
   assert.equal(text.startsWith('今天很好'), true);
   assert.ok(text.length <= 1200);
+});
+
+ok('私密日记开关：真实姓名 / 代称', () => {
+  const on = buildDiaryPrompt({ characterName: '小鲸鱼', context: '楠楠：今天去医院了', allowPrivateDetails: true });
+  assert.match(on, /真实姓名/);
+  assert.doesNotMatch(on, /不要写任何人的名字/);
+  const off = buildDiaryPrompt({ characterName: '小鲸鱼', context: '主人：今天去医院了', allowPrivateDetails: false });
+  assert.match(off, /不要写任何人的名字/);
+  assert.match(off, /不要写住址、单位、学校、金额/);
+});
+
+ok('日记人名标签：私密开/关、公开、自己', () => {
+  const owner = { isOwner: true, sender: '楠楠' };
+  assert.equal(diarySpeakerLabel(owner, { audience: 'owner', allowPrivateDetails: true }), '楠楠');
+  assert.equal(diarySpeakerLabel(owner, { audience: 'owner', allowPrivateDetails: false }), '主人');
+  assert.equal(diarySpeakerLabel({ isGroup: true, sender: '小林' }, { audience: 'public', allowPrivateDetails: true }), '小林');
+  assert.equal(diarySpeakerLabel({ sender: '小林' }, { audience: 'public', allowPrivateDetails: true }), '对方');
+  assert.equal(diarySpeakerLabel({ isSelf: true }, { audience: 'owner', allowPrivateDetails: true }), '我');
+  assert.equal(diarySpeakerLabel({}, { audience: 'owner', allowPrivateDetails: true }), '对方');
 });
 
 ok('Markdown 追加与尾部预览', () => {
