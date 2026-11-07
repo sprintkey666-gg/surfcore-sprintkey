@@ -44,6 +44,7 @@ import * as questionAnswers from '../src/question-answers.js';
 import * as ownerAudit from '../src/owner-audit.js';
 import * as roleCard from '../src/role-card.js';
 import * as personaLayers from '../src/persona-layers.js';
+import * as personaWakeInject from '../src/persona-wake-inject.js';
 import * as wakePolicy from '../src/wake-policy.js';
 import * as groupPolicy from '../src/group-policy.js';
 import * as actionPlanner from '../src/action-planner.js';
@@ -344,7 +345,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     synthesizeSongToFile,
     ...singNotes,
     ...tokenBudget,
-    ...adminIdentity, ...roleCard, ...personaLayers, ...wakePolicy, ...groupPolicy, ...actionPlanner, ...sessionMap, ...contextTelemetry, ...memoryCard, ...vectorMemory, ...biliCard, ...characterStore, ...historyCatchup,
+    ...adminIdentity, ...roleCard, ...personaLayers, ...personaWakeInject, ...wakePolicy, ...groupPolicy, ...actionPlanner, ...sessionMap, ...contextTelemetry, ...memoryCard, ...vectorMemory, ...biliCard, ...characterStore, ...historyCatchup,
     ...questionAnswers, ...ownerAudit, ...turnGuard, ...gateEvents,
     ...purposeEngine,
     ...conversationClosure,

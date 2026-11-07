@@ -22,6 +22,7 @@ import { dynamicDefaults, normalizeDynamics } from '../tools/lib/kinds.mjs';
 import { DEFAULT_QQ_FISH_GUARD, normalizeQqFishGuard } from '../../../src/fish-guard.js';
 import { adminFromSources, normalizeAdmin } from '../../../src/admin-identity.js';
 import { DEFAULT_MEMORY_CARD_CONFIG, normalizeMemoryCardConfig } from '../../../src/memory-card.js?rev=20261025-pet-memory2';
+import { normalizeWakeInject, normalizeWakeTrimChars } from '../../../src/persona-wake-inject.js';
 import { DEFAULT_VECTOR_MEMORY_CONFIG, normalizeVectorMemoryConfig } from '../../../src/vector-memory.js';
 import { normalizeCardMode } from '../../../src/share-mode.js';
 import { normalizeClockText, normalizeWindow } from '../tools/lib/time-window.mjs';
@@ -81,6 +82,10 @@ export const DEFAULT_UNIFIED = {
     compactChars: 2200,
     // full = 整卡注入（完整但费 token）；split = 分层注入（省 token，可能不完整）。
     mode: 'full',
+    // 唤醒提示词里「人格卡怎么注入」：card = 0.8.9 原样印整卡；pointer = 0.6.22 原样只给指针；
+    // trim = 印卡但按 wakeTrimChars 截断（折中档，旧版没有）。由 bridge 每轮现读本文件，改完即生效。
+    wakeInject: 'card',
+    wakeTrimChars: 2500,
   },
   // 管理员身份（QQ ⇄ B站 同一个人）：唯一真相在合体层，保存时投影到
   // QQ config.json 的 ownerQQ 与 B站 bili.config.json 的 owner.mid/name。
@@ -668,6 +673,11 @@ export function saveUnified(incoming) {
   next.vectorMemory = normalizeVectorMemoryConfig(next.vectorMemory);
   next.memory = isPlainObject(next.memory) ? next.memory : {};
   next.memory.mode = next.memory.mode === 'vector' ? 'vector' : 'narrative';
+  // 唤醒人格注入方式：只认 card/trim/pointer；trim 的字数上限也要钳制，
+  // 否则界面显示 99999、桥接按 6000 算，用户会以为「改了没生效」。
+  next.persona = isPlainObject(next.persona) ? next.persona : {};
+  next.persona.wakeInject = normalizeWakeInject(next.persona.wakeInject);
+  next.persona.wakeTrimChars = normalizeWakeTrimChars(next.persona.wakeTrimChars);
   // 平台启动开关：只收布尔，缺省 true。旧字段 bridge.autoStart 同步镜像一次，
   // 让「降级回旧版」或手工读配置的人看到同一份选择（新代码只认 platforms.start）。
   next.platforms = isPlainObject(next.platforms) ? next.platforms : {};

@@ -488,10 +488,10 @@ assert.ok(source.includes("（待补链）"), "百度/UC 必须标待补链");
 assert.ok(source.includes('function SubTabs'), '缺少二级页签组件 SubTabs');
 assert.ok(source.includes('h(SubTabs, { tabs: SPRINTKEY_PAGES'), 'Sprintkey 页没有渲染二级页签');
 assert.deepEqual((client.SPRINTKEY_PAGES || []).map(([id]) => id),
-  ['model', 'memory', 'voice', 'cross', 'tree', 'tools', 'limits', 'api'], 'Sprintkey 页签清单不对');
+  ['model', 'prompt', 'memory', 'voice', 'cross', 'tree', 'tools', 'limits', 'api'], 'Sprintkey 页签清单不对');
 assert.equal((source.match(/socialV2\.crossMemory\.enabled/g) || []).length, 1, '跨会话开关只应保留一处（共享页）');
 assert.ok(!source.includes('这里放 Sprintkey 自己的设置：模型、投递通道'), '旧的 Sprintkey 三行说明应替换成一行提示');
-for (const id of ['model', 'memory', 'voice', 'cross', 'tree', 'tools', 'limits', 'api']) {
+for (const id of ['model', 'prompt', 'memory', 'voice', 'cross', 'tree', 'tools', 'limits', 'api']) {
   assert.ok(source.includes(`hidden: activePage !== "${id}"`), `Sprintkey 缺少页签对应的隐藏条件：${id}`);
 }
 console.log('client contract tests OK');

@@ -115,7 +115,7 @@ import {
 } from './self-expression.js';
 import {
   appendDiaryEntry, appendDiaryEntryGrouped, buildDiaryPrompt, characterDiaryState, cleanDiaryText,
-  diaryBaseDir, diaryCharDir, diaryFileFor, diaryNextDueAt, diaryPublicBaseDir, diaryPublicCharDir, diarySpeakerLabel, diaryStateFile,
+  diaryBaseDir, diaryCharDir, diaryFileFor, diaryNextDueAt, diaryPublicBaseDir, diaryPublicCharDir, diaryStateFile,
   formatDiaryEntry, isDiaryDue, listDiaryEntries, listDiaryFiles, migrateLegacyDiary,
   normalizeDiaryConfig, publicPublishQuota, readDiaryState, readDiaryTail, scrubPublicText, writeDiaryState,
 } from './diary.js';
@@ -124,6 +124,9 @@ import {
   normalizeVoiceConfig, personaAnchorText, voiceStats,
 } from './voice-profile.js';
 import { composePersonaLayers, personaSceneFromKey } from './persona-layers.js';
+import {
+  DEFAULT_WAKE_INJECT, normalizeWakeInject, normalizeWakeTrimChars, pointerLine, wrapCardBlock,
+} from './persona-wake-inject.js';
 import { isHardDirectWakeReason, hasStrictDirectUnread } from './wake-policy.js';
 import { DEFAULT_GROUP_POLICY, normalizeGroupPolicy, groupTier, shouldSkipTriggerForTier } from './group-policy.js';
 import { buildContextSnapshot, DEFAULT_SNAPSHOT_CAPS } from './context-snapshot.js';
@@ -5198,7 +5201,7 @@ async function main() {
   }
 
   /** recentMessages → 一段「最近发生的事」，只给模型当素材，不直接外发。 */
-  function lifeContext(maxChars = 2600, { audience = 'owner', allowPrivateDetails = false } = {}) {
+  function lifeContext(maxChars = 2600) {
     const cutoff = Date.now() - 36 * 3600_000;
     const rows = [];
     for (const [key, st] of socialV2.conversations.entries()) {
@@ -5208,10 +5211,7 @@ async function main() {
         if (!at || at < cutoff) continue;
         const text = String(m.plain || m.text || '').replace(/\s+/g, ' ').trim();
         if (!text) continue;
-        const who = diarySpeakerLabel(
-          { isSelf: m.isSelf === true, isOwner: m.isOwner === true, isGroup, sender: m.sender },
-          { audience, allowPrivateDetails },
-        );
+        const who = m.isSelf ? '我' : (m.isOwner ? '主人' : (isGroup ? String(m.sender || '群友') : '对方'));
         rows.push({ at, line: `[${new Date(at).toLocaleTimeString('zh-CN', { hour12: false })}] ${who}：${text.slice(0, 100)}` });
       }
     }
@@ -5408,14 +5408,9 @@ async function main() {
       const prompt = buildDiaryPrompt({
         characterName: snap.ch.name,
         persona: snap.ch.persona,
-        context: lifeContext(2600, {
-          audience: 'owner',
-          allowPrivateDetails: snap.cfgDiary.allowPrivateDetails !== false,
-        }),
+        context: lifeContext(),
         maxChars: snap.cfgDiary.maxChars,
         now: Date.now(),
-        audience: 'owner',
-        allowPrivateDetails: snap.cfgDiary.allowPrivateDetails !== false,
       });
       const output = await runLifePrompt(prompt);
       const text = cleanDiaryText(output, snap.cfgDiary.maxChars);
@@ -5562,12 +5557,11 @@ async function main() {
       const prompt = buildDiaryPrompt({
         characterName: snap.ch.name,
         persona: snap.ch.persona,
-        context: lifeContext(2600, { audience: 'public', allowPrivateDetails: false }),
+        context: lifeContext(),
         maxChars: snap.pub.maxChars,
         now: Date.now(),
         audience: 'public',
         allowNames: snap.pub.allowNames,
-        allowPrivateDetails: false,
       });
       const output = await runLifePrompt(prompt);
       const cleaned = cleanDiaryText(output, snap.pub.maxChars);
@@ -8426,6 +8420,39 @@ async function main() {
               maxSeconds: voiceCfg().maxSeconds,
               hint: '可用 qq_list_voices 查看语音库，再用 qq_send_voice 把其中一个当语音发出去'
             }
+          });
+          return;
+        }
+        // 设置页「提示词注入」用：把三档各自会注入多少字算给前端看（只读、不触发任何发送）。
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/persona-preview') {
+          const setting = personaWakeSetting();
+          const roleName = readRoleState().role;
+          const preview = (inject) => {
+            try {
+              const text = personaWakeBlockFor('', inject, inject === 'trim' ? setting.trimChars : 0);
+              return { chars: text.length, preview: text.slice(0, 300) };
+            } catch (error) {
+              return { chars: -1, preview: '', note: String(error?.message ?? error) };
+            }
+          };
+          const card = preview('card');
+          const trim = preview('trim');
+          const pointer = preview('pointer');
+          sendJson({
+            ok: true,
+            wakeInject: setting.inject,
+            wakeTrimChars: setting.trimChars,
+            personaMode: personaInjectionMode(),
+            roleName: roleName || '',
+            roleMaxInjectChars,
+            card,
+            trim,
+            pointer,
+            saving: {
+              chars: Math.max(0, card.chars - pointer.chars),
+              tokensEstimate: Math.round(Math.max(0, card.chars - pointer.chars) * 0.7),
+            },
+            lastWake: lastWakePromptStats,
           });
           return;
         }
@@ -17247,7 +17274,11 @@ async function main() {
     const tone = split ? readPersonaLayerText('tone') : '';
     const identity = personaIdentityText();
     const composed = composePersonaLayers({
-      core, scene, daily, tone, identity: identity, personaMode: resolvedMode, mode, maxChars: roleInjectMaxChars, sceneId,
+      core, scene, daily, tone, identity: identity, personaMode: resolvedMode, mode,
+      // opts.maxChars：唤醒侧「缩卡」档要把这一轮的卡压短，只在 personaLookup 的内部用，
+      // 不传就沿用 role.maxInjectChars（默认 6000）。
+      maxChars: Number(opts?.maxChars) > 0 ? Math.round(Number(opts.maxChars)) : roleInjectMaxChars,
+      sceneId,
     });
     const base = composed.text || '';
     // personaOnly：只要人格卡正文（唤醒提示词用）。管理员规则 / B站简报 / 记忆卡
@@ -18373,23 +18404,40 @@ async function main() {
   // 背景（2026-11-01）：以前这里只有一句「完整角色卡请调用 qq_get_prompt 查看」，
   // 实测模型几乎不调这个工具（state/tool-calls.jsonl：1830 次工具调用里只有 10 次，
   // 2026-11-01 当天 0 次），于是「她不知道自己是谁」成了常态。
-  // 现在改走 A1：唤醒侧直接印一份人格卡正文，和 qq_get_prompt 同源
+  // 于是 0.8.9 改走 A1：唤醒侧直接印一份人格卡正文，和 qq_get_prompt 同源
   // （都经 composePersonaLayers 组装），不是手抄两遍 —— 改卡不会漂。
-  // 预算沿用 role.maxInjectChars（默认 6000 字）；全量 / 场景语气 / 推荐值仍由工具提供。
-  function personaWakeBlockV2(key) {
+  // 但整卡每条唤醒多六七千字，主人在 2026-11-07 要求能切回旧版/折中：
+  //   persona.wakeInject = card（默认，0.8.9 原样）| trim（卡正文按字数截断）| pointer（0.6.22 原样）
+  // 三档的文本组装都在 src/persona-wake-inject.js（纯函数、可单测）。
+  function personaWakeSetting() {
+    try {
+      const raw = readJsonSafe(path.join(SURFCORE_DIR, 'config.json'), {});
+      return {
+        inject: normalizeWakeInject(raw?.persona?.wakeInject),
+        trimChars: normalizeWakeTrimChars(raw?.persona?.wakeTrimChars),
+      };
+    } catch {
+      return { inject: DEFAULT_WAKE_INJECT, trimChars: normalizeWakeTrimChars(0) };
+    }
+  }
+
+  function personaWakeBlockFor(key, inject, trimChars) {
     const roleState = readRoleState();
+    if (inject === 'pointer') return pointerLine(roleState.role);
     let card = '';
     try {
-      card = roleHintForMode('v2', key, '', { personaOnly: true });
+      card = inject === 'trim'
+        ? roleHintForMode('v2', key, '', { personaOnly: true, maxChars: trimChars })
+        : roleHintForMode('v2', key, '', { personaOnly: true });
     } catch (error) {
       log(`唤醒人格卡组装失败（降级为指针）：${error?.message ?? error}`);
     }
-    if (!card) {
-      // 没有卡（角色名为空 / 文件读不到）时保持旧行为，至少给个指针。
-      return roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
-    }
-    const name = roleState.role || '（未命名角色）';
-    return `【当前角色】${name}\n${card}\n（完整角色卡 / 场景语气 / 推荐值 / 可用工具：可调用 qq_get_prompt 查看）\n\n`;
+    return wrapCardBlock({ name: roleState.role, card });
+  }
+
+  function personaWakeBlockV2(key) {
+    const setting = personaWakeSetting();
+    return personaWakeBlockFor(key, setting.inject, setting.trimChars);
   }
 
   function buildWakePromptV2Base(key, reason, vectorBlock = '', pre = null) {
@@ -18601,6 +18649,9 @@ async function main() {
   // 2026-11-07 同步上游：正文由 buildWakePromptV2Base（含 personaWakeBlockV2 / 向量记忆块）生成，
   // 这里只叠加「本分支独有」的两件事：任务继承块 + 末尾声线尾巴。
     // 唤醒侧的人格卡必须和 qq_get_prompt 同源：先取一次，Base 直接复用（不重复读盘）。
+  // 最近一次唤醒提示词的体量（设置页「提示词注入」用来看切换效果；只留内存，不落盘）。
+  let lastWakePromptStats = null;
+
   function buildWakePromptV2(key, reason, vectorBlock = '') {
     const roleState = readRoleState();
     const roleLine = personaWakeBlockV2(key);
@@ -18609,7 +18660,16 @@ async function main() {
     const migrate = taskInheritPromptBlockV2(st);
     const vp = voiceLinesFor(key, { quiet: true });
     const body = migrate ? `${text}\n${migrate}` : text;
-    return vp.tail ? `${body}\n${vp.tail}` : body;
+    const final = vp.tail ? `${body}\n${vp.tail}` : body;
+    try {
+      lastWakePromptStats = {
+        at: Date.now(),
+        chars: final.length,
+        roleChars: roleLine.length,
+        inject: personaWakeSetting().inject,
+      };
+    } catch {}
+    return final;
   }
 
   // 主动冒泡 / 收尾这类「自己开口」的路径也要带声线，否则最容易露 AI 味。

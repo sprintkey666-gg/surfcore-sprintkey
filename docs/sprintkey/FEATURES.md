@@ -696,6 +696,32 @@
 
 **验证**：`node scripts/test-orb.mjs`（67 + 334 项）、`node scripts/test-orb-window-state.mjs`（28 项）；真机：鼠标划过 / 单击 / 双击 / 右键都不位移，按住左键 320ms 再拖才跟手。
 
+## 38. 唤醒提示词注入方式可切换：card / trim / pointer（2026-11-07）
+
+**为什么要有**：上游 v0.8.9 把唤醒侧的人格注入从「一句指针」改成「直接印整张人格卡正文」（`personaWakeBlockV2` → `roleHintForMode(..., { personaOnly: true })`）。主人 2026-11-07 实测同一轮唤醒 **7,553 字**，其中 `【人格核心】6,978 字` —— 一天几十上百条，就是十几万 token 的差。
+
+**三档（`persona.wakeInject`）**
+
+| 档位 | 含义 | 每条大致字数 |
+| --- | --- | --- |
+| `card`（默认） | 0.8.9 原样：印整卡正文，上限吃 `role.maxInjectChars`（默认 6000） | 7,553（实测） |
+| `trim` | 0.8.9 的卡按 `persona.wakeTrimChars`（800~6000，默认 2500）截断 —— **折中档，旧版没有** | ~3,100 |
+| `pointer` | 0.6.22 原样：`【当前角色】<名字>（完整角色卡请调用 qq_get_prompt 查看）` —— 与旧代码逐字一致 | ~575 |
+
+**入口**：设置 → Sprintkey 扩展 → 「提示词注入」页签（`client.js` 的 `SPRINTKEY_PAGES` 里 id `prompt`）。页面上还并排放着「B站记忆简报」（每次约 4.3k 字，`biliBridge.memory.enabled`）和「人格注入上限」（`role.maxInjectChars`，只在 `card` 档生效），并实时显示三档字数与「换成指针每条省多少」。
+
+**代码**：`src/persona-wake-inject.js`（纯组装，可单测；`pointerLine` / `wrapCardBlock` / 两个归一化函数）；`src/bridge.js` 的 `personaWakeSetting()`（每轮现读 `~/.dsh/surfcore/config.json` 的 `persona.*`）、`personaWakeBlockFor()`、`personaWakeBlockV2()`；只读预览接口 `GET /api/socialV2/persona-preview`（返回三档 chars/preview + 最近一次唤醒的 `{chars, roleChars, inject}`）；`store.js` 的 `DEFAULT_UNIFIED.persona.wakeInject/wakeTrimChars` 与 `saveUnified()` 归一化。
+
+**注意（踩过的坑）**
+
+- 配置写在 **unified**（`~/.dsh/surfcore/config.json` 的 `persona`），不在 QQ 配置里；设置页必须用 `setUnified(p("persona.wakeInject"))`，写成 `set(...)` 会读不到。
+- `trim` 档走的是 `roleHintForMode(..., { maxChars })`，`composePersonaLayers` 的预算实测生效（6000→6002、2500→2502）。
+- 改完**下一条唤醒**就生效（桥接每轮现读），但页面本身要重启一次 DSH 才会出现新页签。
+- `scripts/test-persona-wake-injection.mjs` 用源码正则钉住旧形状，改 `buildWakePromptV2` 前先看它。
+- 顺带修掉的旧 bug（m06338）：弹窗里 `select.qbw-select` 只有透明底、没补弹窗内底色，白底白字看不见 —— 现在 `.qbw-modal select.qbw-select` 与 `input` 同款补丁。
+
+**验证**：`node scripts/test-prompt-inject-mode.mjs`（含用 `git show pre-sync-0.6.22-sprintkey:src/bridge.js` 取旧源码做逐字对照）、`node scripts/test-persona-wake-injection.mjs`、`node plugins/surfcore/scripts/test-client-contract.mjs`；真机：设置页切换三档后，`GET /api/socialV2/persona-preview` 的 `lastWake.chars` 应随之变化。
+
 ## 新增功能时按这个格式补一条
 
 1. 在总表加一行（功能 / 入口 / 代码 / 配置键）；

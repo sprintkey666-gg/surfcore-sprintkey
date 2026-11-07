@@ -52,8 +52,11 @@ window.__ModuleLoader__.load({
     const CSS = `
 /* 主题语义层：只用 DSH 提供的 light/dark token，组件里不再写死颜色。
    on-brand 用 bg-base：浅色主题是浅字压深品牌色，深色主题是深字压浅品牌色。 */
-:root{
-  --qbw-surface: var(--dsw-alias-bg-overlay, var(--dsw-alias-bg-layer-1, #ffffff));
+/* 注意：DSH 的 --dsw-alias-* 只挂在设置面板那一层容器上（:root 上没有），
+   所以这一整层 token 必须同时声明在插件自己的根节点上，否则在面板里会全部落到
+   兜底值（白底 + 深色主题的浅字 = 看不见的控件）。 */
+:root,.qbw-app,.qbw-body,.qbw-modal,.qbw-toast{
+  --qbw-surface: var(--dsw-alias-bg-layer-1, var(--dsw-alias-bg-overlay, #ffffff));
   --qbw-surface-2: var(--dsw-alias-bg-layer-2, #f2f4f7);
   --qbw-text: var(--dsw-alias-label-primary, #1f2328);
   --qbw-muted: var(--dsw-alias-label-secondary, #5b6472);
@@ -70,7 +73,7 @@ window.__ModuleLoader__.load({
   --qbw-err-text: var(--qbw-err);
 }
 @supports (color: color-mix(in srgb, #000 50%, #fff)){
-  :root{
+  :root,.qbw-app,.qbw-body,.qbw-modal,.qbw-toast{
     --qbw-ok-text: color-mix(in srgb, var(--qbw-ok) 70%, var(--qbw-text));
     --qbw-warn-text: color-mix(in srgb, var(--qbw-warn) 55%, var(--qbw-text));
     --qbw-err-text: color-mix(in srgb, var(--qbw-err) 85%, var(--qbw-text));
@@ -125,7 +128,10 @@ window.__ModuleLoader__.load({
 .qbw-row>div:first-child{flex:1;min-width:190px}
 .qbw-label{font-size:12.5px;line-height:19px}
 .qbw-hint{color:var(--qbw-muted);margin-top:2px;font-size:11px;line-height:17px}
-.qbw-input,.qbw-select,.qbw-textarea{box-sizing:border-box;background:transparent;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;color:var(--dsw-alias-label-primary);font-size:12.5px;min-height:28px;padding:3px 8px;min-width:180px;outline:none;font-family:inherit}
+.qbw-input,.qbw-select,.qbw-textarea{box-sizing:border-box;background:transparent;border:1px solid var(--qbw-line);border-radius:6px;color:var(--qbw-text);font-size:12.5px;min-height:28px;padding:3px 8px;min-width:180px;outline:none;font-family:inherit}
+/* 下拉框不能只靠透明底 + 边框：在浅色弹窗里会和背景糊在一起。给它一层自己的底和箭头留白。 */
+.qbw-select{background:var(--qbw-surface-2);padding-right:22px;cursor:pointer}
+.qbw-select:disabled{cursor:default;opacity:.6}
 .qbw-input:focus-visible,.qbw-select:focus-visible,.qbw-textarea:focus-visible{border-color:var(--dsw-alias-brand-primary)}
 .qbw-input.wide,.qbw-textarea.wide{min-width:320px}
 .qbw-textarea{width:100%;min-height:90px;resize:vertical;line-height:18px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px}
@@ -219,6 +225,7 @@ window.__ModuleLoader__.load({
 .qbw-modal h3,.qbw-modal p,.qbw-modal label,.qbw-modal div,.qbw-modal span,.qbw-modal strong,.qbw-modal li{color:inherit}
 .qbw-modal .qbw-hint{color:var(--qbw-muted)}
 .qbw-modal input.qbw-input{background:var(--qbw-surface-2);color:var(--qbw-text);border:1px solid var(--qbw-line)}
+.qbw-modal select.qbw-select,.qbw-modal textarea.qbw-textarea{background:var(--qbw-surface-2);color:var(--qbw-text);border:1px solid var(--qbw-line)}
 .qbw-modal input[type=checkbox]{accent-color:var(--qbw-brand)}
 /* ── Token 额度页 ─────────────────────────────────────────────── */
 .qbw-budget-summary{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;flex-wrap:wrap;border:1px solid rgba(31,111,235,.28);background:linear-gradient(135deg,rgba(31,111,235,.10),rgba(255,122,162,.06));border-radius:12px;padding:12px 14px;margin:0 0 12px}
@@ -3397,13 +3404,11 @@ F("toolsPath", "bili.mjs 路径", "留空 = 用合体插件自带的 tools/", "t
           "关机错过的写作/发送会在下次启动后补一次；改完点底部「保存」，约 1 分钟生效。"),
         h(Section, {
           title: "私密日记 · 只发主人",
-          note: "写给主人看的：默认允许真实姓名和私密细节，可用下面开关关掉；密码/验证码/银行卡仍不写。",
+          note: "写给主人看的，可以写真实的人和事（密码/转账仍不写）。",
           collapsible: false,
         },
           h(Row, { label: "启用日记", hint: "关 = 不自动写；手动「立即写日记」仍然可用" },
             h("input", { type: "checkbox", className: "qbw-switch", checked: d.enabled === true, onChange: (e) => set([...base, "enabled"], e.target.checked) })),
-          h(Row, { label: "允许写真实姓名和私密细节", hint: "开 = 可写具体的人、关系、地点、金额等；关 = 只用「主人/对方」代称。密码/验证码/银行卡仍不写" },
-            h("input", { type: "checkbox", className: "qbw-switch", checked: d.allowPrivateDetails !== false, onChange: (e) => set([...base, "allowPrivateDetails"], e.target.checked) })),
           h(Row, { label: "保存目录", hint: "存放所有日记的文件夹；里面按人物分子文件夹，文件名是时间" },
             h("div", { style: { display: "flex", gap: "6px", alignItems: "center", flexWrap: "wrap" } },
               h("input", { className: "qbw-input", type: "text", value: d.dir ?? "", placeholder: "留空用默认目录", style: { minWidth: "240px" }, onChange: (e) => set([...base, "dir"], e.target.value) }),
@@ -7887,6 +7892,7 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
     // Sprintkey 扩展插件内部的二级页签：一个子设置一页（2026-10-31 主人要求）。
     const SPRINTKEY_PAGES = [
       ["model", "模型与思考"],
+      ["prompt", "提示词注入"],
       ["memory", "记忆"],
       ["voice", "声线"],
       ["cross", "跨会话共享"],
@@ -7896,7 +7902,7 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
       ["api", "投递接口"],
     ];
 
-    function SprintkeyTab({ qq, set, busy, setBusy, toast, reload, page, setPage }) {
+    function SprintkeyTab({ qq, set, setUnified, unified, busy, setBusy, toast, reload, page, setPage }) {
       const cfg = qq ?? {};
       const dsh = cfg.dsh ?? {};
       const tools = cfg.socialV2?.tools ?? {};
@@ -7996,6 +8002,30 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
         }
       };
       useEffect(() => { loadMemStatus(); }, []);
+      // 提示词注入（2026-11-08 主人要求）：唤醒提示词里人格卡怎么进 —— card（0.8.9 原样整卡）
+      // / trim（同卡按字数截断，折中档）/ pointer（0.6.22 原样一行指针）。三档的文本组装在
+      // src/persona-wake-inject.js，桥接每轮现读 ~/.dsh/surfcore/config.json → 改完即生效。
+      // 页面上的字数是问桥接要的实时值（GET /socialV2/persona-preview），不是写死的估算。
+      const personaRaw = unified?.persona ?? {};
+      const personaWakeInject = ["card", "trim", "pointer"].includes(String(personaRaw.wakeInject ?? "")) ? String(personaRaw.wakeInject) : "card";
+      const personaWakeTrimChars = Number(personaRaw.wakeTrimChars) > 0
+        ? Math.min(6000, Math.max(800, Math.round(Number(personaRaw.wakeTrimChars))))
+        : 2500;
+      const biliMemoryEnabled = cfg.biliBridge?.memory?.enabled !== false;
+      const roleMaxInjectChars = Number(cfg.role?.maxInjectChars) > 0
+        ? Math.min(20000, Math.max(1000, Math.round(Number(cfg.role.maxInjectChars))))
+        : 6000;
+      const [personaPreview, setPersonaPreview] = useState({ loading: true, data: null, error: "" });
+      const loadPersonaPreview = async () => {
+        setPersonaPreview((s) => ({ ...s, loading: true, error: "" }));
+        try {
+          const r = await api("/socialV2/persona-preview");
+          setPersonaPreview({ loading: false, data: r ?? null, error: "" });
+        } catch (e) {
+          setPersonaPreview({ loading: false, data: null, error: String(e?.message ?? e) });
+        }
+      };
+      useEffect(() => { loadPersonaPreview(); }, []);
       // 全量记忆卡备份（2026-10-31）：本地镜像 + 定时 + 私聊主人。
       // 开关/目录是草稿，随底部「保存」写入 config.json；状态与手动执行走桥接接口。
       const backupRaw = cfg.socialV2?.memoryCardBackup ?? {};
@@ -8127,6 +8157,39 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
               h("option", { value: "all" }, "全部会话统一（强制这一档）"))),
           h("div", { className: "qbw-hint" }, "改完点底部「保存」，再点「保存并重启 QQ 桥接」——桥接启动时才读这几个值；已在跑的会话下一条消息自动换。"),
           h("div", { className: "qbw-hint" }, "会话内换模型/档位：让模型调 qq_set_reasoning_effort（传 model 换模型、传 effort 换档位、传 inherit 恢复跟随）；不知道有哪些模型时先 qq_get_model_catalog。")),
+        h(Section, { title: "提示词注入方式（省 token）", collapsible: false, hidden: activePage !== "prompt", note: "QQ 每条唤醒都会拼一大段提示词。这里只切换「人格卡怎么进提示词」——记忆卡、B站简报、本次消息快照都不受影响" },
+          h(Row, { label: "唤醒时怎么注入人格", hint: "切换即时生效：桥接每次拼唤醒词都现读配置，不用重启 DSH；已存在的 DSH 会话历史不会重写" },
+            h("select", {
+              className: "qbw-select",
+              value: personaWakeInject,
+              onChange: (e) => setUnified(p("persona.wakeInject"), e.target.value),
+            },
+              h("option", { value: "card" }, "新版整卡（0.8.9 原样）· 最完整，最费"),
+              h("option", { value: "trim" }, "折中缩卡（0.8.9 新增，旧版没有）· 人设保留、按字数截短"),
+              h("option", { value: "pointer" }, "真·旧版指针（0.6.22 原样）· 最省，但她要自己查 qq_get_prompt"))),
+          h(Row, { label: "缩卡上限（字）", hint: "只在「折中缩卡」档生效；800~6000，默认 2500。整卡档吃「人格注入上限」，指针档不用上限" },
+            h("input", {
+              className: "qbw-input", type: "number", min: 800, max: 6000,
+              value: personaWakeTrimChars, disabled: personaWakeInject !== "trim",
+              onChange: (e) => setUnified(p("persona.wakeTrimChars"), Math.min(6000, Math.max(800, Math.round(Number(e.target.value) || 2500)))),
+            })),
+          h(Row, { label: "实测体量", hint: personaPreview.loading ? "正在问桥接…" : (personaPreview.error ? `桥接没响应：${personaPreview.error}` : "来自 GET /socialV2/persona-preview；「最近一次唤醒」是桥接内存里的真实长度") },
+            h("button", { className: "qbw-btn", type: "button", onClick: loadPersonaPreview }, "重新量一次")),
+          h("div", { className: "qbw-hint" }, personaPreview.loading
+            ? "正在读取…"
+            : (personaPreview.data?.ok
+              ? `整卡 ≈ ${personaPreview.data.card?.chars ?? "—"} 字 · 缩卡（${personaPreview.data.wakeTrimChars}）≈ ${personaPreview.data.trim?.chars ?? "—"} 字 · 指针 ≈ ${personaPreview.data.pointer?.chars ?? "—"} 字；换成指针每条省 ≈ ${personaPreview.data.saving?.chars ?? "—"} 字（≈${personaPreview.data.saving?.tokensEstimate ?? "—"} tokens）${personaPreview.data.lastWake ? `｜最近一次唤醒 ${personaPreview.data.lastWake.chars} 字（${personaPreview.data.lastWake.inject}）` : ""}`
+              : `暂不可用：${personaPreview.error || "桥接没在跑"}`)),
+          personaPreview.data?.ok ? h("details", null,
+            h("summary", { className: "qbw-label", style: { cursor: "pointer" } }, "看看这一档实际注入的人格卡（前 300 字）"),
+            h("pre", { className: "qbw-code", style: { whiteSpace: "pre-wrap", maxHeight: "220px", overflow: "auto" } },
+              personaPreview.data?.[personaWakeInject]?.preview || personaPreview.data?.card?.preview || "")) : null,
+          h("div", { className: "qbw-hint" }, "对照（2026-11-07 实测 session-40f35dc1）：整卡那一轮唤醒 7,553 字（人格段 6,978 字）→ 指针约 575 字；缩卡 2500 约 3,100 字。一天几十条，差的是十几万到几十万 tokens。"),
+          h(Row, { label: "B站记忆简报", hint: "每次唤醒约 4.3k 字；和上面那个开关不是一件事，关掉只影响 B站 简报（走 QQ config.json）" },
+            h("input", { className: "qbw-switch", type: "checkbox", checked: biliMemoryEnabled, onChange: (e) => set(p("biliBridge.memory.enabled"), e.target.checked) })),
+          h(Row, { label: "人格注入上限（字）", hint: "只在整卡档生效（role.maxInjectChars，1000~20000，默认 6000）；指针档完全不用它" },
+            h("input", { className: "qbw-input", type: "number", min: 1000, max: 20000, value: roleMaxInjectChars, onChange: (e) => set(p("role.maxInjectChars"), Math.min(20000, Math.max(1000, Math.round(Number(e.target.value) || 6000)))) })),
+          h("div", { className: "qbw-hint" }, "改完点底部「保存」。注入方式每轮现读，保存后下一轮唤醒就是新形态；页签本身是插件前端，装了新版本要重启一次 DSH 才会出现。")),
         h(Section, { title: "记忆系统", collapsible: false, hidden: activePage !== "memory", note: "会话记忆 / 跨会话共享 / 世界树三层怎么注入，在这里统一切换；记忆卡固定整卡注入" },
           h(Row, { label: "记忆引擎", hint: "只影响会话记忆的衰减与呈现，不改动写入" },
             h("select", { className: "qbw-select", value: memoryCfg.engine, onChange: (e) => set(p("socialV2.memory.engine"), e.target.value) },
@@ -10020,7 +10083,7 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
         if (tab === "diary") return h(DiaryTab, { qq, set: setQqPath, busy, setBusy, toast: notify, reload });
         if (tab === "align") return h(AlignTab, { busy, setBusy, toast: notify, reload });
         if (tab === "extensions") return h(ExtensionsTab, { busy, setBusy, toast: notify, reload });
-        if (tab === "sprintkey") return h(SprintkeyTab, { qq, set: setQqPath, busy, setBusy, toast: notify, reload, page: sprintkeyPage, setPage: setSprintkeyPage });
+        if (tab === "sprintkey") return h(SprintkeyTab, { qq, set: setQqPath, setUnified, unified, busy, setBusy, toast: notify, reload, page: sprintkeyPage, setPage: setSprintkeyPage });
 
         if (tab === "advanced") return h(AdvancedTab, { qq: normalizedQq, bili, unified: normalizedUnified, setQqPath, setBiliPath, setUnifiedPath, busy });
         if (tab === "diag") return h(DiagnosticsTab, { busy, setBusy, toast: notify, reload });
