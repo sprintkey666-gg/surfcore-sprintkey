@@ -3424,11 +3424,13 @@ F("toolsPath", "bili.mjs 路径", "留空 = 用合体插件自带的 tools/", "t
           "关机错过的写作/发送会在下次启动后补一次；改完点底部「保存」，约 1 分钟生效。"),
         h(Section, {
           title: "私密日记 · 只发主人",
-          note: "写给主人看的，可以写真实的人和事（密码/转账仍不写）。",
+          note: "写给主人看的：默认允许真实姓名和私密细节，可用下面开关关掉；密码/验证码/银行卡仍不写。",
           collapsible: false,
         },
           h(Row, { label: "启用日记", hint: "关 = 不自动写；手动「立即写日记」仍然可用" },
             h("input", { type: "checkbox", className: "qbw-switch", checked: d.enabled === true, onChange: (e) => set([...base, "enabled"], e.target.checked) })),
+          h(Row, { label: "允许写真实姓名和私密细节", hint: "开 = 可写具体的人、关系、地点、金额等；关 = 只用「主人/对方」代称。密码/验证码/银行卡仍不写" },
+            h("input", { type: "checkbox", className: "qbw-switch", checked: d.allowPrivateDetails !== false, onChange: (e) => set([...base, "allowPrivateDetails"], e.target.checked) })),
           h(Row, { label: "保存目录", hint: "存放所有日记的文件夹；里面按人物分子文件夹，文件名是时间" },
             h("div", { style: { display: "flex", gap: "6px", alignItems: "center", flexWrap: "wrap" } },
               h("input", { className: "qbw-input", type: "text", value: d.dir ?? "", placeholder: "留空用默认目录", style: { minWidth: "240px" }, onChange: (e) => set([...base, "dir"], e.target.value) }),
@@ -10134,7 +10136,7 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
         if (tab === "diary") return h(DiaryTab, { qq, set: setQqPath, busy, setBusy, toast: notify, reload });
         if (tab === "align") return h(AlignTab, { busy, setBusy, toast: notify, reload });
         if (tab === "extensions") return h(ExtensionsTab, { busy, setBusy, toast: notify, reload });
-        if (tab === "sprintkey") return h(SprintkeyTab, { qq, set: setQqPath, setUnified, unified, busy, setBusy, toast: notify, reload, page: sprintkeyPage, setPage: setSprintkeyPage });
+        if (tab === "sprintkey") return h(SprintkeyTab, { qq, set: setQqPath, setUnified: setUnifiedPath, unified, busy, setBusy, toast: notify, reload, page: sprintkeyPage, setPage: setSprintkeyPage });
 
         if (tab === "advanced") return h(AdvancedTab, { qq: normalizedQq, bili, unified: normalizedUnified, setQqPath, setBiliPath, setUnifiedPath, busy });
         if (tab === "diag") return h(DiagnosticsTab, { busy, setBusy, toast: notify, reload });

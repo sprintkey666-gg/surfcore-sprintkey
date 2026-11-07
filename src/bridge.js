@@ -115,7 +115,7 @@ import {
 } from './self-expression.js';
 import {
   appendDiaryEntry, appendDiaryEntryGrouped, buildDiaryPrompt, characterDiaryState, cleanDiaryText,
-  diaryBaseDir, diaryCharDir, diaryFileFor, diaryNextDueAt, diaryPublicBaseDir, diaryPublicCharDir, diaryStateFile,
+  diaryBaseDir, diaryCharDir, diaryFileFor, diaryNextDueAt, diaryPublicBaseDir, diaryPublicCharDir, diarySpeakerLabel, diaryStateFile,
   formatDiaryEntry, isDiaryDue, listDiaryEntries, listDiaryFiles, migrateLegacyDiary,
   normalizeDiaryConfig, publicPublishQuota, readDiaryState, readDiaryTail, scrubPublicText, writeDiaryState,
 } from './diary.js';
@@ -5201,7 +5201,7 @@ async function main() {
   }
 
   /** recentMessages → 一段「最近发生的事」，只给模型当素材，不直接外发。 */
-  function lifeContext(maxChars = 2600) {
+  function lifeContext(maxChars = 2600, { audience = 'owner', allowPrivateDetails = false } = {}) {
     const cutoff = Date.now() - 36 * 3600_000;
     const rows = [];
     for (const [key, st] of socialV2.conversations.entries()) {
@@ -5211,7 +5211,10 @@ async function main() {
         if (!at || at < cutoff) continue;
         const text = String(m.plain || m.text || '').replace(/\s+/g, ' ').trim();
         if (!text) continue;
-        const who = m.isSelf ? '我' : (m.isOwner ? '主人' : (isGroup ? String(m.sender || '群友') : '对方'));
+        const who = diarySpeakerLabel(
+          { isSelf: m.isSelf === true, isOwner: m.isOwner === true, isGroup, sender: m.sender },
+          { audience, allowPrivateDetails },
+        );
         rows.push({ at, line: `[${new Date(at).toLocaleTimeString('zh-CN', { hour12: false })}] ${who}：${text.slice(0, 100)}` });
       }
     }
@@ -5408,9 +5411,14 @@ async function main() {
       const prompt = buildDiaryPrompt({
         characterName: snap.ch.name,
         persona: snap.ch.persona,
-        context: lifeContext(),
+        context: lifeContext(2600, {
+          audience: 'owner',
+          allowPrivateDetails: snap.cfgDiary.allowPrivateDetails !== false,
+        }),
         maxChars: snap.cfgDiary.maxChars,
         now: Date.now(),
+        audience: 'owner',
+        allowPrivateDetails: snap.cfgDiary.allowPrivateDetails !== false,
       });
       const output = await runLifePrompt(prompt);
       const text = cleanDiaryText(output, snap.cfgDiary.maxChars);
@@ -5557,11 +5565,12 @@ async function main() {
       const prompt = buildDiaryPrompt({
         characterName: snap.ch.name,
         persona: snap.ch.persona,
-        context: lifeContext(),
+        context: lifeContext(2600, { audience: 'public', allowPrivateDetails: false }),
         maxChars: snap.pub.maxChars,
         now: Date.now(),
         audience: 'public',
         allowNames: snap.pub.allowNames,
+        allowPrivateDetails: false,
       });
       const output = await runLifePrompt(prompt);
       const cleaned = cleanDiaryText(output, snap.pub.maxChars);

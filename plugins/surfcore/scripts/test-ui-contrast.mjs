@@ -43,4 +43,14 @@ assert.ok(/\.qbw-btn:disabled/.test(css), '按钮缺少 disabled 样式');
 // 6) 主要文字使用主题 label token（而不是写死 #fff）
 assert.match(css, /\.qbw-app\{[^}]*color:var\(--dsw-alias-label-primary\)/, '.qbw-app 的文字颜色应跟随主题 label-primary');
 
+// 7) 主题变量层必须声明在插件自己的根节点上（DSH 的 --dsw-alias-* 只挂在设置面板容器上，:root 取不到）
+//    2026-11-07：「回复速度 → 用哪套」下拉框看不见，就是因为这一层只写在 :root，
+//    面板里全部落到兜底 #ffffff（白底浅字），而组件里直接用的 label-primary 是深色主题的浅字。
+const themeLayer = /([^{}]*)\{\s*--qbw-surface:/.exec(css)?.[1] ?? '';
+assert.ok(themeLayer, '找不到 --qbw-surface 的主题变量层');
+for (const scope of ['.qbw-app', '.qbw-modal']) {
+  assert.ok(themeLayer.includes(scope), `主题变量层必须包含 ${scope}（DSH token 不在 :root 上）`);
+}
+assert.ok(css.includes('.qbw-select{background:var(--qbw-surface-2)'), '下拉框要自己有底色，不能只靠透明底 + 边框');
+
 console.log('✅ 界面可见性检查通过');

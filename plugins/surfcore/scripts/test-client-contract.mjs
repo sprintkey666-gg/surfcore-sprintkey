@@ -494,4 +494,16 @@ assert.ok(!source.includes('这里放 Sprintkey 自己的设置：模型、投�
 for (const id of ['model', 'prompt', 'memory', 'voice', 'cross', 'tree', 'tools', 'limits', 'api']) {
   assert.ok(source.includes(`hidden: activePage !== "${id}"`), `Sprintkey 缺少页签对应的隐藏条件：${id}`);
 }
+// ── Sprintkey 页的 unified 写回（2026-11-08）────────────────────────────────
+// 背景：SprintkeyTab 一度拿到的是 useState 的原始 setUnified，点击「人格注入方式」
+// 时 unified 被写成 ["persona","wakeInject"] 数组 → personaRaw 变空 → 下拉框弹回
+// 「新版整卡」，保存时 store.js 又把 persona 归一化回默认值，看着就是「切了没变」。
+assert.ok(
+  source.includes('if (tab === "sprintkey") return h(SprintkeyTab, { qq, set: setQqPath, setUnified: setUnifiedPath,'),
+  "SprintkeyTab 必须传 setUnifiedPath；传原始 setUnified 会把 unified 写成路径数组，下拉框点了会弹回原值",
+);
+assert.ok(
+  !/h\(SprintkeyTab, \{[^}]*setUnified \}/.test(source),
+  "SprintkeyTab 不能再用 setUnified 简写传参",
+);
 console.log('client contract tests OK');

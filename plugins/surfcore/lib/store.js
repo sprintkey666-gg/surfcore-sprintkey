@@ -665,6 +665,12 @@ export function saveBiliConfig(incoming) {
 
 export function saveUnified(incoming) {
   const current = readUnified().config;
+  // 只收普通对象（2026-11-08）：设置页曾把 unified 误写成 ["persona","wakeInject"] 数组，
+  // deepMerge 会把数组展成 "0"/"1" 两个顶层键写进 config.json，persona 也被归一化回默认值，
+  // 表现就是「改了没生效」。宁可报错，也不把配置文件写脏。
+  if (incoming != null && !isPlainObject(incoming)) {
+    throw new Error("unified 配置必须是对象（收到 " + (Array.isArray(incoming) ? "数组" : typeof incoming) + "）");
+  }
   const next = deepMerge(current, clone(incoming ?? {}));
   next.version = 1;
   // 记忆卡上限必须按引擎的边界收敛：否则输入 999999 会原样落盘，界面显示 999999、
