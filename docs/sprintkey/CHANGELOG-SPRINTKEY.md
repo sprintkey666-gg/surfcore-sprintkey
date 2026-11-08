@@ -955,3 +955,10 @@
 - 修合并后暴露的 16 个失败用例（`168af84`）：wait 分支引用不存在的 `waitSeen/known/incomingAt` 导致 wait 500、`ensureSession` 里混进孤儿模型块、`buildWakePromptV2` 源码形状、`session-rollover` 的 `batchMs`/`sessionBaseTokens`、`composePersonaLayers` 的 `identity:`、`wellFormed()` 孤立代理项、主题 token 名、语音包缺环境文案、自表达 JSON 解析器、预设与安装清单重生成。
 - 结果：`scripts/test-audit.mjs` 173/173 全绿（同步前 93/97）；插件链 40/42（红项仍是既有 `test-updates` / `test-host-smoke`）。
 - 决策表与 34 个 release 的核对见 `docs/sprintkey/UPSTREAM-SYNC.md`。
+## 2026-11-08 12:10 回复速度：新增「会话绑定」三级页（群号 / 私聊 QQ 号 ↔ session id）
+
+- 「回复速度」页里，原版组和快回复组下面各多一个入口「会话绑定 · 原版 / 快回复（群号 / 私聊 QQ 号 ↔ session id）」，点开是独立页面（`ChatSessionEditor`），不写 `config.json`。
+- 页面列出白名单里的每个群/私聊：当前绑定的 session id、第几轮、原会话 / 已换会话 / 无会话；可以改成别的 session（留空 = 解绑），顶部可展开「最近会话」直接挑。
+- 后端新增 `GET /api/socialV2/chats`（合并 `socialV2.conversations` / `state.sessions` / `cfg.allow`，附 `sessions.list` 最近 20 条）；`POST /api/socialV2/session` 新增 `action:"bind"`：校验 id 格式、DSH 里是否存在、是否已被别的号占用、是否正在跑回合（409）；生效时同步 `sessionPolicies` / `reverse` / `originalSessionId` / `turnsSeeded=false` / `sessionBaseTokens`，**不动旧会话**（不归档、不删除、不迁任务）。
+- 两个接口都进 `adminOnlyV2Paths`（带 agent token 一律 403）；插件转发白名单加 `/api/socialV2/chats`。
+- 测试：`scripts/test-reply-mode.mjs` 87 → 97（新增 10 条契约）；`plugins/surfcore/scripts/test-client-contract.mjs` +7。

@@ -1479,6 +1479,9 @@ F("sessionCwd", "会话工作目录", "留空用 surfcore 根目录", "text", { 
         F("socialV2.reply.fast.cleanup.keep", "保留最近几个", "默认 50", "number", { min: 1, max: 500 }),
         F("socialV2.reply.fast.cleanup.days", "额外要求超过几天（0 = 不限）", "默认 0；填了 N 就是「超出保留数、并且超过 N 天」才处置", "number", { min: 0, max: 365 }),
       ]},
+      // 两个「会话绑定」页：内容由 groupExtra 渲染（ChatSessionEditor），这里只负责给出入口和标题。
+      { group: "会话绑定 · 原版（群号 / 私聊 QQ 号 ↔ session id）", note: "看每个群、每个私聊现在用的是哪条 DSH 会话，也可以换成别的；换会话、清理、忙时接管仍按上面「原版回复」那套走。", fields: [] },
+      { group: "会话绑定 · 快回复（群号 / 私聊 QQ 号 ↔ session id）", note: "绑定是每个号一份、两套模式共用；这里只是入口，换会话规则仍按上面「快回复」那套走。", fields: [] },
     ];
 
 
@@ -10081,6 +10084,86 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
         if (tab === "characters") return h(CharactersTab, { overview, busy, setBusy, toast: notify, reload, goTab: setTab, unified, setUnified: setUnifiedPath });
         if (tab === "purpose") return h(PurposeTab, { qq, setQq: setQqPath, unified, setUnified: setUnifiedPath, overview, busy, setBusy, toast: notify, reload, goTab: setTab });
         if (tab === "qq") return h(QQTab, { cfg: qq, set: setQqPath, admin: unified?.admin ?? {}, setAdmin, unified, setUnified: setUnifiedPath, overview, busy, setBusy, toast: notify, reload, goTab: setTab, onSave: save, onAdminDiscardContext: setAdminDiscardContext, dirty });
+    // 「会话绑定」三级页：看/改每个群、每个私聊对应哪条 DSH 会话（走 /api/socialV2/chats）。
+    function ChatSessionEditor({ toast }) {
+      const [data, setData] = useState(null);
+      const [busy, setBusy] = useState(false);
+      const [drafts, setDrafts] = useState({});
+      const [showRecent, setShowRecent] = useState(false);
+      const load = async () => {
+        try {
+          const r = await api("/socialV2/chats");
+          setData(r);
+          const next = {};
+          for (const c of r.chats || []) next[c.key] = c.sessionId || "";
+          setDrafts(next);
+        } catch (e) {
+          toast(`✗ 读取会话清单失败：${e?.message ?? e}`);
+        }
+      };
+      useEffect(() => {
+        load();
+      }, []);
+      const save = async (chat, sessionId) => {
+        setBusy(true);
+        try {
+          const r = await api("/socialV2/session", { method: "POST", body: { action: "bind", key: chat.key, sessionId } });
+          const row = (r.results || [])[0] || {};
+          toast(sessionId
+            ? `✓ ${chat.label} 已切到 ${String(row.to || sessionId).slice(0, 18)}…`
+            : `✓ ${chat.label} 已解绑，下条消息会新建会话`);
+          await load();
+        } catch (e) {
+          toast(`✗ ${e?.message ?? e}`);
+        }
+        setBusy(false);
+      };
+      const chats = data?.chats || [];
+      const recent = data?.recentSessions || [];
+      const modeName = data?.mode === "fast" ? "快回复" : "原版";
+      return h("div", null,
+        h("p", { className: "qbw-hint" }, `当前生效的是「${modeName}」那套。绑定只决定这个号从哪条 DSH 会话开始聊；定期换会话、清理、忙时接管仍按「${modeName}」那组参数走。`),
+        h("div", { style: { display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "8px" } },
+          h(Btn, { onClick: load, disabled: busy }, "刷新"),
+          h(Btn, { onClick: () => setShowRecent(!showRecent), disabled: busy }, showRecent ? "收起最近会话" : "从最近会话里挑")),
+        showRecent && recent.length > 0
+          ? h("div", { style: { marginBottom: "10px" } },
+              h("p", { className: "qbw-hint" }, "点一条填进第一个号的输入框，再点它那行的「保存」才生效："),
+              ...recent.slice(0, 10).map((s) => h("p", {
+                key: s.sessionId,
+                className: "qbw-hint",
+                style: { cursor: "pointer" },
+                onClick: () => {
+                  const first = chats[0];
+                  if (!first) return;
+                  setDrafts((d) => ({ ...d, [first.key]: s.sessionId }));
+                  toast(`已填入「${first.label}」的输入框`);
+                },
+              }, `${s.title || "(无标题)"} · ${s.sessionId.slice(0, 18)}…`)))
+          : null,
+        chats.length === 0
+          ? h("p", { className: "qbw-hint" }, "白名单里还没有号；先在「群管理 / 白名单」里加号，或等它先发一条消息。")
+          : null,
+        ...chats.map((c) => {
+          const draft = drafts[c.key] !== undefined ? drafts[c.key] : (c.sessionId || "");
+          const badge = c.unbound ? "无会话（下次新建）" : c.rotated ? "已换会话" : "原会话";
+          return h("div", { key: c.key, style: { display: "flex", gap: "10px", alignItems: "flex-start", padding: "8px 0", borderTop: "1px solid var(--qbw-line)" } },
+            h("div", { style: { flex: "0 0 150px" } },
+              h("div", { className: "qbw-label" }, c.label),
+              h("div", { className: "qbw-hint" }, `${badge} · 第 ${Number(c.turnsSinceRotate) || 0} 轮${c.allowed ? "" : " · 当前模式不处理"}`)),
+            h("div", { style: { flex: "1 1 240px", minWidth: "180px" } },
+              h("input", {
+                className: "qbw-input",
+                value: draft,
+                placeholder: "session-…（留空 = 解绑）",
+                onChange: (e) => { const v = e.target.value; setDrafts((d) => ({ ...d, [c.key]: v })); },
+              }),
+              h("div", { style: { display: "flex", gap: "6px", marginTop: "6px" } },
+                h(Btn, { onClick: () => save(c, String(draft || "").trim()), disabled: busy }, "保存"),
+                h(Btn, { onClick: () => save(c, ""), disabled: busy }, "解绑"))));
+        }));
+    }
+
     // 回复速度页底部：手动换会话 / 回原会话（走 /api/socialV2/session）。
     function ReplySessionActions({ toast }) {
       const [busy, setBusy] = useState(false);
@@ -10121,7 +10204,13 @@ F("socialV2.voice.ffmpegPath", "ffmpeg 路径", "留空走 PATH", "text", { wide
     }
 
         if (tab === "reply") return h("div", null,
-          h(FieldGroups, { groups: REPLY_FIELDS, cfg: qq, set: setQqPath }),
+          h(FieldGroups, {
+            groups: REPLY_FIELDS,
+            cfg: qq,
+            set: setQqPath,
+            // 「会话绑定」两组不写 config，点开是独立页面（ChatSessionEditor）。
+            groupExtra: (group) => (String(group?.group ?? "").startsWith("会话绑定") ? h(ChatSessionEditor, { toast: notify }) : null),
+          }),
           h("p", { className: "qbw-hint", style: { marginTop: "8px" } }, "改完点底部「保存」即可：桥接每 3 秒看一眼 config.json，回复参数会自己重载（换会话开关也会跟着生效）。两套参数各自独立：切到「快回复」用 fast 那组，切回「原版」用 legacy 那组。"),
           h(ReplySessionActions, { toast: notify }),
         );

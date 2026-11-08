@@ -6526,7 +6526,7 @@ async function main() {
         // 让 AI 自己读/改等于把控制台的管理输入（以及未来可能写入的其它群信息）交给会话主体。
         // 本地判断统计：跨会话汇总（哪个群被拦了多少），属于管理信息，agent token 一律拒绝。
         // 不加这条的话它落在 /api/socialV2/ 前缀里，QQ 侧的模型能读到别的群的拦截统计。
-        const adminOnlyV2Paths = ['/api/socialV2/config', '/api/socialV2/activity', '/api/socialV2/reset', '/api/socialV2/states', '/api/socialV2/wake', '/api/socialV2/initial-prompt', '/api/socialV2/history-catchup', '/api/socialV2/local-filter'];
+        const adminOnlyV2Paths = ['/api/socialV2/config', '/api/socialV2/activity', '/api/socialV2/reset', '/api/socialV2/states', '/api/socialV2/wake', '/api/socialV2/initial-prompt', '/api/socialV2/history-catchup', '/api/socialV2/session', '/api/socialV2/chats', '/api/socialV2/local-filter'];
         if (req.headers['x-agent-token'] && (adminOnlyV2Paths.includes(url.pathname) || (url.pathname === '/api/socialV2/feedback' && req.method === 'GET') || (url.pathname === '/api/socialV2/tool-log' && req.method === 'GET'))) {
           sendJson({ ok: false, error: '该接口仅控制台可用' }, 403);
           return;
@@ -8653,6 +8653,56 @@ async function main() {
           return;
         }
 
+        // 会话绑定清单：每个群/私聊当前用的是哪条 DSH 会话，以及可选的最近会话。
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/chats') {
+          const params = replyParamsV2();
+          const keys = new Set();
+          for (const key of socialV2.conversations.keys()) keys.add(key);
+          for (const key of Object.keys(state.sessions || {})) keys.add(key);
+          for (const qq of cfg.allow?.private ?? []) keys.add(`private:${String(qq).trim()}`);
+          for (const groupId of cfg.allow?.groups ?? []) keys.add(`group:${String(groupId).trim()}`);
+          const chats = [];
+          for (const raw of keys) {
+            const key = canonicalV2Key(raw);
+            if (!key) continue;
+            const [kind, idText] = key.split(':');
+            const st = getSocialV2State(key);
+            const sessionId = state.sessions[key] || '';
+            chats.push({
+              key,
+              kind,
+              id: Number(idText),
+              label: kind === 'private' ? `私聊 ${idText}` : `群 ${idText}`,
+              sessionId,
+              originalSessionId: st.originalSessionId || '',
+              rotated: !!st.originalSessionId && sessionId !== st.originalSessionId,
+              unbound: !sessionId,
+              turnsSinceRotate: Number(st.turnsSinceRotate) || 0,
+              turnsSeeded: st.turnsSeeded === true,
+              allowed: isSessionAllowedInCurrentMode(key),
+            });
+          }
+          chats.sort((a, b) => (a.kind === b.kind ? a.id - b.id : (a.kind === 'private' ? -1 : 1)));
+          let recentSessions = [];
+          try {
+            const value = unwrap(await api.sessions.list({}), 'session.list');
+            const items = Array.isArray(value?.items) ? value.items : [];
+            recentSessions = items
+              .map((item) => ({
+                sessionId: String(item?.sessionId ?? ''),
+                title: String(item?.title ?? ''),
+                updatedAt: Number(item?.updatedAt) || 0,
+              }))
+              .filter((item) => item.sessionId)
+              .sort((a, b) => b.updatedAt - a.updatedAt)
+              .slice(0, 20);
+          } catch (error) {
+            log(`⚠️ 读取 DSH 会话清单失败：${error?.message ?? error}`);
+          }
+          sendJson({ ok: true, mode: params.mode, params: params.rotate, chats, recentSessions });
+          return;
+        }
+
         if (req.method === 'GET' && url.pathname === '/api/socialV2/latency') {
           const params = replyParamsV2();
           const byMode = {};
@@ -8670,7 +8720,6 @@ async function main() {
               turnsSinceRotate: Number(st.turnsSinceRotate) || 0,
               turnsTotal: Number(st.turnsTotal) || 0,
               turnsSeeded: st.turnsSeeded === true,
-          originalSessionId: st.originalSessionId || '',
               sessionId: state.sessions[key] || '',
               originalSessionId: st.originalSessionId || '',
               rotated: !!st.originalSessionId && (state.sessions[key] || '') !== st.originalSessionId,
@@ -8722,7 +8771,75 @@ async function main() {
             sendJson({ ok: true, action, results });
             return;
           }
-          if (action !== 'rotate') { sendJson({ ok: false, error: 'action 只能是 rotate 或 restore' }, 400); return; }
+          if (action === 'bind') {
+            const key = canonicalV2Key(rawKey);
+            if (!key) { sendJson({ ok: false, error: 'key 必须形如 private:123 或 group:456' }, 400); return; }
+            const wanted = String(body.sessionId ?? '').trim();
+            const from = state.sessions[key] || '';
+            if (!isSessionAllowedInCurrentMode(key)) { sendJson({ ok: false, error: '这个号不在当前模式的允许范围里（白名单 / 模式限制），先在设置里放开' }, 400); return; }
+            if (!wanted) {
+              // 解绑：下一条消息按正常流程新建会话（不动 DSH 侧任何东西）。
+              const st = getSocialV2State(key);
+              delete state.sessions[key];
+              delete state.sessionPolicies[key];
+              if (from) reverse.delete(from);
+              st.originalSessionId = '';
+              st.turnsSinceRotate = 0;
+              st.turnsSeeded = false;
+              st.modelSeenSeqs = new Set();
+              saveState();
+              saveSocialV2State();
+              log(`[reserved2] 会话解绑 ${key}：${from || '(无)'} -> （下条消息新建）`);
+              sendJson({ ok: true, action, results: [{ key, from, to: '', changed: !!from, unbound: true }] });
+              return;
+            }
+            if (!/^session-[A-Za-z0-9._-]+$/.test(wanted)) {
+              sendJson({ ok: false, error: 'session id 形如 session-xxxxxxxx-…，请从「最近会话」里选或粘贴完整 id' }, 400);
+              return;
+            }
+            if (isConversationBusyV2(key, getSocialV2State(key))) {
+              sendJson({ ok: false, error: '这个聊天这一轮还在跑，等它结束再切会话' }, 409);
+              return;
+            }
+            let listed = [];
+            try {
+              const value = unwrap(await api.sessions.list({}), 'session.list');
+              listed = Array.isArray(value?.items) ? value.items.map((item) => String(item?.sessionId ?? '')) : [];
+            } catch (error) {
+              sendJson({ ok: false, error: `读取 DSH 会话清单失败：${error?.message ?? error}` }, 502);
+              return;
+            }
+            if (!listed.includes(wanted)) {
+              sendJson({ ok: false, error: '这个会话 id 在 DSH 里找不到（可能已被删除或归档），先在 DSH 里恢复或新建一条' }, 400);
+              return;
+            }
+            const occupied = Object.entries(state.sessions || {}).find(([other, sid]) => other !== key && sid === wanted);
+            if (occupied) {
+              sendJson({ ok: false, error: `这条会话已经绑定在 ${occupied[0]} 上，先在那里解绑再绑过来` }, 409);
+              return;
+            }
+            state.sessions[key] = wanted;
+            state.sessionPolicies[key] = sessionPolicy(key);
+            reverse.set(wanted, key);
+            const st = getSocialV2State(key);
+            st.originalSessionId = wanted;
+            st.turnsSinceRotate = 0;
+            st.turnsSeeded = false;
+            st.modelSeenSeqs = new Set();
+            st.sessionBaseTokens = tokenLedger.sessionTotal(wanted);
+            st.sessionTokens = 0;
+            st.sessionTurns = 0;
+            st.rolloverPending = false;
+            saveState();
+            saveSocialV2State();
+            try { api.events.follow(wanted); } catch {}
+            // 立刻按这条会话的真实回合数对齐「第 N 轮」，别等下一次回合收尾才显示 0。
+            void seedTurnsV2(key);
+            log(`[reserved2] 会话绑定 ${key}：${from || '(无)'} -> ${wanted}（手动指定）`);
+            sendJson({ ok: true, action, results: [{ key, from, to: wanted, changed: from !== wanted, unbound: false }] });
+            return;
+          }
+          if (action !== 'rotate') { sendJson({ ok: false, error: 'action 只能是 rotate / restore / bind' }, 400); return; }
           const key = canonicalV2Key(rawKey);
           if (!key) { sendJson({ ok: false, error: 'key 必须形如 private:123 或 group:456' }, 400); return; }
           const from = state.sessions[key] || '';

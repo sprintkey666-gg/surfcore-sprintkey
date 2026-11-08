@@ -506,4 +506,12 @@ assert.ok(
   !/h\(SprintkeyTab, \{[^}]*setUnified \}/.test(source),
   "SprintkeyTab 不能再用 setUnified 简写传参",
 );
+// ── 会话绑定三级页（2026-11-08）：原版 / 快回复各一个入口 ──────────────────
+assert.ok(source.includes('会话绑定 · 原版（群号 / 私聊 QQ 号 ↔ session id）'), '原版组要有「会话绑定」入口');
+assert.ok(source.includes('会话绑定 · 快回复（群号 / 私聊 QQ 号 ↔ session id）'), '快回复组要有「会话绑定」入口');
+assert.ok(source.includes('function ChatSessionEditor'), '缺少会话绑定编辑器组件 ChatSessionEditor');
+assert.ok(source.includes('startsWith("会话绑定")'), 'groupExtra 要按组名分流到编辑器');
+assert.ok(source.includes('"/socialV2/chats"'), '编辑器要用 /socialV2/chats 拉会话清单');
+assert.ok(source.includes('action: "bind"'), '保存要走 /api/socialV2/session 的 bind');
+assert.ok(source.includes('留空 = 解绑'), '输入框要说明留空即解绑');
 console.log('client contract tests OK');
